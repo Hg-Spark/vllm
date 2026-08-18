@@ -13,20 +13,22 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
 import torch
-import torch.distributed as dist
 
-from vllm.distributed.parallel_state import get_pcp_group
+from vllm.distributed.async_tensor_ops import (
+    all_gather_into_tensor_async,
+    irecv_tensor,
+    isend_tensor,
+)
+from vllm.distributed.parallel_state import Handle, get_pcp_group
 
 CacheUpdate = Callable[[tuple[torch.Tensor, ...], torch.Tensor], None]
 
 
 @dataclass
 class _PendingSend:
-    works: list[Any]
-    tensors: tuple[torch.Tensor, ...]
+    works: list[Handle]
 
     def completed(self) -> bool:
         return all(work.is_completed() for work in self.works)
@@ -38,7 +40,7 @@ class _PendingSend:
 
 @dataclass
 class _PendingReplica:
-    works: list[Any]
+    works: list[Handle]
     local_inputs: tuple[torch.Tensor, ...]
     gathered: tuple[torch.Tensor, ...]
     slot_mapping: torch.Tensor
@@ -144,7 +146,6 @@ class PCPRunaheadRuntime:
             )
 
         pcp_group = get_pcp_group()
-        p2p_group = pcp_group.device_group
         if self.rank == 0:
             visible = tuple(tensor.contiguous() for tensor in tensors)
         else:
@@ -153,12 +154,10 @@ class PCPRunaheadRuntime:
                 tensor.new_empty((prefix_rows, *tensor.shape[1:]))
                 for tensor in tensors
             )
-            src_rank = pcp_group.ranks[self.rank - 1]
-            ops = [
-                dist.P2POp(dist.irecv, recv_tensor, src_rank, group=p2p_group)
+            works = [
+                irecv_tensor(pcp_group, recv_tensor, self.rank - 1)
                 for recv_tensor in recv_tensors
             ]
-            works = dist.batch_isend_irecv(ops)
             for work in works:
                 work.wait()
             visible = tuple(
@@ -170,14 +169,10 @@ class PCPRunaheadRuntime:
         visible_slot_mapping = slot_mapping[:visible_rows]
 
         if self.rank + 1 < self.world_size:
-            dst_rank = pcp_group.ranks[self.rank + 1]
-            ops = [
-                dist.P2POp(dist.isend, tensor, dst_rank, group=p2p_group)
-                for tensor in visible
+            works = [
+                isend_tensor(pcp_group, tensor, self.rank + 1) for tensor in visible
             ]
-            works = dist.batch_isend_irecv(ops)
-            # Hold the tensors until NCCL has finished reading from them.
-            self._pending_sends.append(_PendingSend(works, visible))
+            self._pending_sends.append(_PendingSend(works))
             self._drain_sends()
 
         return visible, visible_slot_mapping
@@ -206,19 +201,14 @@ class PCPRunaheadRuntime:
                 f"with {rows} rows"
             )
 
-        pcp_group = get_pcp_group().device_group
+        pcp_group = get_pcp_group()
         local_inputs: list[torch.Tensor] = []
         gathered: list[torch.Tensor] = []
-        works: list[Any] = []
+        works: list[Handle] = []
         for tensor in tensors:
             local = tensor.contiguous()
             output = tensor.new_empty((self.world_size * rows, *tensor.shape[1:]))
-            work = dist.all_gather_into_tensor(
-                output,
-                local,
-                group=pcp_group,
-                async_op=True,
-            )
+            work = all_gather_into_tensor_async(pcp_group, output, local)
             local_inputs.append(local)
             gathered.append(output)
             works.append(work)
