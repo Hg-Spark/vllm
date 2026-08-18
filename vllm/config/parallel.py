@@ -38,6 +38,7 @@ DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
+PCPMode = Literal["allgather", "runahead"]
 EPLBCommunicatorBackend = Literal["torch_nccl", "torch_gloo", "nixl", "pynccl"]
 All2AllBackend = Literal[
     "naive",
@@ -126,6 +127,9 @@ class ParallelConfig:
     prefill_context_parallel_size: int = Field(default=1, ge=1)
     """Number of ranks that split prefill sequence computation. PCP expands
     the process world size but does not increase the KV-cache shard count."""
+    prefill_context_parallel_mode: PCPMode = "allgather"
+    """Execution mode for PCP prefill. ``runahead`` is an experimental
+    causal-prefix P2P path; ``allgather`` preserves the default behavior."""
     data_parallel_size: int = Field(default=1, ge=1)
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor, prefill-context, and data parallel sizes."""

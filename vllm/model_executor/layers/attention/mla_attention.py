@@ -244,7 +244,7 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 )
 from vllm.model_executor.layers.attention.pcp import (
     finalize_mla_pcp_decode,
-    maybe_gather_mla_latent_cache_inputs,
+    update_mla_kv_cache,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
@@ -668,22 +668,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
             layer_slot_mapping = slot_mapping.get(self.layer_name)
-            kv_for_cache, kpe_for_cache, layer_slot_mapping = (
-                maybe_gather_mla_latent_cache_inputs(
-                    kv_c_normed,
-                    k_pe,
-                    layer_slot_mapping,
-                    attn_metadata.num_decode_tokens
-                    if attn_metadata is not None
-                    else None,
-                    self.use_pcp,
-                )
-            )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_for_cache,
-                kpe_for_cache,
-                self_kv_cache,
+            update_mla_kv_cache(
+                kv_c_normed,
+                k_pe,
                 layer_slot_mapping,
+                attn_metadata.num_decode_tokens if attn_metadata is not None else None,
+                self.use_pcp,
+                self.impl,
+                self_kv_cache,
                 self.kv_cache_dtype,
                 self._k_scale,
             )
@@ -1209,18 +1201,14 @@ def unified_mla_kv_cache_update(
         layer_name
     )
     if layer_slot_mapping is not None:
-        kv_c_normed, k_pe, layer_slot_mapping = maybe_gather_mla_latent_cache_inputs(
+        update_mla_kv_cache(
             kv_c_normed,
             k_pe,
             layer_slot_mapping,
             attn_metadata.num_decode_tokens if attn_metadata is not None else None,
             attn_layer.use_pcp,
-        )
-        attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-            kv_c_normed,
-            k_pe,
+            attn_layer.impl,
             kv_cache,
-            layer_slot_mapping,
             kv_cache_dtype,
             k_scale,
         )

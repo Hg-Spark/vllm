@@ -13,7 +13,7 @@ from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.attention.pcp import maybe_gather_indexer_k
+from vllm.model_executor.layers.attention.pcp import update_indexer_k_cache
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
@@ -388,19 +388,15 @@ def sparse_attn_indexer(
 
     if not skip_k_cache_insert:
         assert k is not None
-        k, slot_mapping_for_cache = maybe_gather_indexer_k(
-            k,
-            slot_mapping,
-            num_decode_tokens,
-            use_pcp,
-        )
         # scale_fmt can be None, but the function expects str
         assert scale_fmt is not None
         assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
-        ops.indexer_k_quant_and_cache(
+        update_indexer_k_cache(
             k,
             kv_cache,
-            slot_mapping_for_cache,
+            slot_mapping,
+            num_decode_tokens,
+            use_pcp,
             quant_block_size,
             scale_fmt,
         )

@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Any
+
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_tp_group,
 )
+from vllm.v1.attention.ops.pcp_runahead import get_pcp_runahead_runtime
 
 
 def _gather_prefill_cache_inputs(
@@ -66,6 +70,64 @@ def maybe_gather_mla_latent_cache_inputs(
     return cache_kv_c, cache_k_pe, cache_slot_mapping
 
 
+def update_mla_kv_cache(
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    slot_mapping: torch.Tensor | None,
+    num_decode_tokens: int | None,
+    use_pcp: bool,
+    impl: Any,
+    kv_cache: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+) -> None:
+    """Update MLA KV cache through baseline PCP or experimental runahead PCP."""
+    runtime = get_pcp_runahead_runtime() if use_pcp else None
+    if runtime is not None:
+        if num_decode_tokens not in (0, None):
+            raise RuntimeError("runahead PCP only supports fresh prefill cache updates")
+        assert slot_mapping is not None
+
+        def apply(
+            tensors: tuple[torch.Tensor, ...],
+            cache_slot_mapping: torch.Tensor,
+        ) -> None:
+            cache_kv_c, cache_k_pe = tensors
+            impl.do_kv_cache_update(
+                cache_kv_c,
+                cache_k_pe,
+                kv_cache,
+                cache_slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+            )
+
+        runtime.update_and_replicate(
+            (kv_c_normed, k_pe),
+            slot_mapping,
+            apply,
+        )
+        return
+
+    kv_for_cache, kpe_for_cache, cache_slot_mapping = (
+        maybe_gather_mla_latent_cache_inputs(
+            kv_c_normed,
+            k_pe,
+            slot_mapping,
+            num_decode_tokens,
+            use_pcp,
+        )
+    )
+    impl.do_kv_cache_update(
+        kv_for_cache,
+        kpe_for_cache,
+        kv_cache,
+        cache_slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+    )
+
+
 def maybe_gather_indexer_k(
     k: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -78,6 +140,52 @@ def maybe_gather_indexer_k(
         (k,), slot_mapping, num_decode_tokens
     )
     return cache_k, cache_slot_mapping
+
+
+def update_indexer_k_cache(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_decode_tokens: int,
+    use_pcp: bool,
+    quant_block_size: int,
+    scale_fmt: str,
+) -> None:
+    """Insert sparse-indexer K with the same runahead/fallback policy as MLA."""
+    runtime = get_pcp_runahead_runtime() if use_pcp else None
+    if runtime is not None:
+        if num_decode_tokens != 0:
+            raise RuntimeError("runahead PCP only supports fresh prefill indexer updates")
+
+        def apply(
+            tensors: tuple[torch.Tensor, ...],
+            cache_slot_mapping: torch.Tensor,
+        ) -> None:
+            (cache_k,) = tensors
+            ops.indexer_k_quant_and_cache(
+                cache_k,
+                kv_cache,
+                cache_slot_mapping,
+                quant_block_size,
+                scale_fmt,
+            )
+
+        runtime.update_and_replicate((k,), slot_mapping, apply)
+        return
+
+    cache_k, cache_slot_mapping = maybe_gather_indexer_k(
+        k,
+        slot_mapping,
+        num_decode_tokens,
+        use_pcp,
+    )
+    ops.indexer_k_quant_and_cache(
+        cache_k,
+        kv_cache,
+        cache_slot_mapping,
+        quant_block_size,
+        scale_fmt,
+    )
 
 
 def finalize_mla_pcp_decode(

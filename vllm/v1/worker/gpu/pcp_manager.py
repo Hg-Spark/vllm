@@ -9,6 +9,10 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.ops.pcp_runahead import (
+    PCPRunaheadRuntime,
+    register_pcp_runahead_runtime,
+)
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -618,6 +622,143 @@ class PCPManager:
         assert self._global_batch is not None
         return self.restore_hidden_states(hidden_states), self._global_batch
 
+    def finish_forward(self) -> None:
+        pass
+
+
+class RunaheadPCPManager(PCPManager):
+    """Experimental KV-Runahead-style PCP manager.
+
+    Runahead is activated only for one fresh request whose entire prompt is
+    scheduled in the current step. All other batches keep the baseline PCP
+    layout and cache-update path.
+    """
+
+    def __init__(
+        self,
+        pcp_world_size: int,
+        pcp_rank: int,
+        device: torch.device,
+        req_states: RequestState | None = None,
+        max_num_reqs: int | None = None,
+        max_num_tokens: int | None = None,
+        block_tables: BlockTables | None = None,
+        dcp_world_size: int = 1,
+        dcp_rank: int = 0,
+        cp_interleave: int = 1,
+    ) -> None:
+        super().__init__(
+            pcp_world_size=pcp_world_size,
+            pcp_rank=pcp_rank,
+            device=device,
+            req_states=req_states,
+            max_num_reqs=max_num_reqs,
+            max_num_tokens=max_num_tokens,
+            block_tables=block_tables,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=dcp_rank,
+            cp_interleave=cp_interleave,
+        )
+        self._use_runahead_partition = False
+        self._runahead_runtime = PCPRunaheadRuntime(
+            pcp_world_size=pcp_world_size,
+            pcp_rank=pcp_rank,
+            device=device,
+        )
+        register_pcp_runahead_runtime(self._runahead_runtime)
+
+    @staticmethod
+    def validate_config(
+        vllm_config: VllmConfig,
+        supports_mm_inputs: bool,
+    ) -> None:
+        PCPManager.validate_config(vllm_config, supports_mm_inputs)
+        parallel = vllm_config.parallel_config
+        if parallel.tensor_parallel_size != 1:
+            raise NotImplementedError("runahead PCP MVP requires TP=1")
+        if parallel.data_parallel_size != 1:
+            raise NotImplementedError("runahead PCP MVP requires DP=1")
+        if parallel.decode_context_parallel_size != 1:
+            raise NotImplementedError("runahead PCP MVP requires DCP=1")
+        if parallel.enable_expert_parallel:
+            raise NotImplementedError("runahead PCP MVP does not support EP")
+        if parallel.enable_dbo:
+            raise NotImplementedError("runahead PCP MVP does not support DBO")
+        if vllm_config.model_config.is_moe:
+            raise NotImplementedError(
+                "runahead PCP MVP currently rejects MoE layer collectives"
+            )
+        if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            raise NotImplementedError("runahead PCP MVP requires --enforce-eager")
+        if vllm_config.scheduler_config.async_scheduling:
+            raise NotImplementedError(
+                "runahead PCP MVP does not support async scheduling"
+            )
+
+    def _get_rank_segments(
+        self,
+        rank: int,
+        num_scheduled_tokens: np.ndarray,
+        num_computed_tokens: np.ndarray,
+        is_prefilling: np.ndarray,
+        query_start_loc_np: np.ndarray,
+    ) -> list[RankSegment]:
+        if not self._use_runahead_partition:
+            return super()._get_rank_segments(
+                rank,
+                num_scheduled_tokens,
+                num_computed_tokens,
+                is_prefilling,
+                query_start_loc_np,
+            )
+
+        rank_segments: list[RankSegment] = []
+        rank_offset = 0
+        for global_batch_req_idx, num_tokens in enumerate(num_scheduled_tokens):
+            query_len = int(num_tokens)
+            if query_len == 0:
+                continue
+            global_batch_start = int(query_start_loc_np[global_batch_req_idx])
+            chunk_size = (
+                query_len + self.pcp_world_size - 1
+            ) // self.pcp_world_size
+            chunk_offset = rank * chunk_size
+            chunk_len = min(chunk_size, query_len - chunk_offset)
+            if chunk_len <= 0:
+                continue
+            chunk_start = global_batch_start + chunk_offset
+            rank_segments.append(
+                RankSegment(
+                    global_batch_req_idx=global_batch_req_idx,
+                    global_batch_slice=slice(chunk_start, chunk_start + chunk_len),
+                    rank_local_batch_slice=slice(
+                        rank_offset, rank_offset + chunk_len
+                    ),
+                )
+            )
+            rank_offset += chunk_len
+        return rank_segments
+
+    def partition_batch(self, input_batch: InputBatch) -> InputBatch:
+        full_fresh_prefill = (
+            input_batch.num_reqs == 1
+            and bool(input_batch.is_prefilling_np[0])
+            and int(input_batch.num_computed_tokens_np[0]) == 0
+            and int(input_batch.num_scheduled_tokens[0])
+            == int(input_batch.prefill_len_np[0])
+            and int(input_batch.num_scheduled_tokens[0]) >= self.pcp_world_size
+        )
+        self._use_runahead_partition = full_fresh_prefill
+        local_batch = super().partition_batch(input_batch)
+        if full_fresh_prefill:
+            self._runahead_runtime.begin_step(local_batch.num_tokens_after_padding)
+        else:
+            self._runahead_runtime.disable_step()
+        return local_batch
+
+    def finish_forward(self) -> None:
+        self._runahead_runtime.flush()
+
 
 def maybe_partition_pcp_batch(
     manager: PCPManager | None,
@@ -662,13 +803,21 @@ def maybe_build_pcp_manager(
     if pcp_size <= 1:
         return None
 
-    cls.validate_config(vllm_config, supports_mm_inputs)
+    manager_cls = cls
+    if parallel_config.prefill_context_parallel_mode == "runahead":
+        if cls is not PCPManager:
+            raise NotImplementedError(
+                "runahead PCP does not support a custom PCP manager class"
+            )
+        manager_cls = RunaheadPCPManager
+
+    manager_cls.validate_config(vllm_config, supports_mm_inputs)
 
     pcp_rank = get_pcp_group().rank_in_group
     dcp_size = parallel_config.decode_context_parallel_size
     dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
 
-    return cls(
+    return manager_cls(
         pcp_world_size=pcp_size,
         pcp_rank=pcp_rank,
         device=device,
