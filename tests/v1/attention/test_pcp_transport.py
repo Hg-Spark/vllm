@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from vllm.v1.attention.ops.pcp_transport import (
     all_gather_into_tensor_async,
@@ -40,18 +41,8 @@ def test_batch_isend_maps_peer_and_batches_all_tensors() -> None:
         assert batch_isend_tensors(group, tensors, 2) is handles
 
     assert p2p_op.call_args_list == [
-        call(
-            __import__("torch").distributed.isend,
-            tensors[0],
-            12,
-            group=group.device_group,
-        ),
-        call(
-            __import__("torch").distributed.isend,
-            tensors[1],
-            12,
-            group=group.device_group,
-        ),
+        call(dist.isend, tensors[0], 12, group=group.device_group),
+        call(dist.isend, tensors[1], 12, group=group.device_group),
     ]
     batch.assert_called_once()
     assert len(batch.call_args.args[0]) == 2
@@ -75,18 +66,8 @@ def test_batch_irecv_maps_peer_and_batches_all_tensors() -> None:
         assert batch_irecv_tensors(group, tensors, 0) is handles
 
     assert p2p_op.call_args_list == [
-        call(
-            __import__("torch").distributed.irecv,
-            tensors[0],
-            8,
-            group=group.device_group,
-        ),
-        call(
-            __import__("torch").distributed.irecv,
-            tensors[1],
-            8,
-            group=group.device_group,
-        ),
+        call(dist.irecv, tensors[0], 8, group=group.device_group),
+        call(dist.irecv, tensors[1], 8, group=group.device_group),
     ]
     batch.assert_called_once()
     assert len(batch.call_args.args[0]) == 2
