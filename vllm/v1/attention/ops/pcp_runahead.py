@@ -16,12 +16,12 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.distributed.async_tensor_ops import (
-    all_gather_into_tensor_async,
-    irecv_tensor,
-    isend_tensor,
-)
 from vllm.distributed.parallel_state import Handle, get_pcp_group
+from vllm.v1.attention.ops.pcp_transport import (
+    all_gather_into_tensor_async,
+    batch_irecv_tensors,
+    batch_isend_tensors,
+)
 
 CacheUpdate = Callable[[tuple[torch.Tensor, ...], torch.Tensor], None]
 
@@ -154,10 +154,7 @@ class PCPRunaheadRuntime:
                 tensor.new_empty((prefix_rows, *tensor.shape[1:]))
                 for tensor in tensors
             )
-            works = [
-                irecv_tensor(pcp_group, recv_tensor, self.rank - 1)
-                for recv_tensor in recv_tensors
-            ]
+            works = batch_irecv_tensors(pcp_group, recv_tensors, self.rank - 1)
             for work in works:
                 work.wait()
             visible = tuple(
@@ -169,9 +166,7 @@ class PCPRunaheadRuntime:
         visible_slot_mapping = slot_mapping[:visible_rows]
 
         if self.rank + 1 < self.world_size:
-            works = [
-                isend_tensor(pcp_group, tensor, self.rank + 1) for tensor in visible
-            ]
+            works = batch_isend_tensors(pcp_group, visible, self.rank + 1)
             self._pending_sends.append(_PendingSend(works))
             self._drain_sends()
 
