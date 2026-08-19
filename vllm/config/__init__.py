@@ -60,6 +60,11 @@ from vllm.config.vllm import (
     set_current_vllm_config,
 )
 from vllm.config.weight_transfer import WeightTransferConfig
+from vllm.v1.attention.ops.pcp_standard import (
+    enable_standard_attention_pcp_config_support as _enable_pcp_config_support,
+)
+
+_enable_pcp_config_support(VllmConfig)
 
 # __all__ should only contain classes and functions.
 # Types and globals should be imported from their respective modules.

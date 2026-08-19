@@ -26,6 +26,25 @@ from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
 
+RUNAHEAD_MIN_PREFILL_TOKENS = 1024
+
+
+def runahead_batch_eligible(
+    *,
+    num_reqs: int,
+    is_prefilling: np.ndarray,
+    num_scheduled_tokens: np.ndarray,
+    pcp_world_size: int,
+    min_prefill_tokens: int = RUNAHEAD_MIN_PREFILL_TOKENS,
+) -> bool:
+    """Whether a homogeneous standard-attention prefill batch uses runahead."""
+    if num_reqs <= 0:
+        return False
+    if not bool(is_prefilling[:num_reqs].all()):
+        return False
+    total_prefill_tokens = int(num_scheduled_tokens[:num_reqs].sum())
+    return total_prefill_tokens >= max(pcp_world_size, min_prefill_tokens)
+
 
 @dataclass(frozen=True)
 class RankSegment:
@@ -66,6 +85,7 @@ class PCPManager:
         self.dcp_world_size = dcp_world_size
         self.dcp_rank = dcp_rank
         self.cp_interleave = cp_interleave
+        self._standard_attention_pcp = False
 
         self._global_batch: InputBatch | None = None
         self._req_states = req_states
@@ -136,8 +156,6 @@ class PCPManager:
         if pcp_size <= 1:
             return
 
-        if not model_config.use_mla:
-            raise NotImplementedError("MRV2 PCP currently supports MLA models only.")
         if parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError("MRV2 PCP does not support PP yet.")
         if model_config.is_encoder_decoder:
@@ -152,7 +170,13 @@ class PCPManager:
             raise NotImplementedError(
                 "MRV2 PCP does not support speculative decoding yet."
             )
-        is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
+        if not model_config.use_mla and parallel_config.tensor_parallel_size != 1:
+            raise NotImplementedError(
+                "standard-attention PCP MVP currently requires TP=1"
+            )
+        is_sparse_mla = model_config.use_mla and hasattr(
+            model_config.hf_text_config, "index_topk"
+        )
         if (
             is_sparse_mla
             and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
@@ -204,16 +228,7 @@ class PCPManager:
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
     ) -> list[RankSegment]:
-        """Build one rank's attention-compatible DualChunkSwap rows.
-
-        PCP=4 partitions each prefill into eight chunks:
-
-            full:  | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
-            rank 0:  0                           7
-            rank 1:      1                   6
-            rank 2:          2           5
-            rank 3:              3   4
-        """
+        """Build one rank's attention-compatible DualChunkSwap rows."""
         rank_segments = []
         rank_offset = 0
         num_chunks = 2 * self.pcp_world_size
@@ -226,7 +241,7 @@ class PCPManager:
             if bool(is_prefilling[global_batch_req_idx]):
                 chunk_size = (query_len + num_chunks - 1) // num_chunks
                 chunk_indices = (rank, num_chunks - 1 - rank)
-            else:  # decodes are replicated
+            else:
                 chunk_size = query_len
                 chunk_indices = (0,)
 
@@ -274,14 +289,6 @@ class PCPManager:
             segments_by_rank.append(segments)
             per_rank_num_tokens.append(num_rank_tokens)
 
-        # PCP=2 example:
-        #   global batch:       [A B C D E F G]
-        #   rank 0 / rank 1:    [A B G] / [C D E F]
-        #   padded gathered:    [A B G _ | C D E F]
-        #   hidden_restore_idx: [0, 1, 4, 5, 6, 7, 2]
-        #   padded_gather_idx:  [0, 1, 6, 0, 2, 3, 4, 5]
-        # Therefore global = gathered[hidden_restore_idx] and
-        # padded_gathered = global[padded_gather_idx].
         hidden_restore_idx = np.empty(int(query_start_loc_np[-1]), dtype=np.int64)
         padded_num_tokens = max(per_rank_num_tokens)
         num_expanded_tokens = padded_num_tokens * self.pcp_world_size
@@ -299,7 +306,6 @@ class PCPManager:
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
-                # Cache insertion pairs one slot entry with each rank's local decode.
                 if not bool(is_prefilling[segment.global_batch_req_idx]) and rank != 0:
                     continue
                 gathered_kv_write_mask[padded_gathered_slice] = True
@@ -573,6 +579,11 @@ class PCPManager:
             global_batch.num_tokens,
             out=self._global_batch_slot_mappings,
         )
+        has_prefill = bool(
+            global_batch.is_prefilling_np[: global_batch.num_reqs].any()
+        )
+        if not has_prefill:
+            return global_batch_slot_mappings
         return self._convert_to_gathered_slot_mappings(global_batch_slot_mappings)
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
@@ -627,11 +638,11 @@ class PCPManager:
 
 
 class RunaheadPCPManager(PCPManager):
-    """Experimental KV-Runahead-style PCP manager.
+    """PCP manager for contiguous causal-prefix runahead partitions.
 
-    Runahead is activated only for one fresh request whose entire prompt is
-    scheduled in the current step. All other batches keep the baseline PCP
-    layout and cache-update path.
+    Standard attention accepts homogeneous prefill/extend batches above the
+    configured token threshold. MLA retains the original fresh full-prefill
+    eligibility while both paths share the same runtime and transport.
     """
 
     def __init__(
@@ -740,17 +751,26 @@ class RunaheadPCPManager(PCPManager):
         return rank_segments
 
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
-        full_fresh_prefill = (
-            input_batch.num_reqs == 1
-            and bool(input_batch.is_prefilling_np[0])
-            and int(input_batch.num_computed_tokens_np[0]) == 0
-            and int(input_batch.num_scheduled_tokens[0])
-            == int(input_batch.prefill_len_np[0])
-            and int(input_batch.num_scheduled_tokens[0]) >= self.pcp_world_size
-        )
-        self._use_runahead_partition = full_fresh_prefill
+        if self._standard_attention_pcp:
+            use_runahead = runahead_batch_eligible(
+                num_reqs=input_batch.num_reqs,
+                is_prefilling=input_batch.is_prefilling_np,
+                num_scheduled_tokens=input_batch.num_scheduled_tokens,
+                pcp_world_size=self.pcp_world_size,
+            )
+        else:
+            use_runahead = (
+                input_batch.num_reqs == 1
+                and bool(input_batch.is_prefilling_np[0])
+                and int(input_batch.num_computed_tokens_np[0]) == 0
+                and int(input_batch.num_scheduled_tokens[0])
+                == int(input_batch.prefill_len_np[0])
+                and int(input_batch.num_scheduled_tokens[0]) >= self.pcp_world_size
+            )
+
+        self._use_runahead_partition = use_runahead
         local_batch = super().partition_batch(input_batch)
-        if full_fresh_prefill:
+        if use_runahead:
             self._runahead_runtime.begin_step(local_batch.num_tokens_after_padding)
         else:
             self._runahead_runtime.disable_step()
@@ -817,7 +837,7 @@ def maybe_build_pcp_manager(
     dcp_size = parallel_config.decode_context_parallel_size
     dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
 
-    return manager_cls(
+    manager = manager_cls(
         pcp_world_size=pcp_size,
         pcp_rank=pcp_rank,
         device=device,
@@ -829,3 +849,14 @@ def maybe_build_pcp_manager(
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
     )
+
+    is_standard_attention = not vllm_config.model_config.use_mla
+    manager._standard_attention_pcp = is_standard_attention
+    if is_standard_attention:
+        from vllm.v1.attention.ops.pcp_standard import (
+            install_standard_attention_pcp_cache_updates,
+        )
+
+        install_standard_attention_pcp_cache_updates(vllm_config)
+
+    return manager
