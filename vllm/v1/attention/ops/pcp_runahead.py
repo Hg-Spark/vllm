@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Experimental KV-runahead transport for prefill context parallelism.
 
-The critical path forwards fixed-width causal KV prefixes left-to-right with P2P
+The critical path forwards compact causal KV prefixes left-to-right with P2P
 sends. A separate asynchronous PCP all-gather restores the replicated KV-cache
 image used by later decode steps. Request eligibility and batch partition policy
 live in ``RunaheadPCPManager``; this module only owns the per-layer runtime.
@@ -11,7 +11,7 @@ live in ``RunaheadPCPManager``; this module only owns the per-layer runtime.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -19,7 +19,7 @@ import torch
 from vllm.distributed.parallel_state import Handle, get_pcp_group
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 from vllm.v1.attention.ops.pcp_transport import (
-    all_gather_into_tensor_async,
+    all_gather_variable_into_tensor_async,
     batch_irecv_tensors,
     batch_isend_tensors,
 )
@@ -63,11 +63,11 @@ class _PendingReplica:
 class PCPRunaheadRuntime:
     """Per-process runtime for causal-prefix PCP runahead.
 
-    The runtime consumes equal padded token slabs from each PCP rank. It starts
-    asynchronous full-cache replication, propagates the causal-visible prefix
-    across PCP ranks, and commits completed replicas lazily with bounded
-    backpressure. Higher-level topology and workload eligibility are governed by
-    ``RunaheadPCPManager``.
+    The runtime consumes a known variable-width token slab from each PCP rank.
+    It starts asynchronous compact full-cache replication, propagates the
+    causal-visible prefix across PCP ranks, and commits completed replicas lazily
+    with bounded backpressure. Higher-level topology and workload eligibility are
+    governed by ``RunaheadPCPManager``.
     """
 
     def __init__(
@@ -82,21 +82,58 @@ class PCPRunaheadRuntime:
         self.device = device
         self.max_pending_replica_layers = max_pending_replica_layers
         self.active = False
-        self.local_num_tokens_padded = 0
+        self.rows_per_rank: tuple[int, ...] = ()
+        self.rank_offsets: tuple[int, ...] = ()
         self._pending_sends: deque[_PendingSend] = deque()
         self._pending_replicas: deque[_PendingReplica] = deque()
 
-    def begin_step(self, local_num_tokens_padded: int) -> None:
+    @property
+    def local_rows(self) -> int:
+        if not self.rows_per_rank:
+            return 0
+        return self.rows_per_rank[self.rank]
+
+    @property
+    def prefix_rows(self) -> int:
+        if not self.rank_offsets:
+            return 0
+        return self.rank_offsets[self.rank]
+
+    @property
+    def visible_rows(self) -> int:
+        if not self.rank_offsets:
+            return 0
+        return self.rank_offsets[self.rank + 1]
+
+    @property
+    def total_rows(self) -> int:
+        if not self.rank_offsets:
+            return 0
+        return self.rank_offsets[-1]
+
+    def begin_step(self, rows_per_rank: Sequence[int]) -> None:
         self.flush()
-        if local_num_tokens_padded <= 0:
-            raise ValueError("runahead PCP requires a positive padded token count")
-        self.local_num_tokens_padded = local_num_tokens_padded
+        rows = tuple(int(value) for value in rows_per_rank)
+        if len(rows) != self.world_size:
+            raise ValueError(
+                "runahead PCP rows must match PCP world size: "
+                f"rows={rows}, world_size={self.world_size}"
+            )
+        if any(value <= 0 for value in rows):
+            raise ValueError(f"runahead PCP requires positive rows per rank: {rows}")
+
+        offsets = [0]
+        for value in rows:
+            offsets.append(offsets[-1] + value)
+        self.rows_per_rank = rows
+        self.rank_offsets = tuple(offsets)
         self.active = True
 
     def disable_step(self) -> None:
         self.flush()
         self.active = False
-        self.local_num_tokens_padded = 0
+        self.rows_per_rank = ()
+        self.rank_offsets = ()
 
     def _validate_groups(self) -> None:
         pcp_group = get_pcp_group()
@@ -132,21 +169,22 @@ class PCPRunaheadRuntime:
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         """Return the local causal prefix and forward it to the next PCP rank.
 
-        Rank r receives r fixed-size padded chunks from rank r-1, appends its
-        local chunk, starts a nonblocking send of the aggregate to rank r+1,
-        and returns immediately after the receive dependency is satisfied.
+        Rank r receives the compact prefix owned by ranks [0, r), appends its
+        local variable-width slab, starts a nonblocking send of the aggregate to
+        rank r+1, and returns after the receive dependency is satisfied.
         """
         if not self.active:
             return tensors, slot_mapping
 
         self._validate_groups()
-        rows = self.local_num_tokens_padded
+        local_rows = self.local_rows
         if not tensors:
             raise ValueError("runahead PCP requires at least one tensor")
-        if any(tensor.shape[0] != rows for tensor in tensors):
+        if any(tensor.shape[0] != local_rows for tensor in tensors):
             raise ValueError(
-                "runahead PCP expects fixed padded rows on every PCP rank: "
-                f"rows={rows}, shapes={[tuple(t.shape) for t in tensors]}"
+                "runahead PCP expects the configured local row count: "
+                f"rank={self.rank}, rows={local_rows}, "
+                f"shapes={[tuple(t.shape) for t in tensors]}"
             )
 
         pcp_group = get_pcp_group()
@@ -154,7 +192,7 @@ class PCPRunaheadRuntime:
             with pcp_nvtx_range("pcp.prefix_local_prepare"):
                 visible = tuple(tensor.contiguous() for tensor in tensors)
         else:
-            prefix_rows = self.rank * rows
+            prefix_rows = self.prefix_rows
             recv_tensors = tuple(
                 tensor.new_empty((prefix_rows, *tensor.shape[1:]))
                 for tensor in tensors
@@ -169,8 +207,7 @@ class PCPRunaheadRuntime:
                     for prefix, local in zip(recv_tensors, tensors, strict=True)
                 )
 
-        visible_rows = (self.rank + 1) * rows
-        visible_slot_mapping = slot_mapping[:visible_rows]
+        visible_slot_mapping = slot_mapping[: self.visible_rows]
 
         if self.rank + 1 < self.world_size:
             works = batch_isend_tensors(pcp_group, visible, self.rank + 1)
@@ -185,22 +222,23 @@ class PCPRunaheadRuntime:
         slot_mapping: torch.Tensor,
         apply: CacheUpdate,
     ) -> None:
-        """Asynchronously materialize the full PCP cache image.
-
-        The result is outside the current-layer attention critical path. The
-        bounded pending queue prevents memory growth with model depth.
-        """
+        """Asynchronously materialize the compact full PCP cache image."""
         if not self.active:
             return
 
         self._validate_groups()
         self._apply_backpressure()
 
-        rows = self.local_num_tokens_padded
-        if any(tensor.shape[0] != rows for tensor in tensors):
+        local_rows = self.local_rows
+        if any(tensor.shape[0] != local_rows for tensor in tensors):
             raise ValueError(
-                "runahead PCP replication expects padded local inputs "
-                f"with {rows} rows"
+                "runahead PCP replication expects the configured local rows: "
+                f"rank={self.rank}, rows={local_rows}"
+            )
+        if slot_mapping.shape[0] < self.total_rows:
+            raise ValueError(
+                "runahead PCP slot mapping is shorter than the compact layout: "
+                f"slots={slot_mapping.shape[0]}, rows={self.total_rows}"
             )
 
         pcp_group = get_pcp_group()
@@ -209,9 +247,7 @@ class PCPRunaheadRuntime:
         with pcp_nvtx_range("pcp.replica_buffer_prepare"):
             for tensor in tensors:
                 local = tensor.contiguous()
-                output = tensor.new_empty(
-                    (self.world_size * rows, *tensor.shape[1:])
-                )
+                output = tensor.new_empty((self.total_rows, *tensor.shape[1:]))
                 local_inputs.append(local)
                 gathered.append(output)
 
@@ -219,7 +255,12 @@ class PCPRunaheadRuntime:
         with pcp_nvtx_range("pcp.replica_allgather_enqueue"):
             for local, output in zip(local_inputs, gathered, strict=True):
                 works.append(
-                    all_gather_into_tensor_async(pcp_group, output, local)
+                    all_gather_variable_into_tensor_async(
+                        pcp_group,
+                        output,
+                        local,
+                        self.rows_per_rank,
+                    )
                 )
 
         self._pending_replicas.append(
@@ -227,7 +268,7 @@ class PCPRunaheadRuntime:
                 works=works,
                 local_inputs=tuple(local_inputs),
                 gathered=tuple(gathered),
-                slot_mapping=slot_mapping,
+                slot_mapping=slot_mapping[: self.total_rows],
                 apply=apply,
             )
         )
