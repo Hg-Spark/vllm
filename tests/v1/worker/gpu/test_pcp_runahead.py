@@ -20,6 +20,7 @@ def _manager(
 ) -> RunaheadPCPManager:
     manager = object.__new__(RunaheadPCPManager)
     manager.pcp_world_size = world_size
+    manager._standard_attention_pcp = True
     manager._use_runahead_partition = True
     manager._load_weights = weights
     return manager
@@ -127,6 +128,14 @@ def test_weighted_partition_rounding_preserves_all_tokens() -> None:
     lengths = weighted_partition_lengths(10, (4.0, 2.5, 1.9, 1.6))
     assert lengths == (4, 2, 2, 2)
     assert sum(lengths) == 10
+
+
+def test_weighted_partition_is_ignored_for_mla() -> None:
+    manager = _manager(4, (4.0, 2.5, 1.9, 1.6))
+    manager._standard_attention_pcp = False
+
+    assert manager._weighted_lengths(10) == (3, 3, 3, 1)
+    assert not manager._use_compact_layout()
 
 
 def test_parse_runahead_load_weights() -> None:
