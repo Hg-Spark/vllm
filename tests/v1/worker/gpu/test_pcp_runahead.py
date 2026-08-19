@@ -2,17 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import numpy as np
+import pytest
+import torch
 
+from vllm.v1.attention.ops.pcp_runahead import PCPRunaheadRuntime
 from vllm.v1.worker.gpu.pcp_manager import (
     RunaheadPCPManager,
+    parse_runahead_load_weights,
     runahead_batch_eligible,
+    weighted_partition_lengths,
 )
 
 
-def _manager(world_size: int) -> RunaheadPCPManager:
+def _manager(
+    world_size: int,
+    weights: tuple[float, ...] | None = None,
+) -> RunaheadPCPManager:
     manager = object.__new__(RunaheadPCPManager)
     manager.pcp_world_size = world_size
     manager._use_runahead_partition = True
+    manager._load_weights = weights
     return manager
 
 
@@ -86,6 +95,82 @@ def test_runahead_partition_supports_multiple_prefill_requests() -> None:
         )
 
     assert actual == expected
+
+
+def test_weighted_partition_uses_normalized_load_weights() -> None:
+    weights = (4.0, 2.5, 1.9, 1.6)
+    assert weighted_partition_lengths(10_000, weights) == (4000, 2500, 1900, 1600)
+
+    manager = _manager(4, weights)
+    actual: list[tuple[int, int]] = []
+    for rank in range(4):
+        (segment,) = manager._get_rank_segments(
+            rank,
+            np.asarray([10_000], dtype=np.int32),
+            np.asarray([0], dtype=np.int32),
+            np.asarray([True]),
+            np.asarray([0, 10_000], dtype=np.int32),
+        )
+        actual.append(
+            (segment.global_batch_slice.start, segment.global_batch_slice.stop)
+        )
+
+    assert actual == [
+        (0, 4000),
+        (4000, 6500),
+        (6500, 8400),
+        (8400, 10_000),
+    ]
+
+
+def test_weighted_partition_rounding_preserves_all_tokens() -> None:
+    lengths = weighted_partition_lengths(10, (4.0, 2.5, 1.9, 1.6))
+    assert lengths == (4, 2, 2, 2)
+    assert sum(lengths) == 10
+
+
+def test_parse_runahead_load_weights() -> None:
+    assert parse_runahead_load_weights("4,2.5,1.9,1.6", 4) == (
+        4.0,
+        2.5,
+        1.9,
+        1.6,
+    )
+    assert parse_runahead_load_weights(None, 4) is None
+    assert parse_runahead_load_weights("", 4) is None
+
+    with pytest.raises(ValueError, match="requires 4 values"):
+        parse_runahead_load_weights("1,1,1", 4)
+    with pytest.raises(ValueError, match="finite and positive"):
+        parse_runahead_load_weights("1,1,0,1", 4)
+    with pytest.raises(ValueError, match="numeric list"):
+        parse_runahead_load_weights("1,foo,1,1", 4)
+
+
+def test_variable_width_runtime_builds_compact_offsets() -> None:
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=4,
+        pcp_rank=2,
+        device=torch.device("cpu"),
+    )
+    runtime.begin_step((4000, 2500, 1900, 1600))
+
+    assert runtime.rows_per_rank == (4000, 2500, 1900, 1600)
+    assert runtime.rank_offsets == (0, 4000, 6500, 8400, 10_000)
+    assert runtime.local_rows == 1900
+    assert runtime.prefix_rows == 6500
+    assert runtime.visible_rows == 8400
+    assert runtime.total_rows == 10_000
+
+
+def test_variable_width_runtime_rejects_empty_rank() -> None:
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(ValueError, match="positive rows"):
+        runtime.begin_step((4, 3, 0, 1))
 
 
 def test_runahead_batch_accepts_fresh_and_existing_context_prefill() -> None:
