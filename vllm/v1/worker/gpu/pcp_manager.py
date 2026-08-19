@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, replace
+import math
+import os
 
 import numpy as np
 import torch
@@ -9,9 +11,13 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 from vllm.v1.attention.ops.pcp_runahead import (
     PCPRunaheadRuntime,
     register_pcp_runahead_runtime,
+)
+from vllm.v1.attention.ops.pcp_transport import (
+    all_gather_variable_into_tensor_async,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
@@ -27,6 +33,62 @@ from vllm.v1.worker.gpu.states import RequestState
 logger = init_logger(__name__)
 
 RUNAHEAD_MIN_PREFILL_TOKENS = 1024
+RUNAHEAD_LOAD_WEIGHTS_ENV = "VLLM_PCP_RUNAHEAD_LOAD_WEIGHTS"
+
+
+def parse_runahead_load_weights(
+    raw: str | None,
+    pcp_world_size: int,
+) -> tuple[float, ...] | None:
+    """Parse optional positive per-rank runahead load weights."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        weights = tuple(float(value.strip()) for value in raw.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            f"{RUNAHEAD_LOAD_WEIGHTS_ENV} must be a comma-separated numeric list"
+        ) from exc
+    if len(weights) != pcp_world_size:
+        raise ValueError(
+            f"{RUNAHEAD_LOAD_WEIGHTS_ENV} requires {pcp_world_size} values, "
+            f"got {len(weights)}: {weights}"
+        )
+    if any(not math.isfinite(weight) or weight <= 0.0 for weight in weights):
+        raise ValueError(
+            f"{RUNAHEAD_LOAD_WEIGHTS_ENV} values must be finite and positive: "
+            f"{weights}"
+        )
+    return weights
+
+
+def weighted_partition_lengths(
+    num_tokens: int,
+    weights: tuple[float, ...],
+) -> tuple[int, ...]:
+    """Allocate integer token counts according to normalized weights.
+
+    Floors the ideal per-rank counts, then distributes the remainder to the
+    largest fractional parts. Ties are stable by rank index.
+    """
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    if not weights:
+        raise ValueError("weighted PCP partition requires at least one weight")
+    total_weight = sum(weights)
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError(f"invalid PCP load weights: {weights}")
+
+    ideal = [num_tokens * weight / total_weight for weight in weights]
+    lengths = [math.floor(value) for value in ideal]
+    remainder = num_tokens - sum(lengths)
+    order = sorted(
+        range(len(weights)),
+        key=lambda rank: (-(ideal[rank] - lengths[rank]), rank),
+    )
+    for rank in order[:remainder]:
+        lengths[rank] += 1
+    return tuple(lengths)
 
 
 def runahead_batch_eligible(
@@ -93,6 +155,8 @@ class PCPManager:
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
+        self._per_rank_num_tokens: tuple[int, ...] | None = None
+        self._rank_offsets: tuple[int, ...] | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
         max_num_local_reqs = 2 * max_num_reqs if max_num_reqs is not None else None
@@ -144,6 +208,9 @@ class PCPManager:
             if max_num_tokens is not None and num_kv_cache_groups > 0
             else None
         )
+
+    def _use_compact_layout(self) -> bool:
+        return False
 
     @staticmethod
     def validate_config(
@@ -290,12 +357,23 @@ class PCPManager:
             per_rank_num_tokens.append(num_rank_tokens)
 
         hidden_restore_idx = np.empty(int(query_start_loc_np[-1]), dtype=np.int64)
-        padded_num_tokens = max(per_rank_num_tokens)
-        num_expanded_tokens = padded_num_tokens * self.pcp_world_size
+        compact_layout = self._use_compact_layout()
+        if compact_layout:
+            rank_offsets = [0]
+            for num_rank_tokens in per_rank_num_tokens:
+                rank_offsets.append(rank_offsets[-1] + num_rank_tokens)
+            num_expanded_tokens = rank_offsets[-1]
+        else:
+            padded_num_tokens = max(per_rank_num_tokens)
+            rank_offsets = [
+                rank * padded_num_tokens for rank in range(self.pcp_world_size + 1)
+            ]
+            num_expanded_tokens = padded_num_tokens * self.pcp_world_size
+
         padded_gather_idx = np.zeros(num_expanded_tokens, dtype=np.int64)
         gathered_kv_write_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
         for rank, segments in enumerate(segments_by_rank):
-            expanded_rank_offset = rank * padded_num_tokens
+            expanded_rank_offset = rank_offsets[rank]
             for segment in segments:
                 padded_gathered_slice = slice(
                     expanded_rank_offset + segment.rank_local_batch_slice.start,
@@ -324,6 +402,8 @@ class PCPManager:
         self._gathered_kv_write_mask = async_copy_to_gpu(
             gathered_kv_write_mask, device=self.device
         )
+        self._per_rank_num_tokens = tuple(per_rank_num_tokens)
+        self._rank_offsets = tuple(rank_offsets)
         return segments_by_rank, per_rank_num_tokens
 
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
@@ -394,7 +474,11 @@ class PCPManager:
         ]
 
         num_local_tokens = int(local_num_scheduled_tokens.sum())
-        num_local_tokens_padded = max(per_rank_num_tokens)
+        num_local_tokens_padded = (
+            per_rank_num_tokens[self.pcp_rank]
+            if self._use_compact_layout()
+            else max(per_rank_num_tokens)
+        )
         fresh_prefills = int(
             np.count_nonzero(is_prefilling & (num_computed_tokens == 0))
         )
@@ -404,7 +488,7 @@ class PCPManager:
         logger.debug(
             "PCP batch: rank=%d global_batch_reqs=%d fresh_prefills=%d "
             "continued_prefills=%d decodes=%d local_reqs=%d "
-            "local_tokens=%d per_rank_tokens=%s",
+            "local_tokens=%d per_rank_tokens=%s compact=%s",
             self.pcp_rank,
             global_batch.num_reqs,
             fresh_prefills,
@@ -413,13 +497,15 @@ class PCPManager:
             num_local_reqs,
             num_local_tokens,
             per_rank_num_tokens,
+            self._use_compact_layout(),
         )
         if num_local_tokens_padded > input_buffers.max_num_tokens:
             raise RuntimeError(
                 "PCP local token count exceeds the MRV2 input buffer size: "
                 f"{num_local_tokens_padded} > {input_buffers.max_num_tokens}."
             )
-        rank_token_start = self.pcp_rank * num_local_tokens_padded
+        assert self._rank_offsets is not None
+        rank_token_start = self._rank_offsets[self.pcp_rank]
         assert self._padded_gather_idx is not None
         local_gather_idx = self._padded_gather_idx[
             rank_token_start : rank_token_start + num_local_tokens_padded
@@ -623,7 +709,20 @@ class PCPManager:
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._hidden_restore_idx is None:
             return hidden_states
-        gathered = get_pcp_group().all_gather(hidden_states, dim=0)
+        if self._use_compact_layout():
+            assert self._per_rank_num_tokens is not None
+            total_rows = sum(self._per_rank_num_tokens)
+            gathered = hidden_states.new_empty((total_rows, *hidden_states.shape[1:]))
+            with pcp_nvtx_range("pcp.restore_hidden_variable_allgather"):
+                work = all_gather_variable_into_tensor_async(
+                    get_pcp_group(),
+                    gathered,
+                    hidden_states.contiguous(),
+                    self._per_rank_num_tokens,
+                )
+                work.wait()
+        else:
+            gathered = get_pcp_group().all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 
     def restore_for_sampling(
@@ -671,12 +770,19 @@ class RunaheadPCPManager(PCPManager):
             cp_interleave=cp_interleave,
         )
         self._use_runahead_partition = False
+        self._load_weights = parse_runahead_load_weights(
+            os.environ.get(RUNAHEAD_LOAD_WEIGHTS_ENV),
+            pcp_world_size,
+        )
         self._runahead_runtime = PCPRunaheadRuntime(
             pcp_world_size=pcp_world_size,
             pcp_rank=pcp_rank,
             device=device,
         )
         register_pcp_runahead_runtime(self._runahead_runtime)
+
+    def _use_compact_layout(self) -> bool:
+        return self._use_runahead_partition and self._load_weights is not None
 
     @staticmethod
     def validate_config(
@@ -706,6 +812,15 @@ class RunaheadPCPManager(PCPManager):
                 "runahead PCP MVP does not support async scheduling"
             )
 
+    def _weighted_lengths(self, query_len: int) -> tuple[int, ...]:
+        if self._load_weights is None:
+            chunk_size = (query_len + self.pcp_world_size - 1) // self.pcp_world_size
+            return tuple(
+                max(0, min(chunk_size, query_len - rank * chunk_size))
+                for rank in range(self.pcp_world_size)
+            )
+        return weighted_partition_lengths(query_len, self._load_weights)
+
     def _get_rank_segments(
         self,
         rank: int,
@@ -730,11 +845,9 @@ class RunaheadPCPManager(PCPManager):
             if query_len == 0:
                 continue
             global_batch_start = int(query_start_loc_np[global_batch_req_idx])
-            chunk_size = (
-                query_len + self.pcp_world_size - 1
-            ) // self.pcp_world_size
-            chunk_offset = rank * chunk_size
-            chunk_len = min(chunk_size, query_len - chunk_offset)
+            lengths = self._weighted_lengths(query_len)
+            chunk_offset = sum(lengths[:rank])
+            chunk_len = lengths[rank]
             if chunk_len <= 0:
                 continue
             chunk_start = global_batch_start + chunk_offset
@@ -749,6 +862,14 @@ class RunaheadPCPManager(PCPManager):
             )
             rank_offset += chunk_len
         return rank_segments
+
+    def _runahead_rows_per_rank(self, input_batch: InputBatch) -> tuple[int, ...]:
+        rows = [0] * self.pcp_world_size
+        for num_tokens in input_batch.num_scheduled_tokens[: input_batch.num_reqs]:
+            lengths = self._weighted_lengths(int(num_tokens))
+            for rank, length in enumerate(lengths):
+                rows[rank] += length
+        return tuple(rows)
 
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
         if self._standard_attention_pcp:
@@ -768,10 +889,25 @@ class RunaheadPCPManager(PCPManager):
                 and int(input_batch.num_scheduled_tokens[0]) >= self.pcp_world_size
             )
 
+        if use_runahead and self._load_weights is not None:
+            rows_per_rank = self._runahead_rows_per_rank(input_batch)
+            if any(rows <= 0 for rows in rows_per_rank):
+                logger.debug(
+                    "PCP runahead weighted partition produced an empty rank; "
+                    "falling back to baseline PCP: rows=%s",
+                    rows_per_rank,
+                )
+                use_runahead = False
+
         self._use_runahead_partition = use_runahead
         local_batch = super().partition_batch(input_batch)
         if use_runahead:
-            self._runahead_runtime.begin_step(local_batch.num_tokens_after_padding)
+            if self._use_compact_layout():
+                assert self._per_rank_num_tokens is not None
+                runtime_rows = self._per_rank_num_tokens
+            else:
+                runtime_rows = (local_batch.num_tokens_after_padding,) * self.pcp_world_size
+            self._runahead_runtime.begin_step(runtime_rows)
         else:
             self._runahead_runtime.disable_step()
         return local_batch
