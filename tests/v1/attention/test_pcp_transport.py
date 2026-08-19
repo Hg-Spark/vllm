@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from vllm.v1.attention.ops.pcp_transport import (
     all_gather_into_tensor_async,
+    all_gather_variable_into_tensor_async,
     batch_irecv_tensors,
     batch_isend_tensors,
 )
@@ -112,3 +113,52 @@ def test_all_gather_into_tensor_async_uses_device_group() -> None:
         group=group.device_group,
         async_op=True,
     )
+
+
+def test_variable_all_gather_builds_compact_uneven_views() -> None:
+    group = _group()
+    rows_per_rank = (3, 2, 4, 1)
+    input_ = torch.empty(2, 5)
+    output = torch.empty(10, 5)
+    handle = MagicMock()
+
+    with patch(
+        "vllm.v1.attention.ops.pcp_transport.dist.all_gather",
+        return_value=handle,
+    ) as op:
+        assert (
+            all_gather_variable_into_tensor_async(
+                group, output, input_, rows_per_rank
+            )
+            is handle
+        )
+
+    output_views = op.call_args.args[0]
+    assert [view.shape[0] for view in output_views] == [3, 2, 4, 1]
+    assert [view.storage_offset() for view in output_views] == [0, 15, 25, 45]
+    assert op.call_args.args[1] is input_
+    assert op.call_args.kwargs == {
+        "group": group.device_group,
+        "async_op": True,
+    }
+
+
+def test_variable_all_gather_validates_local_and_total_rows() -> None:
+    group = _group()
+    rows_per_rank = (3, 2, 4, 1)
+
+    with pytest.raises(ValueError, match="local input"):
+        all_gather_variable_into_tensor_async(
+            group,
+            torch.empty(10, 5),
+            torch.empty(3, 5),
+            rows_per_rank,
+        )
+
+    with pytest.raises(ValueError, match="output"):
+        all_gather_variable_into_tensor_async(
+            group,
+            torch.empty(9, 5),
+            torch.empty(2, 5),
+            rows_per_rank,
+        )
