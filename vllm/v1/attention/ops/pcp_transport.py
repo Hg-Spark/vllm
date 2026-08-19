@@ -64,10 +64,54 @@ def all_gather_into_tensor_async(
     output: torch.Tensor,
     input_: torch.Tensor,
 ) -> Handle:
-    """Launch an asynchronous tensor all-gather on the PCP device group."""
+    """Launch an asynchronous equal-width tensor all-gather."""
     with pcp_nvtx_range("pcp.transport.allgather_enqueue"):
         return dist.all_gather_into_tensor(
             output,
+            input_,
+            group=group.device_group,
+            async_op=True,
+        )
+
+
+def all_gather_variable_into_tensor_async(
+    group: GroupCoordinator,
+    output: torch.Tensor,
+    input_: torch.Tensor,
+    rows_per_rank: tuple[int, ...],
+) -> Handle:
+    """Gather uneven dim-0 slabs into one compact rank-major output tensor."""
+    if len(rows_per_rank) != group.world_size:
+        raise ValueError(
+            "PCP variable all-gather rows must match the group size: "
+            f"rows={rows_per_rank}, world_size={group.world_size}"
+        )
+    if any(rows < 0 for rows in rows_per_rank):
+        raise ValueError(
+            f"PCP variable all-gather rows must be non-negative: {rows_per_rank}"
+        )
+    local_rows = rows_per_rank[group.rank_in_group]
+    if input_.shape[0] != local_rows:
+        raise ValueError(
+            "PCP variable all-gather local input has the wrong row count: "
+            f"rank={group.rank_in_group}, expected={local_rows}, got={input_.shape[0]}"
+        )
+    total_rows = sum(rows_per_rank)
+    if output.shape[0] != total_rows:
+        raise ValueError(
+            "PCP variable all-gather output has the wrong row count: "
+            f"expected={total_rows}, got={output.shape[0]}"
+        )
+
+    output_views: list[torch.Tensor] = []
+    offset = 0
+    for rows in rows_per_rank:
+        output_views.append(output.narrow(0, offset, rows))
+        offset += rows
+
+    with pcp_nvtx_range("pcp.transport.variable_allgather_enqueue"):
+        return dist.all_gather(
+            output_views,
             input_,
             group=group.device_group,
             async_op=True,
