@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass, replace
 import math
 import os
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -781,8 +781,16 @@ class RunaheadPCPManager(PCPManager):
         )
         register_pcp_runahead_runtime(self._runahead_runtime)
 
+    def _effective_load_weights(self) -> tuple[float, ...] | None:
+        if not self._standard_attention_pcp:
+            return None
+        return self._load_weights
+
     def _use_compact_layout(self) -> bool:
-        return self._use_runahead_partition and self._load_weights is not None
+        return (
+            self._use_runahead_partition
+            and self._effective_load_weights() is not None
+        )
 
     @staticmethod
     def validate_config(
@@ -813,13 +821,14 @@ class RunaheadPCPManager(PCPManager):
             )
 
     def _weighted_lengths(self, query_len: int) -> tuple[int, ...]:
-        if self._load_weights is None:
+        weights = self._effective_load_weights()
+        if weights is None:
             chunk_size = (query_len + self.pcp_world_size - 1) // self.pcp_world_size
             return tuple(
                 max(0, min(chunk_size, query_len - rank * chunk_size))
                 for rank in range(self.pcp_world_size)
             )
-        return weighted_partition_lengths(query_len, self._load_weights)
+        return weighted_partition_lengths(query_len, weights)
 
     def _get_rank_segments(
         self,
@@ -889,7 +898,7 @@ class RunaheadPCPManager(PCPManager):
                 and int(input_batch.num_scheduled_tokens[0]) >= self.pcp_world_size
             )
 
-        if use_runahead and self._load_weights is not None:
+        if use_runahead and self._effective_load_weights() is not None:
             rows_per_rank = self._runahead_rows_per_rank(input_batch)
             if any(rows <= 0 for rows in rows_per_rank):
                 logger.debug(
