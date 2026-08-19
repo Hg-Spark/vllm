@@ -13,20 +13,22 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
 import torch
-import torch.distributed as dist
 
-from vllm.distributed.parallel_state import get_pcp_group, get_world_group
+from vllm.distributed.parallel_state import Handle, get_pcp_group
+from vllm.v1.attention.ops.pcp_transport import (
+    all_gather_into_tensor_async,
+    batch_irecv_tensors,
+    batch_isend_tensors,
+)
 
 CacheUpdate = Callable[[tuple[torch.Tensor, ...], torch.Tensor], None]
 
 
 @dataclass
 class _PendingSend:
-    works: list[Any]
-    tensors: tuple[torch.Tensor, ...]
+    works: list[Handle]
 
     def completed(self) -> bool:
         return all(work.is_completed() for work in self.works)
@@ -38,7 +40,7 @@ class _PendingSend:
 
 @dataclass
 class _PendingReplica:
-    works: list[Any]
+    works: list[Handle]
     local_inputs: tuple[torch.Tensor, ...]
     gathered: tuple[torch.Tensor, ...]
     slot_mapping: torch.Tensor
@@ -57,10 +59,12 @@ class PCPRunaheadRuntime:
     """Per-process runtime for the experimental runahead PCP path.
 
     Scope is intentionally narrow:
-      * one node / TP1 / PP1 / DP1;
       * one fresh full-prefill request;
       * equal contiguous PCP chunks (last rank may contain padding);
       * existing replicated PCP KV cache is restored asynchronously.
+
+    Transport is scoped to the PCP process group. Higher-level topology support
+    is still governed by ``RunaheadPCPManager.validate_config``.
     """
 
     def __init__(
@@ -93,17 +97,13 @@ class PCPRunaheadRuntime:
 
     def _validate_groups(self) -> None:
         pcp_group = get_pcp_group()
-        world_group = get_world_group()
         if pcp_group.world_size != self.world_size:
             raise RuntimeError(
                 "runahead PCP world-size changed after runtime initialization"
             )
-        # The MVP uses the world communicator as an independent P2P communicator
-        # while the PCP communicator carries asynchronous all-gathers.
-        if world_group.world_size != self.world_size or world_group.rank != self.rank:
+        if pcp_group.rank_in_group != self.rank:
             raise RuntimeError(
-                "runahead PCP MVP requires world ranks to match PCP ranks "
-                "(TP=PP=DP=1)"
+                "runahead PCP rank changed after runtime initialization"
             )
 
     def _drain_sends(self) -> None:
@@ -145,7 +145,7 @@ class PCPRunaheadRuntime:
                 f"rows={rows}, shapes={[tuple(t.shape) for t in tensors]}"
             )
 
-        p2p_group = get_world_group().device_group
+        pcp_group = get_pcp_group()
         if self.rank == 0:
             visible = tuple(tensor.contiguous() for tensor in tensors)
         else:
@@ -154,11 +154,7 @@ class PCPRunaheadRuntime:
                 tensor.new_empty((prefix_rows, *tensor.shape[1:]))
                 for tensor in tensors
             )
-            ops = [
-                dist.P2POp(dist.irecv, recv_tensor, self.rank - 1, group=p2p_group)
-                for recv_tensor in recv_tensors
-            ]
-            works = dist.batch_isend_irecv(ops)
+            works = batch_irecv_tensors(pcp_group, recv_tensors, self.rank - 1)
             for work in works:
                 work.wait()
             visible = tuple(
@@ -170,13 +166,8 @@ class PCPRunaheadRuntime:
         visible_slot_mapping = slot_mapping[:visible_rows]
 
         if self.rank + 1 < self.world_size:
-            ops = [
-                dist.P2POp(dist.isend, tensor, self.rank + 1, group=p2p_group)
-                for tensor in visible
-            ]
-            works = dist.batch_isend_irecv(ops)
-            # Hold the tensors until NCCL has finished reading from them.
-            self._pending_sends.append(_PendingSend(works, visible))
+            works = batch_isend_tensors(pcp_group, visible, self.rank + 1)
+            self._pending_sends.append(_PendingSend(works))
             self._drain_sends()
 
         return visible, visible_slot_mapping
@@ -205,19 +196,14 @@ class PCPRunaheadRuntime:
                 f"with {rows} rows"
             )
 
-        pcp_group = get_pcp_group().device_group
+        pcp_group = get_pcp_group()
         local_inputs: list[torch.Tensor] = []
         gathered: list[torch.Tensor] = []
-        works: list[Any] = []
+        works: list[Handle] = []
         for tensor in tensors:
             local = tensor.contiguous()
             output = tensor.new_empty((self.world_size * rows, *tensor.shape[1:]))
-            work = dist.all_gather_into_tensor(
-                output,
-                local,
-                group=pcp_group,
-                async_op=True,
-            )
+            work = all_gather_into_tensor_async(pcp_group, output, local)
             local_inputs.append(local)
             gathered.append(output)
             works.append(work)
