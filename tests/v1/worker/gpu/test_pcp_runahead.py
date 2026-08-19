@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 import torch
@@ -136,6 +138,73 @@ def test_weighted_partition_is_ignored_for_mla() -> None:
 
     assert manager._weighted_lengths(10) == (3, 3, 3, 1)
     assert not manager._use_compact_layout()
+
+
+def test_weighted_layout_is_compact_and_rank_major() -> None:
+    manager = _manager(4, (4.0, 3.0, 2.0, 1.0))
+    manager.device = torch.device("cpu")
+    scheduled = np.asarray([8, 4], dtype=np.int32)
+    computed = np.asarray([0, 16384], dtype=np.int32)
+    is_prefilling = np.asarray([True, True])
+    query_start = np.asarray([0, 8, 12], dtype=np.int32)
+
+    def copy_to_cpu(
+        value: np.ndarray,
+        device: torch.device | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del device
+        tensor = torch.as_tensor(value)
+        if out is not None:
+            out.copy_(tensor)
+            return out
+        return tensor
+
+    with patch(
+        "vllm.v1.worker.gpu.pcp_manager.async_copy_to_gpu",
+        side_effect=copy_to_cpu,
+    ):
+        _, rows = manager._build_batch_layout(
+            scheduled,
+            computed,
+            is_prefilling,
+            query_start,
+        )
+
+    assert rows == [5, 3, 3, 1]
+    assert manager._rank_offsets == (0, 5, 8, 11, 12)
+    assert manager._padded_gather_idx is not None
+    assert manager._padded_gather_idx.tolist() == [
+        0,
+        1,
+        2,
+        8,
+        9,
+        3,
+        4,
+        10,
+        5,
+        6,
+        11,
+        7,
+    ]
+    assert manager._hidden_restore_idx is not None
+    assert manager._hidden_restore_idx.tolist() == [
+        0,
+        1,
+        2,
+        5,
+        6,
+        8,
+        9,
+        11,
+        3,
+        4,
+        7,
+        10,
+    ]
+    assert manager._gathered_kv_write_mask is not None
+    assert bool(manager._gathered_kv_write_mask.all())
 
 
 def test_parse_runahead_load_weights() -> None:
