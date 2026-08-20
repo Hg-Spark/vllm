@@ -8,15 +8,15 @@ layer L repair traffic cannot queue ahead of layer L+1 prefix traffic on the
 same PCP ProcessGroup.
 
 Deferred repair is sourced from persistent paged KV cache storage. The runtime
-records raw cache block views and the block IDs touched by the current step;
-it does not retain per-layer K/V activation tensors until the end of forward.
+records raw cache block views and lightweight slot-mapping references; it does
+not retain per-layer K/V activation tensors until the end of forward.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -49,11 +49,19 @@ class _PendingSend:
 
 
 @dataclass
+class _RepairSlotSource:
+    slot_mapping: torch.Tensor
+    cache_block_size: int
+    total_rows: int
+
+
+@dataclass
 class _DeferredPagedRepair:
-    """Persistent KV storage plus the physical cache blocks to repair."""
+    """Persistent KV storage plus metadata needed to find touched pages."""
 
     cache_blocks: torch.Tensor  # uint8 [num_blocks, bytes_per_block]
-    block_ids: torch.Tensor  # int64, device resident
+    slot_sources: list[_RepairSlotSource] = field(default_factory=list)
+    slot_source_keys: set[tuple[int, int, int]] = field(default_factory=set)
 
 
 class PCPRunaheadRuntime:
@@ -62,7 +70,7 @@ class PCPRunaheadRuntime:
     The runtime consumes a known variable-width token slab from each PCP rank.
     During transformer-layer execution it only propagates the causal-visible
     prefix, commits that visible prefix to the persistent KV cache, and records
-    which persistent cache blocks need replication later.
+    lightweight metadata identifying persistent cache pages to repair later.
 
     At ``flush`` all outstanding prefix sends are drained, PCP ranks rendezvous
     through the CPU group, and the last PCP rank broadcasts the touched raw KV
@@ -238,10 +246,10 @@ class PCPRunaheadRuntime:
         slot_mapping: torch.Tensor,
         cache_block_size: int,
     ) -> None:
-        """Record raw paged-cache blocks touched by this runahead step.
+        """Record persistent cache metadata without launching GPU repair work.
 
-        ``cache_block_size`` is the number of token slots represented by one
-        physical block in ``kv_cache``. No K/V activation tensor is retained.
+        Block-ID extraction is intentionally postponed to ``flush``. This keeps
+        ``torch.unique`` and scalar range checks out of the layer critical path.
         """
         if not self.active:
             return
@@ -261,39 +269,34 @@ class PCPRunaheadRuntime:
             )
 
         with pcp_nvtx_range("pcp.replica_defer"):
-            slots = slot_mapping[: self.total_rows]
-            valid_slots = slots[slots >= 0]
-            if valid_slots.numel() == 0:
-                return
-            block_ids = torch.unique(
-                torch.div(valid_slots, cache_block_size, rounding_mode="floor")
-            ).to(dtype=torch.long)
-            num_blocks = int(kv_cache.shape[0])
-            if bool((block_ids >= num_blocks).any().item()):
-                raise RuntimeError(
-                    "runahead PCP slot mapping addresses past the KV cache block view: "
-                    f"num_blocks={num_blocks}, max_block={int(block_ids.max().item())}"
-                )
-
             storage_ptr = kv_cache.untyped_storage().data_ptr()
-            cache_blocks = self._raw_cache_block_view(kv_cache, num_blocks)
             existing = self._deferred_repairs.get(storage_ptr)
+            num_blocks = int(kv_cache.shape[0])
             if existing is None:
-                self._deferred_repairs[storage_ptr] = _DeferredPagedRepair(
-                    cache_blocks=cache_blocks,
-                    block_ids=block_ids,
+                existing = _DeferredPagedRepair(
+                    cache_blocks=self._raw_cache_block_view(kv_cache, num_blocks)
                 )
-                return
-
-            if existing.cache_blocks.shape != cache_blocks.shape:
+                self._deferred_repairs[storage_ptr] = existing
+            elif existing.cache_blocks.shape[0] != num_blocks:
                 raise RuntimeError(
-                    "runahead PCP found incompatible block views sharing one KV "
-                    f"backing storage: {existing.cache_blocks.shape} vs "
-                    f"{cache_blocks.shape}"
+                    "runahead PCP found incompatible block counts sharing one KV "
+                    f"backing storage: {existing.cache_blocks.shape[0]} vs {num_blocks}"
                 )
-            existing.block_ids = torch.unique(
-                torch.cat((existing.block_ids, block_ids), dim=0)
+
+            source_key = (
+                slot_mapping.data_ptr(),
+                cache_block_size,
+                self.total_rows,
             )
+            if source_key not in existing.slot_source_keys:
+                existing.slot_source_keys.add(source_key)
+                existing.slot_sources.append(
+                    _RepairSlotSource(
+                        slot_mapping=slot_mapping,
+                        cache_block_size=cache_block_size,
+                        total_rows=self.total_rows,
+                    )
+                )
 
     def update_visible_and_defer_repair(
         self,
@@ -313,10 +316,43 @@ class PCPRunaheadRuntime:
                 apply(visible, visible_slot_mapping)
             self.defer_paged_repair(kv_cache, slot_mapping, cache_block_size)
 
+    @staticmethod
+    def _repair_block_ids(repair: _DeferredPagedRepair) -> torch.Tensor:
+        block_id_parts: list[torch.Tensor] = []
+        for source in repair.slot_sources:
+            slots = source.slot_mapping[: source.total_rows]
+            valid_slots = slots[slots >= 0]
+            if valid_slots.numel() == 0:
+                continue
+            block_id_parts.append(
+                torch.div(
+                    valid_slots,
+                    source.cache_block_size,
+                    rounding_mode="floor",
+                ).to(dtype=torch.long)
+            )
+        if not block_id_parts:
+            return torch.empty(
+                0,
+                dtype=torch.long,
+                device=repair.cache_blocks.device,
+            )
+        return torch.unique(torch.cat(block_id_parts, dim=0))
+
     def _repair_paged_cache(self, repair: _DeferredPagedRepair) -> None:
         pcp_group = get_pcp_group()
         source_rank = self.world_size - 1
-        block_ids = repair.block_ids
+        with pcp_nvtx_range("pcp.replica_block_index"):
+            block_ids = self._repair_block_ids(repair)
+            if block_ids.numel() == 0:
+                return
+            num_blocks = repair.cache_blocks.shape[0]
+            if bool((block_ids >= num_blocks).any().item()):
+                raise RuntimeError(
+                    "runahead PCP slot mapping addresses past the KV cache block view: "
+                    f"num_blocks={num_blocks}, max_block={int(block_ids.max().item())}"
+                )
+
         cache_blocks = repair.cache_blocks
         bytes_per_block = int(cache_blocks.shape[1])
         blocks_per_chunk = max(1, _REPAIR_CHUNK_BYTES // bytes_per_block)
