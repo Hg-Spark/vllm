@@ -3,9 +3,11 @@
 """Experimental KV-runahead transport for prefill context parallelism.
 
 The critical path forwards compact causal KV prefixes left-to-right with P2P
-sends. A separate asynchronous PCP all-gather restores the replicated KV-cache
-image used by later decode steps. Request eligibility and batch partition policy
-live in ``RunaheadPCPManager``; this module only owns the per-layer runtime.
+sends. Full replicated-cache repair is deferred until the forward boundary so
+layer L repair traffic cannot queue ahead of layer L+1 prefix traffic on the
+same PCP ProcessGroup. Request eligibility and batch partition policy live in
+``RunaheadPCPManager``; this module owns the per-layer runtime and deferred
+repair queue.
 """
 
 from __future__ import annotations
@@ -41,33 +43,25 @@ class _PendingSend:
 
 
 @dataclass
-class _PendingReplica:
-    works: list[Handle]
+class _DeferredReplica:
     local_inputs: tuple[torch.Tensor, ...]
-    gathered: tuple[torch.Tensor, ...]
     slot_mapping: torch.Tensor
     apply: CacheUpdate
-
-    def completed(self) -> bool:
-        return all(work.is_completed() for work in self.works)
-
-    def finish(self) -> None:
-        with pcp_nvtx_range("pcp.replica_commit"):
-            with pcp_nvtx_range("pcp.replica_wait"):
-                for work in self.works:
-                    work.wait()
-            with pcp_nvtx_range("pcp.replica_cache_update"):
-                self.apply(self.gathered, self.slot_mapping)
 
 
 class PCPRunaheadRuntime:
     """Per-process runtime for causal-prefix PCP runahead.
 
     The runtime consumes a known variable-width token slab from each PCP rank.
-    It starts asynchronous compact full-cache replication, propagates the
-    causal-visible prefix across PCP ranks, and commits completed replicas lazily
-    with bounded backpressure. Higher-level topology and workload eligibility are
-    governed by ``RunaheadPCPManager``.
+    During transformer-layer execution it only propagates the causal-visible
+    prefix and records enough state to repair the replicated cache later. Full
+    PCP all-gathers are launched by ``flush`` after the model forward, which
+    keeps them out of the cross-layer prefix critical path.
+
+    Deferred repair intentionally retains the local current-step tensors for
+    each participating layer until ``flush``. This is an MVP tradeoff: it proves
+    the communication schedule without requiring paged-cache pack/unpack. A
+    later implementation can source repair payloads from persistent KV cache.
     """
 
     def __init__(
@@ -75,17 +69,15 @@ class PCPRunaheadRuntime:
         pcp_world_size: int,
         pcp_rank: int,
         device: torch.device,
-        max_pending_replica_layers: int = 4,
     ) -> None:
         self.world_size = pcp_world_size
         self.rank = pcp_rank
         self.device = device
-        self.max_pending_replica_layers = max_pending_replica_layers
         self.active = False
         self.rows_per_rank: tuple[int, ...] = ()
         self.rank_offsets: tuple[int, ...] = ()
         self._pending_sends: deque[_PendingSend] = deque()
-        self._pending_replicas: deque[_PendingReplica] = deque()
+        self._deferred_replicas: deque[_DeferredReplica] = deque()
 
     @property
     def local_rows(self) -> int:
@@ -110,6 +102,10 @@ class PCPRunaheadRuntime:
         if not self.rank_offsets:
             return 0
         return self.rank_offsets[-1]
+
+    @property
+    def num_deferred_replica_layers(self) -> int:
+        return len(self._deferred_replicas)
 
     def begin_step(self, rows_per_rank: Sequence[int]) -> None:
         self.flush()
@@ -149,18 +145,6 @@ class PCPRunaheadRuntime:
     def _drain_sends(self) -> None:
         while self._pending_sends and self._pending_sends[0].completed():
             self._pending_sends.popleft().wait()
-
-    def _drain_replicas(self) -> None:
-        while self._pending_replicas and self._pending_replicas[0].completed():
-            self._pending_replicas.popleft().finish()
-
-    def _apply_backpressure(self) -> None:
-        with pcp_nvtx_range("pcp.replica_backpressure"):
-            self._drain_sends()
-            self._drain_replicas()
-            while len(self._pending_replicas) >= self.max_pending_replica_layers:
-                self._pending_replicas.popleft().finish()
-                self._drain_replicas()
 
     def exchange_prefix(
         self,
@@ -216,23 +200,21 @@ class PCPRunaheadRuntime:
 
         return visible, visible_slot_mapping
 
-    def enqueue_replication(
+    def defer_replication(
         self,
         tensors: tuple[torch.Tensor, ...],
         slot_mapping: torch.Tensor,
         apply: CacheUpdate,
     ) -> None:
-        """Asynchronously materialize the compact full PCP cache image."""
+        """Record one layer's full-cache repair without launching communication."""
         if not self.active:
             return
 
         self._validate_groups()
-        self._apply_backpressure()
-
         local_rows = self.local_rows
         if any(tensor.shape[0] != local_rows for tensor in tensors):
             raise ValueError(
-                "runahead PCP replication expects the configured local rows: "
+                "runahead PCP deferred repair expects the configured local rows: "
                 f"rank={self.rank}, rows={local_rows}"
             )
         if slot_mapping.shape[0] < self.total_rows:
@@ -241,19 +223,28 @@ class PCPRunaheadRuntime:
                 f"slots={slot_mapping.shape[0]}, rows={self.total_rows}"
             )
 
-        pcp_group = get_pcp_group()
-        local_inputs: list[torch.Tensor] = []
-        gathered: list[torch.Tensor] = []
-        with pcp_nvtx_range("pcp.replica_buffer_prepare"):
-            for tensor in tensors:
-                local = tensor.contiguous()
-                output = tensor.new_empty((self.total_rows, *tensor.shape[1:]))
-                local_inputs.append(local)
-                gathered.append(output)
+        with pcp_nvtx_range("pcp.replica_defer"):
+            self._deferred_replicas.append(
+                _DeferredReplica(
+                    local_inputs=tuple(tensor.contiguous() for tensor in tensors),
+                    slot_mapping=slot_mapping[: self.total_rows],
+                    apply=apply,
+                )
+            )
 
+    def _repair_replica(self, replica: _DeferredReplica) -> None:
+        pcp_group = get_pcp_group()
+        gathered: list[torch.Tensor] = []
         works: list[Handle] = []
+
+        with pcp_nvtx_range("pcp.replica_buffer_prepare"):
+            for local in replica.local_inputs:
+                gathered.append(
+                    local.new_empty((self.total_rows, *local.shape[1:]))
+                )
+
         with pcp_nvtx_range("pcp.replica_allgather_enqueue"):
-            for local, output in zip(local_inputs, gathered, strict=True):
+            for local, output in zip(replica.local_inputs, gathered, strict=True):
                 works.append(
                     all_gather_variable_into_tensor_async(
                         pcp_group,
@@ -263,15 +254,12 @@ class PCPRunaheadRuntime:
                     )
                 )
 
-        self._pending_replicas.append(
-            _PendingReplica(
-                works=works,
-                local_inputs=tuple(local_inputs),
-                gathered=tuple(gathered),
-                slot_mapping=slot_mapping[: self.total_rows],
-                apply=apply,
-            )
-        )
+        with pcp_nvtx_range("pcp.replica_wait"):
+            for work in works:
+                work.wait()
+
+        with pcp_nvtx_range("pcp.replica_cache_update"):
+            replica.apply(tuple(gathered), replica.slot_mapping)
 
     def update_and_replicate(
         self,
@@ -279,24 +267,24 @@ class PCPRunaheadRuntime:
         slot_mapping: torch.Tensor,
         apply: CacheUpdate,
     ) -> None:
-        """Launch full replication, then commit only the causal prefix locally."""
+        """Commit the causal prefix now and defer full replication to flush."""
         with pcp_nvtx_range("pcp.runahead_kv_update"):
-            with pcp_nvtx_range("pcp.replica_launch"):
-                self.enqueue_replication(tensors, slot_mapping, apply)
             with pcp_nvtx_range("pcp.prefix_exchange"):
                 visible, visible_slot_mapping = self.exchange_prefix(
                     tensors, slot_mapping
                 )
             with pcp_nvtx_range("pcp.visible_cache_update"):
                 apply(visible, visible_slot_mapping)
-            self._drain_replicas()
+            self.defer_replication(tensors, slot_mapping, apply)
 
     def flush(self) -> None:
+        """Complete P2P sends, then repair all deferred replicated cache images."""
         with pcp_nvtx_range("pcp.flush"):
-            while self._pending_replicas:
-                self._pending_replicas.popleft().finish()
             while self._pending_sends:
                 self._pending_sends.popleft().wait()
+            while self._deferred_replicas:
+                with pcp_nvtx_range("pcp.replica_commit"):
+                    self._repair_replica(self._deferred_replicas.popleft())
 
 
 _RUNTIME: PCPRunaheadRuntime | None = None
