@@ -22,6 +22,7 @@ class PCPRunaheadConfig:
     transport: TransportPolicy = "prefix_p2p"
     partition_policy: PartitionPolicy = "equal_contiguous"
     weights: tuple[float, ...] | None = None
+    segment_to_rank: tuple[int, ...] = ()
     page_align: bool = True
     layout: LayoutPolicy = "compact"
     require_full_prefill: bool = True
@@ -33,7 +34,7 @@ def parse_runahead_weights(
     raw: object,
     pcp_world_size: int,
 ) -> tuple[float, ...] | None:
-    """Parse manually supplied positive per-rank load weights."""
+    """Parse manually supplied positive per-segment load weights."""
     if raw is None:
         return None
     if not isinstance(raw, (list, tuple)):
@@ -51,6 +52,79 @@ def parse_runahead_weights(
     if any(not math.isfinite(weight) or weight <= 0.0 for weight in weights):
         raise ValueError(f"weights values must be finite and positive: {weights}")
     return weights
+
+
+def parse_runahead_segments(
+    raw: object,
+    pcp_world_size: int,
+) -> tuple[tuple[float, ...], tuple[int, ...]] | None:
+    """Parse logical segments and their physical PCP-rank bindings."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(
+            f"segments must be a JSON list with {pcp_world_size} objects"
+        )
+    if len(raw) != pcp_world_size:
+        raise ValueError(
+            f"segments requires {pcp_world_size} entries, got {len(raw)}: {raw}"
+        )
+
+    weights: list[float] = []
+    segment_to_rank: list[int] = []
+    for segment_idx, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"segments[{segment_idx}] must be a JSON object")
+        unknown = set(item) - {"weight", "pcp_rank"}
+        if unknown:
+            raise ValueError(
+                f"segments[{segment_idx}] has unsupported keys: {sorted(unknown)}"
+            )
+        if "pcp_rank" not in item:
+            raise ValueError(f"segments[{segment_idx}].pcp_rank is required")
+
+        weight_raw = item.get("weight", 1.0)
+        try:
+            weight = float(weight_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"segments[{segment_idx}].weight must be numeric: {weight_raw!r}"
+            ) from exc
+        if not math.isfinite(weight) or weight <= 0.0:
+            raise ValueError(
+                f"segments[{segment_idx}].weight must be finite and positive: "
+                f"{weight!r}"
+            )
+
+        pcp_rank = item["pcp_rank"]
+        if not isinstance(pcp_rank, int) or isinstance(pcp_rank, bool):
+            raise ValueError(
+                f"segments[{segment_idx}].pcp_rank must be an integer: {pcp_rank!r}"
+            )
+        if not 0 <= pcp_rank < pcp_world_size:
+            raise ValueError(
+                f"segments[{segment_idx}].pcp_rank must be in "
+                f"[0, {pcp_world_size}): {pcp_rank}"
+            )
+
+        weights.append(weight)
+        segment_to_rank.append(pcp_rank)
+
+    expected_ranks = list(range(pcp_world_size))
+    if sorted(segment_to_rank) != expected_ranks:
+        raise ValueError(
+            "segments[].pcp_rank must be a permutation of PCP ranks "
+            f"{expected_ranks}, got {segment_to_rank}"
+        )
+    return tuple(weights), tuple(segment_to_rank)
+
+
+def invert_segment_to_rank(segment_to_rank: tuple[int, ...]) -> tuple[int, ...]:
+    """Return physical-rank -> logical-segment mapping for a rank permutation."""
+    rank_to_segment = [0] * len(segment_to_rank)
+    for segment_idx, rank in enumerate(segment_to_rank):
+        rank_to_segment[rank] = segment_idx
+    return tuple(rank_to_segment)
 
 
 def _mapping(raw: object, name: str) -> dict:
@@ -97,9 +171,23 @@ def parse_pcp_runahead_config(
 
     transport = raw.get("transport", "prefix_p2p")
     layout = raw.get("layout", "compact")
-    weights = parse_runahead_weights(partition.get("weights"), pcp_world_size)
+
+    raw_weights = partition.get("weights")
+    parsed_segments = parse_runahead_segments(
+        partition.get("segments"), pcp_world_size
+    )
+    if raw_weights is not None and parsed_segments is not None:
+        raise ValueError("partition.weights and partition.segments are mutually exclusive")
+
+    if parsed_segments is not None:
+        weights, segment_to_rank = parsed_segments
+    else:
+        weights = parse_runahead_weights(raw_weights, pcp_world_size)
+        segment_to_rank = tuple(range(pcp_world_size))
+
     partition_policy = partition.get(
-        "policy", "weighted_contiguous" if weights is not None else "equal_contiguous"
+        "policy",
+        "weighted_contiguous" if weights is not None else "equal_contiguous",
     )
     page_align = partition.get("page_align", True)
     require_full_prefill = eligibility.get("require_full_prefill", True)
@@ -134,10 +222,11 @@ def parse_pcp_runahead_config(
         raise ValueError("runtime.max_inflight_sends must be a positive integer")
 
     if partition_policy == "weighted_contiguous" and weights is None:
-        raise ValueError("weighted_contiguous partition requires weights")
+        raise ValueError("weighted_contiguous partition requires weights or segments")
     if partition_policy != "weighted_contiguous" and weights is not None:
         raise ValueError(
-            f"weights are only valid with weighted_contiguous, got {partition_policy}"
+            "weights/segments are only valid with weighted_contiguous, got "
+            f"{partition_policy}"
         )
     if partition_policy == "stock":
         if transport != "full_kv_collective" or layout != "padded":
@@ -159,6 +248,7 @@ def parse_pcp_runahead_config(
         transport=transport,
         partition_policy=partition_policy,
         weights=weights,
+        segment_to_rank=segment_to_rank,
         page_align=page_align,
         layout=layout,
         require_full_prefill=require_full_prefill,
