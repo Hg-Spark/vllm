@@ -8,6 +8,7 @@ from typing import Any
 
 _FLASH_ATTN_BACKEND = "FLASH_ATTN"
 _PCP_UNSUPPORTED_FEATURE = "prefill context parallelism"
+_PCP_LAYER_MARKER = "_standard_attention_pcp_enabled"
 
 
 def enable_standard_attention_pcp_config_support(vllm_config_cls: type[Any]) -> None:
@@ -52,10 +53,14 @@ def enable_standard_attention_pcp_config_support(vllm_config_cls: type[Any]) -> 
 
 
 def install_standard_attention_pcp_cache_updates(vllm_config: Any) -> None:
-    """Install one class-level FlashAttention cache-update policy hook."""
-    del vllm_config
+    """Install one class-level hook and mark only this PCP engine's layers."""
+    from vllm.model_executor.layers.attention.attention import Attention
     from vllm.model_executor.layers.attention.pcp import update_standard_kv_cache
     from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+
+    for layer in vllm_config.compilation_config.static_forward_context.values():
+        if isinstance(layer, Attention) and layer.get_attn_backend().get_name() == _FLASH_ATTN_BACKEND:
+            setattr(layer, _PCP_LAYER_MARKER, True)
 
     if getattr(FlashAttentionImpl, "_standard_attention_pcp_cache_update_installed", False):
         return
@@ -70,6 +75,17 @@ def install_standard_attention_pcp_cache_updates(vllm_config: Any) -> None:
         kv_cache: Any,
         slot_mapping: Any,
     ) -> None:
+        if not getattr(attn_layer, _PCP_LAYER_MARKER, False):
+            original_update(
+                self_impl,
+                attn_layer,
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+            )
+            return
+
         def cache_writer(
             layer: Any,
             cache_key: Any,
