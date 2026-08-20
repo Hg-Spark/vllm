@@ -55,8 +55,9 @@ class PCPRunaheadRuntime:
     The runtime consumes a known variable-width token slab from each PCP rank.
     During transformer-layer execution it only propagates the causal-visible
     prefix and records enough state to repair the replicated cache later. Full
-    PCP all-gathers are launched by ``flush`` after the model forward, which
-    keeps them out of the cross-layer prefix critical path.
+    PCP all-gathers are launched by ``flush`` after every rank reaches the
+    forward boundary, which keeps them out of the cross-layer prefix critical
+    path and preserves one operation order on the PCP NCCL communicator.
 
     Deferred repair intentionally retains the local current-step tensors for
     each participating layer until ``flush``. This is an MVP tradeoff: it proves
@@ -278,10 +279,22 @@ class PCPRunaheadRuntime:
             self.defer_replication(tensors, slot_mapping, apply)
 
     def flush(self) -> None:
-        """Complete P2P sends, then repair all deferred replicated cache images."""
+        """Drain P2P, rendezvous on CPU, then repair replicated cache images."""
         with pcp_nvtx_range("pcp.flush"):
             while self._pending_sends:
                 self._pending_sends.popleft().wait()
+
+            if self._deferred_replicas:
+                # Early PCP ranks can reach the end of the model while later
+                # ranks are still submitting prefix P2P for trailing layers.
+                # A device-group barrier/all-gather here would re-enter the same
+                # NCCL communicator too early. Rendezvous on the CPU/Gloo group
+                # first; after every rank arrives, no further layer P2P can be
+                # submitted and the deferred NCCL collectives have one order.
+                pcp_group = get_pcp_group()
+                with pcp_nvtx_range("pcp.replica_forward_boundary"):
+                    torch.distributed.barrier(group=pcp_group.cpu_group)
+
             while self._deferred_replicas:
                 with pcp_nvtx_range("pcp.replica_commit"):
                     self._repair_replica(self._deferred_replicas.popleft())
