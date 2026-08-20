@@ -51,7 +51,10 @@ def prepare_standard_pcp_kv_cache_inputs(
                     dim=0,
                     sizes=list(runtime.rows_per_rank),
                 )
-            return key, value, slot_mapping[: runtime.total_rows]
+            key = runtime.rank_major_to_segment_major(key)
+            value = runtime.rank_major_to_segment_major(value)
+            slot_mapping = runtime.rank_major_to_segment_major(slot_mapping)
+            return key, value, slot_mapping
 
         raise RuntimeError(f"unsupported active PCP transport: {runtime.transport!r}")
 
