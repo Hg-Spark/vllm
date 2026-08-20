@@ -8,7 +8,11 @@ import torch
 from vllm.model_executor.layers.attention.pcp import update_standard_kv_cache
 
 
-def _flash_kv_cache(num_blocks: int = 8, num_kv_heads: int = 2, block_size: int = 16):
+def _flash_kv_cache(
+    num_blocks: int = 8,
+    num_kv_heads: int = 2,
+    block_size: int = 16,
+) -> torch.Tensor:
     return torch.empty((num_blocks, num_kv_heads, block_size, 32))
 
 
