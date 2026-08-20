@@ -14,7 +14,10 @@ import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import init_logger
-from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
+from vllm.v1.attention.ops.pcp_profile import (
+    install_pcp_nvtx_hooks,
+    pcp_nvtx_range,
+)
 from vllm.v1.attention.ops.pcp_runahead import (
     PCPRunaheadRuntime,
     register_pcp_runahead_runtime,
@@ -186,6 +189,7 @@ class RunaheadPCPManager(PCPManager):
                 "PCP runahead manager was built without validated config"
             )
         self._config = config
+        install_pcp_nvtx_hooks()
         self._standard_attention_pcp = False
         self._use_custom_partition = False
         self._use_compact_layout = False

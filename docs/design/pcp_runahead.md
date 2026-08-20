@@ -213,6 +213,15 @@ runahead config itself is currently standard-attention-only.
 
 ## Profiling
 
+PCP NVTX is opt-in. Enable it only for profiling runs:
+
+```bash
+VLLM_PCP_NVTX=1 ...
+```
+
+When the environment variable is disabled, the detailed FlashAttention wrappers
+are not installed, so normal benchmark runs do not add per-layer wrapper overhead.
+
 Important NVTX ranges:
 
 ```text
@@ -222,12 +231,32 @@ pcp.prefix_exchange
 pcp.prefix_recv_wait
 pcp.prefix_visible_alloc
 pcp.prefix_local_append
+pcp.prefix_send_enqueue
 pcp.compact_slot_mapping
 pcp.restore_hidden_variable_allgather
 pcp.send_wait
 pcp.flush
 ```
 
-Nsight should show early PCP ranks entering later Transformer layers while later
-ranks are still completing earlier layers. There should be no forward-boundary
-KV repair or broadcast in the prefix-P2P case.
+Detailed layer anchors use the real attention layer name, for example:
+
+```text
+pcp.layer.model.layers.17.self_attn.kv_update
+  ├─ pcp.prefix_exchange / pcp.full_kv_allgatherv
+  └─ pcp.layer.model.layers.17.self_attn.kv_cache_write
+
+pcp.layer.model.layers.17.self_attn.attention
+```
+
+`kv_update` spans the PCP transport plus cache-update path. The nested
+`kv_cache_write` range measures the actual `reshape_and_cache_flash()` call.
+`attention` spans the corresponding FlashAttention forward. The
+`prefix_send_enqueue` range identifies the nonblocking P2P send launch; send
+completion remains deferred and is visible separately as `pcp.send_wait` when
+backpressure or flush forces a wait.
+
+Nsight should show early PCP ranks entering later attention layers while later
+ranks are still completing earlier layers. Layer-qualified ranges make the
+cross-rank runahead distance directly visible without relying on kernel-name
+inference. There should be no forward-boundary KV repair or broadcast in the
+prefix-P2P case.

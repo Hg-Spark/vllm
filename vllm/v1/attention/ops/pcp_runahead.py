@@ -192,7 +192,8 @@ class PCPRunaheadRuntime:
 
         visible_slots = slot_mapping[: self.visible_rows]
         if self.rank + 1 < self.world_size:
-            works = self._p2p(visible, peer=self.rank + 1, recv=False)
+            with pcp_nvtx_range("pcp.prefix_send_enqueue"):
+                works = self._p2p(visible, peer=self.rank + 1, recv=False)
             self._pending_sends.append(_PendingSend(works, visible))
             self._bound_pending_sends()
         return visible, visible_slots
