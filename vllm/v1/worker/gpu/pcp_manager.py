@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
@@ -15,9 +16,6 @@ from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 from vllm.v1.attention.ops.pcp_runahead import (
     PCPRunaheadRuntime,
     register_pcp_runahead_runtime,
-)
-from vllm.v1.attention.ops.pcp_transport import (
-    all_gather_variable_into_tensor_async,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
@@ -56,8 +54,7 @@ def parse_runahead_load_weights(
         )
     if any(not math.isfinite(weight) or weight <= 0.0 for weight in weights):
         raise ValueError(
-            f"{RUNAHEAD_LOAD_WEIGHTS_ENV} values must be finite and positive: "
-            f"{weights}"
+            f"{RUNAHEAD_LOAD_WEIGHTS_ENV} values must be finite and positive: {weights}"
         )
     return weights
 
@@ -66,11 +63,7 @@ def weighted_partition_lengths(
     num_tokens: int,
     weights: tuple[float, ...],
 ) -> tuple[int, ...]:
-    """Allocate integer token counts according to normalized weights.
-
-    Floors the ideal per-rank counts, then distributes the remainder to the
-    largest fractional parts. Ties are stable by rank index.
-    """
+    """Allocate integer token counts according to normalized weights."""
     if num_tokens < 0:
         raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
     if not weights:
@@ -120,13 +113,7 @@ class RankSegment:
 
 
 class PCPManager:
-    """MRV2 PC batch manager.
-
-    The model runner keeps the global scheduled batch. This manager rewrites only
-    the per-step InputBatch into rank-local DualChunkSwap rows and keeps the
-    global-batch view private to restore to the global batch shape before
-    sampling/postprocess.
-    """
+    """MRV2 PC batch manager."""
 
     def __init__(
         self,
@@ -262,9 +249,7 @@ class PCPManager:
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
     ) -> list[RankSegment]:
-        """Move pure prefills last to match the batch ordering expected by
-        attention backends like MLA and sparse MLA.
-        """
+        """Move pure prefills last for attention-backend batch ordering."""
 
         def is_pure_prefill(segment: RankSegment) -> bool:
             req_idx = segment.global_batch_req_idx
@@ -295,7 +280,6 @@ class PCPManager:
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
     ) -> list[RankSegment]:
-        """Build one rank's attention-compatible DualChunkSwap rows."""
         rank_segments = []
         rank_offset = 0
         num_chunks = 2 * self.pcp_world_size
@@ -357,8 +341,7 @@ class PCPManager:
             per_rank_num_tokens.append(num_rank_tokens)
 
         hidden_restore_idx = np.empty(int(query_start_loc_np[-1]), dtype=np.int64)
-        compact_layout = self._use_compact_layout()
-        if compact_layout:
+        if self._use_compact_layout():
             rank_offsets = [0]
             for num_rank_tokens in per_rank_num_tokens:
                 rank_offsets.append(rank_offsets[-1] + num_rank_tokens)
@@ -375,21 +358,21 @@ class PCPManager:
         for rank, segments in enumerate(segments_by_rank):
             expanded_rank_offset = rank_offsets[rank]
             for segment in segments:
-                padded_gathered_slice = slice(
+                gathered_slice = slice(
                     expanded_rank_offset + segment.rank_local_batch_slice.start,
                     expanded_rank_offset + segment.rank_local_batch_slice.stop,
                 )
-                padded_gather_idx[padded_gathered_slice] = np.arange(
+                padded_gather_idx[gathered_slice] = np.arange(
                     segment.global_batch_slice.start,
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
                 if not bool(is_prefilling[segment.global_batch_req_idx]) and rank != 0:
                     continue
-                gathered_kv_write_mask[padded_gathered_slice] = True
+                gathered_kv_write_mask[gathered_slice] = True
                 hidden_restore_idx[segment.global_batch_slice] = np.arange(
-                    padded_gathered_slice.start,
-                    padded_gathered_slice.stop,
+                    gathered_slice.start,
+                    gathered_slice.stop,
                     dtype=np.int64,
                 )
 
@@ -653,6 +636,9 @@ class PCPManager:
         slot_mappings = self.prepare_slot_mappings()
         return block_tables, slot_mappings
 
+    def _plan_runahead_repair(self, global_slot_mappings: torch.Tensor) -> None:
+        del global_slot_mappings
+
     def prepare_slot_mappings(self) -> torch.Tensor:
         assert self._block_tables is not None
         assert self._global_batch_slot_mappings is not None
@@ -665,6 +651,7 @@ class PCPManager:
             global_batch.num_tokens,
             out=self._global_batch_slot_mappings,
         )
+        self._plan_runahead_repair(global_batch_slot_mappings)
         has_prefill = bool(
             global_batch.is_prefilling_np[: global_batch.num_reqs].any()
         )
@@ -706,21 +693,46 @@ class PCPManager:
         )
         return gathered_kv_slot_mappings
 
+    def _all_gatherv_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        rows_per_rank: tuple[int, ...],
+    ) -> torch.Tensor:
+        total_rows = sum(rows_per_rank)
+        gathered = hidden_states.new_empty((total_rows, *hidden_states.shape[1:]))
+        group = get_pcp_group()
+        device_comm = group.device_communicator
+        pynccl = getattr(device_comm, "pynccl_comm", None)
+        if pynccl is not None and not pynccl.disabled:
+            pynccl.all_gatherv(
+                gathered,
+                hidden_states.contiguous(),
+                list(rows_per_rank),
+            )
+            return gathered
+
+        output_views = []
+        offset = 0
+        for rows in rows_per_rank:
+            output_views.append(gathered.narrow(0, offset, rows))
+            offset += rows
+        dist.all_gather(
+            output_views,
+            hidden_states.contiguous(),
+            group=group.device_group,
+        )
+        return gathered
+
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._hidden_restore_idx is None:
             return hidden_states
         if self._use_compact_layout():
             assert self._per_rank_num_tokens is not None
-            total_rows = sum(self._per_rank_num_tokens)
-            gathered = hidden_states.new_empty((total_rows, *hidden_states.shape[1:]))
             with pcp_nvtx_range("pcp.restore_hidden_variable_allgather"):
-                work = all_gather_variable_into_tensor_async(
-                    get_pcp_group(),
-                    gathered,
-                    hidden_states.contiguous(),
+                gathered = self._all_gatherv_hidden(
+                    hidden_states,
                     self._per_rank_num_tokens,
                 )
-                work.wait()
         else:
             gathered = get_pcp_group().all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
@@ -737,12 +749,7 @@ class PCPManager:
 
 
 class RunaheadPCPManager(PCPManager):
-    """PCP manager for contiguous causal-prefix runahead partitions.
-
-    Standard attention accepts homogeneous prefill/extend batches above the
-    configured token threshold. MLA retains the original fresh full-prefill
-    eligibility while both paths share the same runtime and transport.
-    """
+    """PCP manager for contiguous causal-prefix runahead partitions."""
 
     def __init__(
         self,
@@ -787,10 +794,7 @@ class RunaheadPCPManager(PCPManager):
         return self._load_weights
 
     def _use_compact_layout(self) -> bool:
-        return (
-            self._use_runahead_partition
-            and self._effective_load_weights() is not None
-        )
+        return self._use_runahead_partition
 
     @staticmethod
     def validate_config(
@@ -880,6 +884,33 @@ class RunaheadPCPManager(PCPManager):
                 rows[rank] += length
         return tuple(rows)
 
+    def _plan_runahead_repair(self, global_slot_mappings: torch.Tensor) -> None:
+        if not self._use_runahead_partition:
+            self._runahead_runtime.set_repair_block_ids(None)
+            return
+        assert self._block_tables is not None
+        assert self._global_batch is not None
+
+        parts: list[torch.Tensor] = []
+        for group_id, block_size in enumerate(self._block_tables.kernel_block_sizes):
+            slots = global_slot_mappings[group_id, : self._global_batch.num_tokens]
+            valid_slots = slots[slots >= 0]
+            if valid_slots.numel() == 0:
+                continue
+            parts.append(
+                torch.div(
+                    valid_slots,
+                    block_size,
+                    rounding_mode="floor",
+                ).to(dtype=torch.long)
+            )
+
+        if parts:
+            block_ids = torch.unique(torch.cat(parts, dim=0))
+        else:
+            block_ids = torch.empty(0, dtype=torch.long, device=self.device)
+        self._runahead_runtime.set_repair_block_ids(block_ids)
+
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
         if self._standard_attention_pcp:
             use_runahead = runahead_batch_eligible(
@@ -898,11 +929,11 @@ class RunaheadPCPManager(PCPManager):
                 and int(input_batch.num_scheduled_tokens[0]) >= self.pcp_world_size
             )
 
-        if use_runahead and self._effective_load_weights() is not None:
+        if use_runahead:
             rows_per_rank = self._runahead_rows_per_rank(input_batch)
             if any(rows <= 0 for rows in rows_per_rank):
                 logger.debug(
-                    "PCP runahead weighted partition produced an empty rank; "
+                    "PCP runahead partition produced an empty rank; "
                     "falling back to baseline PCP: rows=%s",
                     rows_per_rank,
                 )
@@ -911,12 +942,8 @@ class RunaheadPCPManager(PCPManager):
         self._use_runahead_partition = use_runahead
         local_batch = super().partition_batch(input_batch)
         if use_runahead:
-            if self._use_compact_layout():
-                assert self._per_rank_num_tokens is not None
-                runtime_rows = self._per_rank_num_tokens
-            else:
-                runtime_rows = (local_batch.num_tokens_after_padding,) * self.pcp_world_size
-            self._runahead_runtime.begin_step(runtime_rows)
+            assert self._per_rank_num_tokens is not None
+            self._runahead_runtime.begin_step(self._per_rank_num_tokens)
         else:
             self._runahead_runtime.disable_step()
         return local_batch

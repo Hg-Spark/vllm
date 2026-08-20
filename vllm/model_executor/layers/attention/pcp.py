@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -10,7 +11,12 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
 )
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
-from vllm.v1.attention.ops.pcp_runahead import get_pcp_runahead_runtime
+from vllm.v1.attention.ops.pcp_runahead import (
+    PCPRunaheadRuntime,
+    get_pcp_runahead_runtime,
+)
+
+CacheUpdate = Callable[[tuple[torch.Tensor, ...], torch.Tensor], None]
 
 
 def _gather_prefill_cache_inputs(
@@ -52,29 +58,19 @@ def _gather_prefill_cache_inputs(
     return cache_inputs, cache_slot_mapping
 
 
-def _standard_cache_block_size(kv_cache: torch.Tensor) -> int:
-    """Return FlashAttention's physical token slots per cache block.
-
-    Standard PCP is currently gated to FLASH_ATTN. Its logical cache view is
-    ``[num_blocks, num_kv_heads, block_size, 2 * head_size]`` even when the
-    physical stride order is NHD/HND, so dim 2 is the kernel cache block size.
-    """
-    if kv_cache.ndim != 4:
-        raise RuntimeError(
-            "standard runahead PCP expected a 4D FlashAttention KV cache, "
-            f"got shape={tuple(kv_cache.shape)}"
-        )
-    return int(kv_cache.shape[2])
-
-
-def _mla_cache_block_size(kv_cache: torch.Tensor) -> int:
-    """Return MLA/sparse-MLA token slots per block-major cache page."""
-    if kv_cache.ndim < 2:
-        raise RuntimeError(
-            "MLA runahead PCP expected a block-major KV cache, "
-            f"got shape={tuple(kv_cache.shape)}"
-        )
-    return int(kv_cache.shape[1])
+def _run_runahead_cache_update(
+    runtime: PCPRunaheadRuntime,
+    tensors: tuple[torch.Tensor, ...],
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    apply: CacheUpdate,
+) -> None:
+    """Write only the causal-visible image; repair is planned once per step."""
+    runtime.register_kv_cache(kv_cache)
+    with pcp_nvtx_range("pcp.prefix_exchange"):
+        visible, visible_slot_mapping = runtime.exchange_prefix(tensors, slot_mapping)
+    with pcp_nvtx_range("pcp.visible_cache_update"):
+        apply(visible, visible_slot_mapping)
 
 
 def update_standard_kv_cache(
@@ -85,13 +81,7 @@ def update_standard_kv_cache(
     cache_writer: Any,
     kv_cache: torch.Tensor,
 ) -> None:
-    """Update standard MHA/GQA/MQA KV cache through PCP policy.
-
-    A rank-local slot mapping keeps pure decode local. A gathered mapping selects
-    the baseline synchronous K/V AllGather. Active runahead uses causal-prefix
-    P2P on the layer critical path, writes only the visible causal prefix, and
-    records the persistent paged-KV blocks for forward-boundary repair.
-    """
+    """Update standard MHA/GQA/MQA KV cache through PCP policy."""
     layer_name = getattr(attn_layer, "layer_name", "unknown")
 
     def apply(
@@ -111,12 +101,12 @@ def update_standard_kv_cache(
     runtime = get_pcp_runahead_runtime()
     if runtime is not None:
         with pcp_nvtx_range(f"pcp.standard.runahead:{layer_name}"):
-            runtime.update_visible_and_defer_repair(
+            _run_runahead_cache_update(
+                runtime,
                 (key, value),
                 slot_mapping,
-                apply,
                 kv_cache,
-                _standard_cache_block_size(kv_cache),
+                apply,
             )
         return
 
@@ -196,12 +186,12 @@ def update_mla_kv_cache(
                 )
 
         with pcp_nvtx_range("pcp.mla.runahead"):
-            runtime.update_visible_and_defer_repair(
+            _run_runahead_cache_update(
+                runtime,
                 (kv_c_normed, k_pe),
                 slot_mapping,
-                apply,
                 kv_cache,
-                _mla_cache_block_size(kv_cache),
+                apply,
             )
         return
 
@@ -269,12 +259,12 @@ def update_indexer_k_cache(
                 )
 
         with pcp_nvtx_range("pcp.indexer.runahead"):
-            runtime.update_visible_and_defer_repair(
+            _run_runahead_cache_update(
+                runtime,
                 (k,),
                 slot_mapping,
-                apply,
                 kv_cache,
-                _mla_cache_block_size(kv_cache),
+                apply,
             )
         return
 

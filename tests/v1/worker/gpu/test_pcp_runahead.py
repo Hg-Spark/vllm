@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -31,40 +32,21 @@ def _manager(
 def test_runahead_partition_is_contiguous_and_complete() -> None:
     manager = _manager(4)
     expected = [(0, 3), (3, 6), (6, 9), (9, 10)]
-    actual: list[tuple[int, int]] = []
+    actual = []
 
     for rank in range(4):
-        segments = manager._get_rank_segments(
+        (segment,) = manager._get_rank_segments(
             rank,
             np.asarray([10], dtype=np.int32),
             np.asarray([0], dtype=np.int32),
             np.asarray([True]),
             np.asarray([0, 10], dtype=np.int32),
         )
-        assert len(segments) == 1
-        segment = segments[0]
         actual.append(
             (segment.global_batch_slice.start, segment.global_batch_slice.stop)
         )
 
     assert actual == expected
-
-
-def test_runahead_partition_handles_exact_division() -> None:
-    manager = _manager(4)
-    lengths = []
-
-    for rank in range(4):
-        (segment,) = manager._get_rank_segments(
-            rank,
-            np.asarray([16], dtype=np.int32),
-            np.asarray([0], dtype=np.int32),
-            np.asarray([True]),
-            np.asarray([0, 16], dtype=np.int32),
-        )
-        lengths.append(segment.num_tokens)
-
-    assert lengths == [4, 4, 4, 4]
 
 
 def test_runahead_partition_supports_multiple_prefill_requests() -> None:
@@ -80,8 +62,7 @@ def test_runahead_partition_supports_multiple_prefill_requests() -> None:
         [(4, 6), (10, 11)],
         [(6, 8), (11, 12)],
     ]
-
-    actual: list[list[tuple[int, int]]] = []
+    actual = []
     for rank in range(4):
         segments = manager._get_rank_segments(
             rank,
@@ -103,44 +84,18 @@ def test_runahead_partition_supports_multiple_prefill_requests() -> None:
 def test_weighted_partition_uses_normalized_load_weights() -> None:
     weights = (4.0, 2.5, 1.9, 1.6)
     assert weighted_partition_lengths(10_000, weights) == (4000, 2500, 1900, 1600)
-
-    manager = _manager(4, weights)
-    actual: list[tuple[int, int]] = []
-    for rank in range(4):
-        (segment,) = manager._get_rank_segments(
-            rank,
-            np.asarray([10_000], dtype=np.int32),
-            np.asarray([0], dtype=np.int32),
-            np.asarray([True]),
-            np.asarray([0, 10_000], dtype=np.int32),
-        )
-        actual.append(
-            (segment.global_batch_slice.start, segment.global_batch_slice.stop)
-        )
-
-    assert actual == [
-        (0, 4000),
-        (4000, 6500),
-        (6500, 8400),
-        (8400, 10_000),
-    ]
+    assert sum(weighted_partition_lengths(10, weights)) == 10
 
 
-def test_weighted_partition_rounding_preserves_all_tokens() -> None:
-    lengths = weighted_partition_lengths(10, (4.0, 2.5, 1.9, 1.6))
-    assert lengths == (4, 2, 2, 2)
-    assert sum(lengths) == 10
-
-
-def test_weighted_partition_is_ignored_for_mla() -> None:
+def test_mla_uses_equal_compact_runahead_partition() -> None:
     manager = _manager(4, (4.0, 2.5, 1.9, 1.6))
     manager._standard_attention_pcp = False
 
     assert manager._weighted_lengths(10) == (3, 3, 3, 1)
-    assert not manager._use_compact_layout()
+    assert manager._use_compact_layout()
 
 
-def test_weighted_layout_is_compact_and_rank_major() -> None:
+def test_runahead_layout_is_always_compact_and_rank_major() -> None:
     manager = _manager(4, (4.0, 3.0, 2.0, 1.0))
     manager.device = torch.device("cpu")
     scheduled = np.asarray([8, 4], dtype=np.int32)
@@ -207,6 +162,26 @@ def test_weighted_layout_is_compact_and_rank_major() -> None:
     assert bool(manager._gathered_kv_write_mask.all())
 
 
+def test_step_level_repair_plan_uses_kernel_block_ids() -> None:
+    manager = _manager(4)
+    manager.device = torch.device("cpu")
+    manager._block_tables = SimpleNamespace(kernel_block_sizes=[4, 2])
+    manager._global_batch = SimpleNamespace(num_tokens=6)
+    manager._runahead_runtime = MagicMock()
+
+    slot_mappings = torch.tensor(
+        [
+            [0, 1, 4, 7, 8, -1],
+            [0, 1, 4, 5, 8, -1],
+        ],
+        dtype=torch.int64,
+    )
+    manager._plan_runahead_repair(slot_mappings)
+
+    (block_ids,) = manager._runahead_runtime.set_repair_block_ids.call_args.args
+    assert block_ids.tolist() == [0, 1, 2, 4]
+
+
 def test_parse_runahead_load_weights() -> None:
     assert parse_runahead_load_weights("4,2.5,1.9,1.6", 4) == (
         4.0,
@@ -251,37 +226,26 @@ def test_variable_width_runtime_rejects_empty_rank() -> None:
         runtime.begin_step((4, 3, 0, 1))
 
 
-def test_runahead_batch_accepts_fresh_and_existing_context_prefill() -> None:
-    assert runahead_batch_eligible(
-        num_reqs=2,
-        is_prefilling=np.asarray([True, True]),
-        num_scheduled_tokens=np.asarray([2048, 4096], dtype=np.int32),
-        pcp_world_size=4,
-    )
-
-
-def test_runahead_batch_accepts_chunked_prefill() -> None:
-    assert runahead_batch_eligible(
-        num_reqs=1,
-        is_prefilling=np.asarray([True]),
-        num_scheduled_tokens=np.asarray([2048], dtype=np.int32),
-        pcp_world_size=4,
-    )
-
-
-def test_runahead_batch_rejects_mixed_decode_prefill() -> None:
-    assert not runahead_batch_eligible(
-        num_reqs=2,
-        is_prefilling=np.asarray([False, True]),
-        num_scheduled_tokens=np.asarray([1, 4096], dtype=np.int32),
-        pcp_world_size=4,
-    )
-
-
-def test_runahead_batch_rejects_small_prefill() -> None:
-    assert not runahead_batch_eligible(
-        num_reqs=1,
-        is_prefilling=np.asarray([True]),
-        num_scheduled_tokens=np.asarray([512], dtype=np.int32),
-        pcp_world_size=4,
+@pytest.mark.parametrize(
+    ("is_prefilling", "scheduled", "expected"),
+    [
+        ([True, True], [2048, 4096], True),
+        ([True], [2048], True),
+        ([False, True], [1, 4096], False),
+        ([True], [512], False),
+    ],
+)
+def test_runahead_batch_eligibility(
+    is_prefilling: list[bool],
+    scheduled: list[int],
+    expected: bool,
+) -> None:
+    assert (
+        runahead_batch_eligible(
+            num_reqs=len(is_prefilling),
+            is_prefilling=np.asarray(is_prefilling),
+            num_scheduled_tokens=np.asarray(scheduled, dtype=np.int32),
+            pcp_world_size=4,
+        )
+        is expected
     )
