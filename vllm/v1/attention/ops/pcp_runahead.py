@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Causal-prefix runahead runtime for prefill context parallelism.
-
-The runtime carries only the causal-visible K/V prefix between PCP ranks.
-Persistent KV cache replication is intentionally omitted: after a runahead
-prefill, each rank retains only the causal-visible cache image it produced.
-"""
+"""Per-step transport state for experimental PCP causal-prefix runahead."""
 
 from __future__ import annotations
 
@@ -35,18 +30,27 @@ class _PendingSend:
 
 
 class PCPRunaheadRuntime:
-    """Per-process runtime for causal-prefix PCP runahead."""
+    """Per-process step state and causal-prefix P2P runtime.
+
+    ``full_kv_collective`` uses the row metadata only; ``prefix_p2p`` also uses
+    the asynchronous prefix send/receive machinery below.
+    """
 
     def __init__(
         self,
         pcp_world_size: int,
         pcp_rank: int,
         device: torch.device,
+        max_inflight_sends: int = 4,
     ) -> None:
+        if max_inflight_sends <= 0:
+            raise ValueError("max_inflight_sends must be positive")
         self.world_size = pcp_world_size
         self.rank = pcp_rank
         self.device = device
+        self.max_inflight_sends = max_inflight_sends
         self.active = False
+        self.transport: str | None = None
         self.rows_per_rank: tuple[int, ...] = ()
         self.rank_offsets: tuple[int, ...] = ()
         self._pending_sends: deque[_PendingSend] = deque()
@@ -67,8 +71,15 @@ class PCPRunaheadRuntime:
     def total_rows(self) -> int:
         return self.rank_offsets[-1] if self.rank_offsets else 0
 
-    def begin_step(self, rows_per_rank: Sequence[int]) -> None:
+    def begin_step(
+        self,
+        rows_per_rank: Sequence[int],
+        *,
+        transport: str = "prefix_p2p",
+    ) -> None:
         self.flush()
+        if transport not in ("full_kv_collective", "prefix_p2p"):
+            raise ValueError(f"unsupported PCP step transport: {transport!r}")
         rows = tuple(int(value) for value in rows_per_rank)
         if len(rows) != self.world_size:
             raise ValueError(
@@ -83,11 +94,13 @@ class PCPRunaheadRuntime:
             offsets.append(offsets[-1] + value)
         self.rows_per_rank = rows
         self.rank_offsets = tuple(offsets)
+        self.transport = transport
         self.active = True
 
     def disable_step(self) -> None:
         self.flush()
         self.active = False
+        self.transport = None
         self.rows_per_rank = ()
         self.rank_offsets = ()
 
@@ -100,6 +113,11 @@ class PCPRunaheadRuntime:
 
     def _drain_sends(self) -> None:
         while self._pending_sends and self._pending_sends[0].completed():
+            self._pending_sends.popleft().wait()
+
+    def _bound_pending_sends(self) -> None:
+        self._drain_sends()
+        while len(self._pending_sends) > self.max_inflight_sends:
             self._pending_sends.popleft().wait()
 
     @staticmethod
@@ -133,6 +151,10 @@ class PCPRunaheadRuntime:
         """Receive ranks [0, r), append local rows, and forward to rank r+1."""
         if not self.active:
             return tensors, slot_mapping
+        if self.transport != "prefix_p2p":
+            raise RuntimeError(
+                f"exchange_prefix requires prefix_p2p, got {self.transport!r}"
+            )
 
         self._validate_group()
         local_rows = self.local_rows
@@ -172,11 +194,11 @@ class PCPRunaheadRuntime:
         if self.rank + 1 < self.world_size:
             works = self._p2p(visible, peer=self.rank + 1, recv=False)
             self._pending_sends.append(_PendingSend(works, visible))
-            self._drain_sends()
+            self._bound_pending_sends()
         return visible, visible_slots
 
     def flush(self) -> None:
-        """Drain outstanding prefix sends. Persistent KV remains sharded."""
+        """Drain outstanding prefix sends. Persistent KV remains untouched."""
         with pcp_nvtx_range("pcp.flush"):
             while self._pending_sends:
                 self._pending_sends.popleft().wait()

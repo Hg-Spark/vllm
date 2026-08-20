@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Minimal PCP manager extension for causal-prefix runahead."""
+"""Minimal PCP manager extension for configurable causal-prefix experiments."""
 
 from __future__ import annotations
 
@@ -22,42 +22,16 @@ from vllm.v1.attention.ops.pcp_runahead import (
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
+from vllm.v1.worker.gpu.pcp_runahead_config import (
+    RUNAHEAD_MIN_PREFILL_TOKENS,
+    RUNAHEAD_WEIGHTS_KEY,
+    PCPRunaheadConfig,
+    parse_pcp_runahead_config,
+    parse_runahead_weights,
+)
 from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
-
-RUNAHEAD_MIN_PREFILL_TOKENS = 1024
-RUNAHEAD_WEIGHTS_KEY = "pcp_runahead_weights"
-
-
-def parse_runahead_weights(
-    raw: object,
-    pcp_world_size: int,
-) -> tuple[float, ...] | None:
-    """Parse manually supplied positive per-rank load weights."""
-    if raw is None:
-        return None
-    if not isinstance(raw, (list, tuple)):
-        raise ValueError(
-            f"{RUNAHEAD_WEIGHTS_KEY} must be a JSON list with "
-            f"{pcp_world_size} positive numbers"
-        )
-    if len(raw) != pcp_world_size:
-        raise ValueError(
-            f"{RUNAHEAD_WEIGHTS_KEY} requires {pcp_world_size} values, "
-            f"got {len(raw)}: {raw}"
-        )
-    try:
-        weights = tuple(float(value) for value in raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{RUNAHEAD_WEIGHTS_KEY} values must be numeric: {raw}"
-        ) from exc
-    if any(not math.isfinite(weight) or weight <= 0.0 for weight in weights):
-        raise ValueError(
-            f"{RUNAHEAD_WEIGHTS_KEY} values must be finite and positive: {weights}"
-        )
-    return weights
 
 
 def weighted_partition_lengths(
@@ -67,11 +41,7 @@ def weighted_partition_lengths(
     start_pos: int = 0,
     alignment: int = 1,
 ) -> tuple[int, ...]:
-    """Split one request by manual weights and align internal absolute cuts.
-
-    Internal boundaries are aligned to the common KV kernel-page granularity
-    whenever the request is large enough to do so without collapsing a rank.
-    """
+    """Split one request by weights and align internal absolute cuts."""
     if num_tokens < 0:
         raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
     if not weights:
@@ -133,14 +103,27 @@ def runahead_batch_eligible(
     num_reqs: int,
     is_prefilling: np.ndarray,
     num_scheduled_tokens: np.ndarray,
+    num_computed_tokens: np.ndarray,
+    prefill_len: np.ndarray,
     pcp_world_size: int,
+    require_full_prefill: bool = True,
     min_prefill_tokens: int = RUNAHEAD_MIN_PREFILL_TOKENS,
 ) -> bool:
-    """Use runahead only for homogeneous, sufficiently large prefill batches."""
+    """Select batches eligible for the configured PCP experiment step."""
     if num_reqs <= 0:
         return False
     if not bool(is_prefilling[:num_reqs].all()):
         return False
+    if require_full_prefill:
+        if not bool((num_computed_tokens[:num_reqs] == 0).all()):
+            return False
+        if not bool(
+            (
+                num_scheduled_tokens[:num_reqs]
+                == prefill_len[:num_reqs]
+            ).all()
+        ):
+            return False
     total_prefill_tokens = int(num_scheduled_tokens[:num_reqs].sum())
     return total_prefill_tokens >= max(pcp_world_size, min_prefill_tokens)
 
@@ -168,9 +151,9 @@ def compact_hidden_restore_idx(
 
 
 class RunaheadPCPManager(PCPManager):
-    """Reuse vLLM PCP layout machinery and replace only the runahead policy."""
+    """Reuse PCP mapping/layout machinery; replace only experiment policies."""
 
-    _validated_weights: ClassVar[tuple[float, ...] | None] = None
+    _validated_config: ClassVar[PCPRunaheadConfig | None] = None
 
     def __init__(
         self,
@@ -197,12 +180,21 @@ class RunaheadPCPManager(PCPManager):
             dcp_rank=dcp_rank,
             cp_interleave=cp_interleave,
         )
-        self._use_runahead_partition = False
+        config = type(self)._validated_config
+        if config is None:
+            raise RuntimeError(
+                "PCP runahead manager was built without validated config"
+            )
+        self._config = config
         self._standard_attention_pcp = False
-        self._load_weights = type(self)._validated_weights
+        self._use_custom_partition = False
+        self._use_compact_layout = False
+        self._step_transport: str | None = None
         self._page_alignment = (
             math.lcm(*block_tables.kernel_block_sizes)
-            if block_tables is not None and block_tables.kernel_block_sizes
+            if config.page_align
+            and block_tables is not None
+            and block_tables.kernel_block_sizes
             else 1
         )
         self._rows_per_rank: tuple[int, ...] = ()
@@ -212,6 +204,7 @@ class RunaheadPCPManager(PCPManager):
             pcp_world_size=pcp_world_size,
             pcp_rank=pcp_rank,
             device=device,
+            max_inflight_sends=config.max_inflight_sends,
         )
         register_pcp_runahead_runtime(self._runahead_runtime)
 
@@ -228,34 +221,30 @@ class RunaheadPCPManager(PCPManager):
         model = vllm_config.model_config
         assert model is not None
 
-        additional = vllm_config.additional_config
-        raw_weights = (
-            additional.get(RUNAHEAD_WEIGHTS_KEY)
-            if isinstance(additional, dict)
-            else None
-        )
-        cls._validated_weights = parse_runahead_weights(
-            raw_weights,
+        config = parse_pcp_runahead_config(
+            vllm_config.additional_config,
             parallel.prefill_context_parallel_size,
         )
+        if config is None:
+            raise ValueError("pcp_runahead manager requires an enabled config")
+        cls._validated_config = config
 
         if model.use_mla:
-            PCPManager.validate_config(vllm_config, supports_mm_inputs)
-        else:
-            if parallel.pipeline_parallel_size > 1:
-                raise NotImplementedError("MRV2 PCP does not support PP yet.")
-            if model.is_encoder_decoder:
-                raise NotImplementedError(
-                    "MRV2 PCP does not support encoder-decoder models yet."
-                )
-            if supports_mm_inputs:
-                raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
-            if vllm_config.lora_config is not None:
-                raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
-            if vllm_config.speculative_config is not None:
-                raise NotImplementedError(
-                    "MRV2 PCP does not support speculative decoding yet."
-                )
+            raise NotImplementedError(
+                "experimental PCP runahead currently supports standard attention only"
+            )
+        if model.is_encoder_decoder:
+            raise NotImplementedError(
+                "MRV2 PCP does not support encoder-decoder models yet."
+            )
+        if supports_mm_inputs:
+            raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
+        if vllm_config.lora_config is not None:
+            raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "MRV2 PCP does not support speculative decoding yet."
+            )
 
         if parallel.tensor_parallel_size != 1:
             raise NotImplementedError("runahead PCP MVP requires TP=1")
@@ -285,8 +274,10 @@ class RunaheadPCPManager(PCPManager):
         query_len: int,
         start_pos: int = 0,
     ) -> tuple[int, ...]:
-        weights = self._load_weights
-        if weights is None:
+        if self._config.partition_policy == "weighted_contiguous":
+            assert self._config.weights is not None
+            weights = self._config.weights
+        else:
             weights = (1.0,) * self.pcp_world_size
         return weighted_partition_lengths(
             query_len,
@@ -303,7 +294,7 @@ class RunaheadPCPManager(PCPManager):
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
     ) -> list[RankSegment]:
-        if not self._use_runahead_partition:
+        if not self._use_custom_partition:
             return super()._get_rank_segments(
                 rank,
                 num_scheduled_tokens,
@@ -338,7 +329,7 @@ class RunaheadPCPManager(PCPManager):
             rank_offset += chunk_len
         return rank_segments
 
-    def _runahead_rows_per_rank(self, input_batch: InputBatch) -> tuple[int, ...]:
+    def _custom_rows_per_rank(self, input_batch: InputBatch) -> tuple[int, ...]:
         rows = [0] * self.pcp_world_size
         for req_idx, num_tokens in enumerate(
             input_batch.num_scheduled_tokens[: input_batch.num_reqs]
@@ -354,42 +345,48 @@ class RunaheadPCPManager(PCPManager):
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
         if self._sharded_kv_history:
             raise RuntimeError(
-                "PCP runahead left persistent KV sharded across ranks; "
+                "PCP prefix_p2p left persistent KV sharded across ranks; "
                 "another model step requires a sharded-KV decode/continue path, "
                 "which is not implemented by this experimental branch."
             )
 
-        if self._standard_attention_pcp:
-            use_runahead = runahead_batch_eligible(
-                num_reqs=input_batch.num_reqs,
-                is_prefilling=input_batch.is_prefilling_np,
-                num_scheduled_tokens=input_batch.num_scheduled_tokens,
-                pcp_world_size=self.pcp_world_size,
-            )
-        else:
-            use_runahead = (
-                input_batch.num_reqs == 1
-                and bool(input_batch.is_prefilling_np[0])
-                and int(input_batch.num_computed_tokens_np[0]) == 0
-                and int(input_batch.num_scheduled_tokens[0])
-                == int(input_batch.prefill_len_np[0])
-                and int(input_batch.num_scheduled_tokens[0]) >= self.pcp_world_size
-            )
+        eligible = self._standard_attention_pcp and runahead_batch_eligible(
+            num_reqs=input_batch.num_reqs,
+            is_prefilling=input_batch.is_prefilling_np,
+            num_scheduled_tokens=input_batch.num_scheduled_tokens,
+            num_computed_tokens=input_batch.num_computed_tokens_np,
+            prefill_len=input_batch.prefill_len_np,
+            pcp_world_size=self.pcp_world_size,
+            require_full_prefill=self._config.require_full_prefill,
+            min_prefill_tokens=self._config.min_tokens,
+        )
 
+        self._use_custom_partition = (
+            eligible and self._config.partition_policy != "stock"
+        )
         rows_per_rank: tuple[int, ...] = ()
-        if use_runahead:
-            rows_per_rank = self._runahead_rows_per_rank(input_batch)
+        if self._use_custom_partition:
+            rows_per_rank = self._custom_rows_per_rank(input_batch)
             if any(rows <= 0 for rows in rows_per_rank):
                 logger.debug(
-                    "PCP runahead produced an empty rank; falling back: rows=%s",
+                    "PCP custom partition produced an empty rank; "
+                    "falling back: rows=%s",
                     rows_per_rank,
                 )
-                use_runahead = False
+                eligible = False
+                self._use_custom_partition = False
+                rows_per_rank = ()
 
-        self._use_runahead_partition = use_runahead
         local_batch = super().partition_batch(input_batch)
 
-        compact = use_runahead and self._standard_attention_pcp
+        compact = (
+            eligible
+            and self._use_custom_partition
+            and self._config.layout == "compact"
+        )
+        self._use_compact_layout = compact
+        self._step_transport = self._config.transport if eligible else None
+
         if compact:
             padded_rows = int(local_batch.num_tokens_after_padding)
             local_rows = rows_per_rank[self.pcp_rank]
@@ -407,13 +404,10 @@ class RunaheadPCPManager(PCPManager):
                 positions=local_batch.positions[:local_rows],
                 is_padding=local_batch.is_padding[:local_rows],
             )
-            self._runahead_runtime.begin_step(rows_per_rank)
-        elif use_runahead:
-            padded_rows = int(local_batch.num_tokens_after_padding)
-            uniform_rows = (padded_rows,) * self.pcp_world_size
-            self._rows_per_rank = uniform_rows
-            self._compact_hidden_restore_idx = None
-            self._runahead_runtime.begin_step(uniform_rows)
+            self._runahead_runtime.begin_step(
+                rows_per_rank,
+                transport=self._config.transport,
+            )
         else:
             self._rows_per_rank = ()
             self._compact_hidden_restore_idx = None
@@ -423,7 +417,7 @@ class RunaheadPCPManager(PCPManager):
 
     def prepare_slot_mappings(self) -> torch.Tensor:
         slot_mappings = super().prepare_slot_mappings()
-        if not (self._use_runahead_partition and self._standard_attention_pcp):
+        if not self._use_compact_layout:
             return slot_mappings
         assert self._gathered_kv_write_mask is not None
         with pcp_nvtx_range("pcp.compact_slot_mapping"):
@@ -446,6 +440,19 @@ class RunaheadPCPManager(PCPManager):
     ) -> tuple[torch.Tensor, InputBatch]:
         self._runahead_runtime.flush()
         result = super().restore_for_sampling(hidden_states)
-        if self._use_runahead_partition:
+        if self._step_transport == "prefix_p2p":
             self._sharded_kv_history = True
+        self._runahead_runtime.disable_step()
+        self._step_transport = None
         return result
+
+
+__all__ = [
+    "RUNAHEAD_MIN_PREFILL_TOKENS",
+    "RUNAHEAD_WEIGHTS_KEY",
+    "RunaheadPCPManager",
+    "compact_hidden_restore_idx",
+    "parse_runahead_weights",
+    "runahead_batch_eligible",
+    "weighted_partition_lengths",
+]

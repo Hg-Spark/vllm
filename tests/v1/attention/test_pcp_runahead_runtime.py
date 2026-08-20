@@ -89,6 +89,37 @@ def test_flush_only_waits_outstanding_prefix_sends() -> None:
     group.barrier.assert_not_called()
 
 
+def test_pending_prefix_sends_are_bounded() -> None:
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        max_inflight_sends=1,
+    )
+    runtime.begin_step((4, 3, 2, 1))
+    group = _group(0)
+    first = MagicMock()
+    second = MagicMock()
+    first.is_completed.return_value = False
+    second.is_completed.return_value = False
+
+    with (
+        patch(
+            "vllm.v1.attention.ops.pcp_runahead.get_pcp_group",
+            return_value=group,
+        ),
+        patch.object(runtime, "_p2p", side_effect=[[first], [second]]),
+    ):
+        runtime.exchange_prefix((torch.ones(4, 2),), torch.arange(10))
+        first.wait.assert_not_called()
+        runtime.exchange_prefix((torch.ones(4, 2),), torch.arange(10))
+        first.wait.assert_called_once_with()
+        second.wait.assert_not_called()
+        runtime.flush()
+
+    second.wait.assert_called_once_with()
+
+
 def test_variable_width_runtime_builds_offsets() -> None:
     runtime = PCPRunaheadRuntime(
         pcp_world_size=4,

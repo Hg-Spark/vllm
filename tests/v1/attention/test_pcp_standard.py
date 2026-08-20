@@ -24,6 +24,7 @@ def test_standard_runahead_preserves_gqa_kv_head_shape() -> None:
     slot_mapping = torch.arange(6, dtype=torch.int64)
     kv_cache = _flash_kv_cache()
     runtime = MagicMock()
+    runtime.transport = "prefix_p2p"
     runtime.exchange_prefix.return_value = ((key, value), slot_mapping)
 
     with patch(
@@ -49,6 +50,7 @@ def test_standard_runahead_returns_causal_visible_image() -> None:
     visible_slots = torch.arange(7, dtype=torch.int64)
     kv_cache = _flash_kv_cache()
     runtime = MagicMock()
+    runtime.transport = "prefix_p2p"
     runtime.exchange_prefix.return_value = (
         (visible_key, visible_value), visible_slots
     )
@@ -64,6 +66,41 @@ def test_standard_runahead_returns_causal_visible_image() -> None:
     assert out_key is visible_key
     assert out_value is visible_value
     assert out_slots is visible_slots
+
+
+def test_standard_compact_full_kv_collective_uses_allgatherv() -> None:
+    key = torch.randn(2, 2, 8)
+    value = torch.randn(2, 2, 8)
+    slots = torch.arange(5, dtype=torch.int64)
+    kv_cache = _flash_kv_cache()
+    runtime = MagicMock()
+    runtime.transport = "full_kv_collective"
+    runtime.local_rows = 2
+    runtime.total_rows = 5
+    runtime.rows_per_rank = (2, 3)
+    group = MagicMock()
+    gathered_key = torch.randn(5, 2, 8)
+    gathered_value = torch.randn(5, 2, 8)
+    group.all_gatherv.return_value = [gathered_key, gathered_value]
+
+    with (
+        patch(
+            "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
+            return_value=runtime,
+        ),
+        patch(
+            "vllm.v1.attention.ops.pcp_standard.get_pcp_group",
+            return_value=group,
+        ),
+    ):
+        out_key, out_value, out_slots = prepare_standard_pcp_kv_cache_inputs(
+            key, value, slots, kv_cache
+        )
+
+    group.all_gatherv.assert_called_once()
+    assert out_key is gathered_key
+    assert out_value is gathered_value
+    assert out_slots.tolist() == list(range(5))
 
 
 def test_standard_fallback_reuses_baseline_allgather() -> None:

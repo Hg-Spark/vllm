@@ -22,11 +22,38 @@ def prepare_standard_pcp_kv_cache_inputs(
 
     runtime = get_pcp_runahead_runtime()
     if runtime is not None:
-        with pcp_nvtx_range("pcp.prefix_exchange"):
-            (key, value), slot_mapping = runtime.exchange_prefix(
-                (key, value), slot_mapping
-            )
-        return key, value, slot_mapping
+        if runtime.transport == "prefix_p2p":
+            with pcp_nvtx_range("pcp.prefix_exchange"):
+                (key, value), slot_mapping = runtime.exchange_prefix(
+                    (key, value), slot_mapping
+                )
+            return key, value, slot_mapping
+
+        if runtime.transport == "full_kv_collective":
+            if (
+                key.shape[0] != runtime.local_rows
+                or value.shape[0] != runtime.local_rows
+            ):
+                raise RuntimeError(
+                    "PCP compact full-KV collective expects configured local rows: "
+                    f"key={key.shape[0]}, value={value.shape[0]}, "
+                    f"expected={runtime.local_rows}"
+                )
+            if slot_mapping.shape[0] < runtime.total_rows:
+                raise RuntimeError(
+                    "PCP compact slot mapping is shorter than full gathered rows: "
+                    f"slots={slot_mapping.shape[0]}, rows={runtime.total_rows}"
+                )
+            pcp_group = get_pcp_group()
+            with pcp_nvtx_range("pcp.full_kv_allgatherv"):
+                key, value = pcp_group.all_gatherv(
+                    [key.contiguous(), value.contiguous()],
+                    dim=0,
+                    sizes=list(runtime.rows_per_rank),
+                )
+            return key, value, slot_mapping[: runtime.total_rows]
+
+        raise RuntimeError(f"unsupported active PCP transport: {runtime.transport!r}")
 
     pcp_group = get_pcp_group()
     if pcp_group.world_size <= 1 or slot_mapping.shape[0] <= key.shape[0]:
