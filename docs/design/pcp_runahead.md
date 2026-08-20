@@ -57,15 +57,12 @@ PCPRunaheadRuntime
   |- causal-prefix exchange
   |- pending P2P sends
   |- visible-prefix cache update
-  |- deferred replica descriptors
-  `- forward-boundary replica repair
+  |- persistent paged-cache repair metadata
+  `- forward-boundary raw-page repair
           |
           v
-pcp_transport.py
-  |- PCP-local -> global rank mapping
-  |- batched tensor P2P
-  |- equal-width async all_gather_into_tensor
-  `- variable-width async all_gather
+vLLM KV backing storage
+  `- raw uint8 block/page view
 ```
 
 The former `pcp_runahead_ext.py` import-time class patch has been removed. Eligibility, validation, partitioning, slot mapping, and manager construction live directly in `pcp_manager.py`.
@@ -74,7 +71,7 @@ The former `pcp_runahead_ext.py` import-time class patch has been removed. Eligi
 
 ## Layer Critical Path
 
-For each participating attention layer, the runtime now executes:
+For each participating attention layer, the runtime executes:
 
 ```text
 receive prefix from rank r-1
@@ -88,31 +85,64 @@ append local current-step KV
 write causal-visible KV into paged cache
         |
         v
+record lightweight repair metadata
+        |
+        v
 attention
         |
         v
 next transformer layer
 ```
 
-No full-KV AllGather is submitted from `update_and_replicate()` during layer execution.
+No full-KV repair communication is submitted from `update_visible_and_defer_repair()` during layer execution.
 
-The runtime stores a deferred replica descriptor containing the local current-step tensors, the compact rank-major slot mapping, and the cache-update callback. The descriptor is repaired after model forward.
+The deferred metadata contains references to the persistent KV backing storage and slot mappings. Block-ID extraction (`torch.unique`) and scalar range checks are postponed until the forward boundary. Per-layer K/V activation tensors are free to follow their normal lifetime after the cache update.
+
+## Persistent Paged-KV Repair Source
+
+The repair path mirrors vLLM's storage-level block-copy model. For supported block-major PCP cache layouts, `kv_cache.stride(0) * element_size` is the physical distance between consecutive cache pages. The runtime exposes the backing allocation as:
+
+```text
+uint8 [num_physical_pages, bytes_per_page]
+```
+
+through `untyped_storage()`.
+
+This handles normal, padded, and compatible packed KV backing allocations without reconstructing logical K and V tensors. Multiple layer views that share the same backing-storage data pointer register one deferred repair buffer. When vLLM packs several layers into one physical page stride, one raw-page transfer carries those packed layer bytes together.
+
+Standard FlashAttention uses its logical block size from the cache view. MLA and the sparse DeepSeek indexer use their block-major cache slot width; compressed DeepSeek layouts expose the storage block size through that view.
+
+## Last-Rank Cache Authority
+
+After causal prefix propagation for PCP size 4, the current-step cache state for a completed layer is:
+
+```text
+rank0: K0
+rank1: K0 K1
+rank2: K0 K1 K2
+rank3: K0 K1 K2 K3
+```
+
+The final PCP rank therefore owns a complete current-step page image for every completed participating layer. Boundary repair uses the final rank as the source of truth and broadcasts every touched raw KV page to the other PCP ranks.
+
+Using a complete-page authority also handles a PCP partition boundary that falls inside one KV page: the final rank has written every current-step token in that page before repair begins, so receivers replace the whole page with a complete image.
 
 ## Forward-Boundary Repair
 
 `RunaheadPCPManager.finish_forward()` calls `PCPRunaheadRuntime.flush()`.
 
-The repair sequence is:
+The current repair sequence is:
 
-1. wait for outstanding prefix sends,
-2. rendezvous all PCP ranks on the PCP CPU/Gloo process group,
-3. after every rank has exited layer P2P, launch full-cache repair AllGathers on the PCP device/NCCL process group,
-4. wait for each repair collective,
-5. write the gathered rank-major image into persistent KV cache.
+1. wait for outstanding causal-prefix P2P sends,
+2. rendezvous all PCP ranks with `GroupCoordinator.barrier()` on the CPU/Gloo group,
+3. derive the unique physical page IDs touched by the current step,
+4. on the last PCP rank, gather those raw pages into a bounded temporary payload,
+5. broadcast the payload over the PCP device communicator,
+6. on earlier ranks, scatter the received raw pages back into the persistent KV backing storage.
 
-The CPU/Gloo rendezvous is required because earlier PCP ranks can finish all transformer layers while later ranks are still submitting trailing-layer P2P. Submitting an NCCL repair collective immediately from an early rank would re-enter the same device communicator before all ranks had finished the P2P phase and could violate operation ordering.
+The temporary broadcast payload is chunked to approximately 64 MiB. A single physical page larger than this limit is transferred as one page.
 
-The boundary is therefore:
+The CPU/Gloo rendezvous remains required because repair currently uses the same PCP device/NCCL group as layer-level prefix P2P. Earlier PCP ranks can finish all transformer layers while later ranks are still submitting trailing-layer P2P. The CPU rendezvous prevents a repair collective from entering that device-group operation stream before every rank has left the layer-P2P phase.
 
 ```text
                  transformer forward
@@ -120,48 +150,42 @@ rank0  L0 -> L1 -> L2 -> ... -> LN ----\
 rank1    L0 -> L1 -> ... -> LN ---------+--> CPU/Gloo rendezvous
 rank2      L0 -> ... -> LN -------------+          |
 rank3        ... -> LN -----------------/           v
-                                             NCCL cache repair
+                                         raw KV-page broadcast
 ```
 
 This boundary synchronization does not prevent cross-layer runahead inside the transformer stack.
 
-## Replicated KV Cache Semantics
+## Repair Memory Behavior
 
-During forward, rank `r` contains the current-step prefix owned by ranks `0..r` for each completed layer. After boundary repair every PCP rank receives the complete current-step KV image, preserving the replicated-cache contract used by later chunked prefill and decode steps.
-
-The current MVP reconstructs the full image with AllGather:
+The previous reference implementation retained every layer's local current-step K/V activation tensors until `finish_forward()`:
 
 ```text
-[K0][K1][K2][K3]
+O(num_layers * local_prefill_tokens * local_kv_width)
 ```
 
-For equal-width partitions this uses `all_gather_into_tensor`. Weighted variable-width standard attention uses uneven `torch.distributed.all_gather` output views and produces one compact rank-major output buffer.
+The current implementation retains persistent-cache references and lightweight slot metadata. The persistent KV cache already exists as part of normal vLLM execution, while temporary repair payload memory is bounded by the repair chunk size.
 
-This repair is intentionally placed outside transformer-layer execution. It still contributes to end-to-end prefill latency and TTFT because the current model runner flushes before sampling.
+Consequently, the runahead-specific activation-retention term above is removed.
 
-## Current Repair-Memory Tradeoff
+Raw-page transfer also operates on the cache's stored dtype. For an FP8 KV cache, repair transports the FP8 cache bytes rather than retaining and communicating the original BF16 K/V activation tensors.
 
-Deferred repair retains each layer's local current-step KV tensors until `finish_forward()`.
+## Current Repair Communication Cost
 
-This is an MVP mechanism for proving the communication schedule. Its temporary-memory cost grows with:
+The current reference repair broadcasts touched full pages from the final PCP rank to every rank. It preserves the replicated-cache contract required by later chunked prefill and decode steps and avoids activation retention, while repair traffic still remains at the model-forward boundary.
 
-```text
-num_layers * local_prefill_tokens * local_kv_width
-```
-
-A production implementation should source repair payloads from the already-written persistent paged KV cache through explicit pack/unpack operations. That removes the need to retain every layer's activation tensors across the whole model forward.
-
-A later optimization can replace full AllGather repair with reverse suffix propagation:
+A later optimization will use reverse suffix propagation:
 
 ```text
 forward prefix:
 rank0 -> rank1 -> rank2 -> rank3
 
 boundary repair:
-rank3 -> rank2 -> rank1 -> rank0
+rank3 -- suffix3 --> rank2
+rank2 -- suffix2+3 --> rank1
+rank1 -- suffix1+2+3 --> rank0
 ```
 
-That avoids retransmitting prefix data each rank already received during forward.
+That reduces redundant retransmission because each earlier rank already owns its causal prefix.
 
 ## Supported Standard-Attention Workloads
 
@@ -245,7 +269,7 @@ The current-step prefix moves left-to-right without padding:
 rank0 -- 4000 --> rank1 -- 6500 --> rank2 -- 8400 --> rank3
 ```
 
-Previously computed context remains in paged KV cache. Runahead communicates only K/V generated in the current scheduler step.
+Previously computed context remains in paged KV cache. Runahead communicates only K/V generated in the current scheduler step on the layer critical path. Boundary repair operates on the physical pages touched by those slots.
 
 ## Transport Ordering
 
@@ -253,7 +277,7 @@ P2P peers are specified in PCP-local rank space and mapped through `GroupCoordin
 
 Known-shape tensors use tensor-only communication. Multiple tensors belonging to one layer are submitted through `torch.distributed.batch_isend_irecv`.
 
-During transformer forward, the PCP device group carries prefix P2P only. Deferred device-group AllGathers start only after the CPU/Gloo forward-boundary rendezvous. This separation in time is deliberate: it avoids inserting a full collective between consecutive layer-prefix operations on the same NCCL communicator.
+During transformer forward, the PCP device group carries prefix P2P only. Raw-page repair starts only after the CPU/Gloo forward-boundary rendezvous. This separation in time avoids inserting a full repair collective between consecutive layer-prefix operations on the same NCCL communicator.
 
 ## NVTX Profiling
 
@@ -276,15 +300,13 @@ pcp.replica_defer
 pcp.send_wait
 pcp.flush
 pcp.replica_forward_boundary
+pcp.replica_block_index
 pcp.replica_commit
 pcp.replica_buffer_prepare
-pcp.replica_allgather_enqueue
-pcp.replica_wait
+pcp.replica_broadcast
 pcp.replica_cache_update
 pcp.transport.recv_enqueue
 pcp.transport.send_enqueue
-pcp.transport.allgather_enqueue
-pcp.transport.variable_allgather_enqueue
 pcp.restore_hidden_variable_allgather
 ```
 
@@ -304,9 +326,7 @@ rank1:   recv L0 -> L0 attn -> recv L1 -> L1 attn
 rank2:                recv L0 -> L0 attn -> ...
 ```
 
-If every PCP rank continues entering each layer together, the synchronization target has not been achieved even when outputs are correct.
-
-No `pcp.replica_allgather_enqueue` range should appear between transformer layers. All repair ranges should occur after the forward-boundary rendezvous.
+No `pcp.replica_broadcast` range should appear between transformer layers. All repair communication should occur after the forward-boundary rendezvous.
 
 ## Current Execution Envelope
 
@@ -328,15 +348,25 @@ Mixed decode+prefill runahead and broader topology support remain deferred.
 
 Correctness validation should compare baseline PCP and runahead at PCP=2 and PCP=4, covering fresh prefill, chunked prefill, existing-context extend, prefix-cache hits, homogeneous multi-request batches, pure decode fallback, and mixed fallback.
 
-For weighted standard attention, additionally sweep explicit load vectors such as `1,1,1,1`, `4,2.5,1.9,1.6`, and `4,3,2,1`. Confirm that per-rank token counts sum to every request length, compact rank offsets agree across ranks, final hidden-state ordering is restored, and the repaired KV cache matches baseline PCP within numerical tolerance.
+For weighted standard attention, additionally sweep explicit load vectors such as `1,1,1,1`, `4,2.5,1.9,1.6`, and `4,3,2,1`. Confirm that per-rank token counts sum to every request length, compact rank offsets agree across ranks, final hidden-state ordering is restored, and the repaired paged KV cache matches baseline PCP byte-for-byte for cache formats where exact byte equality is expected.
 
 Timeline validation should use Nsight Systems with NVTX enabled and confirm:
 
 1. earlier ranks execute later-layer GEMM/attention while later PCP ranks are still processing earlier layers,
-2. no replica AllGather is submitted from the transformer-layer critical path,
-3. every rank reaches `pcp.replica_forward_boundary` before device-group repair begins,
+2. no replica repair communication is submitted from the transformer-layer critical path,
+3. every rank reaches `pcp.replica_forward_boundary` before raw-page broadcast begins,
 4. repaired cache contents match baseline before the next model forward.
 
-Performance benchmarking should keep model, prompt/suffix lengths, PCP size, eager mode, cache dtype, and hardware identical between baseline and runahead. Measure TTFT/prefill latency, communication overlap, GPU utilization, peak deferred-KV memory, per-rank completion time, forward-boundary wait, repair time, and sensitivity to the load-weight vector.
+Performance benchmarking should keep model, prompt/suffix lengths, PCP size, eager mode, cache dtype, and hardware identical between baseline and runahead. Measure TTFT/prefill latency, communication overlap, GPU utilization, peak temporary repair memory, per-rank completion time, forward-boundary wait, repair time, and sensitivity to the load-weight vector.
 
 The fixed 1024-token runahead threshold is an initial guardrail and should be replaced or tuned from measured crossover data.
+
+## Planned Evolution
+
+The next optimization stages are intentionally separated so each can be validated independently:
+
+1. replace final-rank full-page broadcast with reverse-suffix raw-page P2P,
+2. create a sibling PCP device communicator and a dedicated repair CUDA stream, following the existing PP side-stream pattern,
+3. use CUDA events to launch repair after the source pages are ready and wait only before the next operation that can mutate/reuse those pages,
+4. overlap terminal-prefill repair with sampling,
+5. evaluate block-aligned PCP partitioning so per-layer background repair writes only cache pages that current-layer attention cannot read.
