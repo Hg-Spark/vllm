@@ -59,8 +59,15 @@ def install_standard_attention_pcp_cache_updates(vllm_config: Any) -> None:
     from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 
     for layer in vllm_config.compilation_config.static_forward_context.values():
-        if isinstance(layer, Attention) and layer.get_attn_backend().get_name() == _FLASH_ATTN_BACKEND:
-            setattr(layer, _PCP_LAYER_MARKER, True)
+        if not isinstance(layer, Attention):
+            continue
+        backend_name = layer.get_attn_backend().get_name()
+        if backend_name != _FLASH_ATTN_BACKEND:
+            raise NotImplementedError(
+                "MRV2 PCP for standard MHA/GQA/MQA attention currently requires "
+                f"FLASH_ATTN, got {backend_name}."
+            )
+        setattr(layer, _PCP_LAYER_MARKER, True)
 
     if getattr(FlashAttentionImpl, "_standard_attention_pcp_cache_update_installed", False):
         return
