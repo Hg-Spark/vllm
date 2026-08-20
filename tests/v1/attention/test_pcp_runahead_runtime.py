@@ -63,7 +63,7 @@ def test_exchange_prefix_uses_variable_rank_offsets() -> None:
     assert [tensor.shape[0] for tensor in send.call_args.args[1]] == [9, 9]
 
 
-def test_replication_uses_compact_total_rows() -> None:
+def test_replication_is_deferred_until_flush() -> None:
     runtime = PCPRunaheadRuntime(
         pcp_world_size=4,
         pcp_rank=2,
@@ -72,8 +72,6 @@ def test_replication_uses_compact_total_rows() -> None:
     runtime.begin_step((4, 3, 2, 1))
     group = _group(2)
     handles = [MagicMock(), MagicMock()]
-    for handle in handles:
-        handle.is_completed.return_value = False
     apply = MagicMock()
 
     with (
@@ -86,20 +84,71 @@ def test_replication_uses_compact_total_rows() -> None:
             side_effect=handles,
         ) as gather,
     ):
-        runtime.enqueue_replication(
+        runtime.defer_replication(
             (torch.empty(2, 3), torch.empty(2, 5)),
             torch.arange(10),
             apply,
         )
+
+        assert gather.call_count == 0
+        assert runtime.num_deferred_replica_layers == 1
+
+        runtime.flush()
+
         assert gather.call_count == 2
         assert gather.call_args_list[0].args[1].shape == (10, 3)
         assert gather.call_args_list[0].args[2].shape == (2, 3)
         assert gather.call_args_list[0].args[3] == (4, 3, 2, 1)
         assert gather.call_args_list[1].args[1].shape == (10, 5)
 
-        runtime.flush()
-
     apply.assert_called_once()
     gathered_tensors, gathered_slots = apply.call_args.args
     assert [tensor.shape[0] for tensor in gathered_tensors] == [10, 10]
     assert gathered_slots.tolist() == list(range(10))
+    assert runtime.num_deferred_replica_layers == 0
+
+
+def test_layer_update_does_not_launch_replica_allgather() -> None:
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+    )
+    runtime.begin_step((2, 2, 2, 2))
+    group = _group(0)
+    send_work = MagicMock()
+    send_work.is_completed.return_value = False
+    gather_work = MagicMock()
+    apply = MagicMock()
+
+    with (
+        patch(
+            "vllm.v1.attention.ops.pcp_runahead.get_pcp_group",
+            return_value=group,
+        ),
+        patch(
+            "vllm.v1.attention.ops.pcp_runahead.batch_isend_tensors",
+            return_value=[send_work],
+        ),
+        patch(
+            "vllm.v1.attention.ops.pcp_runahead.all_gather_variable_into_tensor_async",
+            return_value=gather_work,
+        ) as gather,
+    ):
+        runtime.update_and_replicate(
+            (torch.empty(2, 3),),
+            torch.arange(8),
+            apply,
+        )
+
+        gather.assert_not_called()
+        apply.assert_called_once()
+        visible_tensors, visible_slots = apply.call_args.args
+        assert visible_tensors[0].shape == (2, 3)
+        assert visible_slots.tolist() == [0, 1]
+        assert runtime.num_deferred_replica_layers == 1
+
+        runtime.flush()
+
+    gather.assert_called_once()
+    assert apply.call_count == 2
