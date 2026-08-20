@@ -273,6 +273,14 @@ class PCPRunaheadRuntime:
         with pcp_nvtx_range("pcp.replica_defer"):
             storage_ptr = kv_cache.untyped_storage().data_ptr()
             cache_blocks = self._raw_cache_block_view(kv_cache)
+            if cache_blocks.shape[0] != kv_cache.shape[0]:
+                raise NotImplementedError(
+                    "runahead PCP raw-page repair currently requires one "
+                    "slot-addressed cache block per physical backing page: "
+                    f"logical_blocks={kv_cache.shape[0]}, "
+                    f"physical_pages={cache_blocks.shape[0]}"
+                )
+
             existing = self._deferred_repairs.get(storage_ptr)
             if existing is None:
                 existing = _DeferredPagedRepair(cache_blocks=cache_blocks)
@@ -282,6 +290,14 @@ class PCPRunaheadRuntime:
                     "runahead PCP found incompatible page views sharing one KV "
                     f"backing storage: {existing.cache_blocks.shape} vs "
                     f"{cache_blocks.shape}"
+                )
+            elif (
+                existing.slot_sources
+                and existing.slot_sources[0].cache_block_size != cache_block_size
+            ):
+                raise NotImplementedError(
+                    "runahead PCP raw-page repair does not yet support multiple "
+                    "slot block sizes sharing one physical KV backing allocation"
                 )
 
             source_key = (
