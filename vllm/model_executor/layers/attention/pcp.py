@@ -52,6 +52,31 @@ def _gather_prefill_cache_inputs(
     return cache_inputs, cache_slot_mapping
 
 
+def _standard_cache_block_size(kv_cache: torch.Tensor) -> int:
+    """Return FlashAttention's physical token slots per cache block.
+
+    Standard PCP is currently gated to FLASH_ATTN. Its logical cache view is
+    ``[num_blocks, num_kv_heads, block_size, 2 * head_size]`` even when the
+    physical stride order is NHD/HND, so dim 2 is the kernel cache block size.
+    """
+    if kv_cache.ndim != 4:
+        raise RuntimeError(
+            "standard runahead PCP expected a 4D FlashAttention KV cache, "
+            f"got shape={tuple(kv_cache.shape)}"
+        )
+    return int(kv_cache.shape[2])
+
+
+def _mla_cache_block_size(kv_cache: torch.Tensor) -> int:
+    """Return MLA/sparse-MLA token slots per block-major cache page."""
+    if kv_cache.ndim < 2:
+        raise RuntimeError(
+            "MLA runahead PCP expected a block-major KV cache, "
+            f"got shape={tuple(kv_cache.shape)}"
+        )
+    return int(kv_cache.shape[1])
+
+
 def update_standard_kv_cache(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -63,9 +88,9 @@ def update_standard_kv_cache(
     """Update standard MHA/GQA/MQA KV cache through PCP policy.
 
     A rank-local slot mapping keeps pure decode local. A gathered mapping selects
-    the baseline synchronous K/V AllGather. Active runahead replaces that
-    collective with causal-prefix P2P on the critical path plus asynchronous
-    full-cache replication.
+    the baseline synchronous K/V AllGather. Active runahead uses causal-prefix
+    P2P on the layer critical path, writes only the visible causal prefix, and
+    records the persistent paged-KV blocks for forward-boundary repair.
     """
     layer_name = getattr(attn_layer, "layer_name", "unknown")
 
@@ -86,7 +111,13 @@ def update_standard_kv_cache(
     runtime = get_pcp_runahead_runtime()
     if runtime is not None:
         with pcp_nvtx_range(f"pcp.standard.runahead:{layer_name}"):
-            runtime.update_and_replicate((key, value), slot_mapping, apply)
+            runtime.update_visible_and_defer_repair(
+                (key, value),
+                slot_mapping,
+                apply,
+                kv_cache,
+                _standard_cache_block_size(kv_cache),
+            )
         return
 
     if slot_mapping.shape[0] > key.shape[0]:
@@ -165,10 +196,12 @@ def update_mla_kv_cache(
                 )
 
         with pcp_nvtx_range("pcp.mla.runahead"):
-            runtime.update_and_replicate(
+            runtime.update_visible_and_defer_repair(
                 (kv_c_normed, k_pe),
                 slot_mapping,
                 apply,
+                kv_cache,
+                _mla_cache_block_size(kv_cache),
             )
         return
 
@@ -236,7 +269,13 @@ def update_indexer_k_cache(
                 )
 
         with pcp_nvtx_range("pcp.indexer.runahead"):
-            runtime.update_and_replicate((k,), slot_mapping, apply)
+            runtime.update_visible_and_defer_repair(
+                (k,),
+                slot_mapping,
+                apply,
+                kv_cache,
+                _mla_cache_block_size(kv_cache),
+            )
         return
 
     cache_k, cache_slot_mapping = maybe_gather_indexer_k(
