@@ -215,6 +215,15 @@ class RunaheadPCPManager(PCPManager):
     def set_standard_attention(self, enabled: bool) -> None:
         self._standard_attention_pcp = enabled
 
+    def _segment_to_rank(self) -> tuple[int, ...]:
+        mapping = self._config.segment_to_rank
+        if mapping:
+            return mapping
+        return tuple(range(self.pcp_world_size))
+
+    def _rank_to_segment(self, rank: int) -> int:
+        return self._segment_to_rank().index(rank)
+
     @classmethod
     def validate_config(
         cls,
@@ -307,6 +316,7 @@ class RunaheadPCPManager(PCPManager):
                 query_start_loc_np,
             )
 
+        segment_idx = self._rank_to_segment(rank)
         rank_segments: list[RankSegment] = []
         rank_offset = 0
         for global_batch_req_idx, num_tokens in enumerate(num_scheduled_tokens):
@@ -316,8 +326,8 @@ class RunaheadPCPManager(PCPManager):
             global_batch_start = int(query_start_loc_np[global_batch_req_idx])
             start_pos = int(num_computed_tokens[global_batch_req_idx])
             lengths = self._partition_lengths(query_len, start_pos)
-            chunk_offset = sum(lengths[:rank])
-            chunk_len = lengths[rank]
+            chunk_offset = sum(lengths[:segment_idx])
+            chunk_len = lengths[segment_idx]
             if chunk_len <= 0:
                 continue
             chunk_start = global_batch_start + chunk_offset
@@ -335,6 +345,7 @@ class RunaheadPCPManager(PCPManager):
 
     def _custom_rows_per_rank(self, input_batch: InputBatch) -> tuple[int, ...]:
         rows = [0] * self.pcp_world_size
+        segment_to_rank = self._segment_to_rank()
         for req_idx, num_tokens in enumerate(
             input_batch.num_scheduled_tokens[: input_batch.num_reqs]
         ):
@@ -342,8 +353,8 @@ class RunaheadPCPManager(PCPManager):
                 int(num_tokens),
                 int(input_batch.num_computed_tokens_np[req_idx]),
             )
-            for rank, length in enumerate(lengths):
-                rows[rank] += length
+            for segment_idx, length in enumerate(lengths):
+                rows[segment_to_rank[segment_idx]] += length
         return tuple(rows)
 
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
@@ -411,6 +422,7 @@ class RunaheadPCPManager(PCPManager):
             self._runahead_runtime.begin_step(
                 rows_per_rank,
                 transport=self._config.transport,
+                segment_to_rank=self._segment_to_rank(),
             )
         else:
             self._rows_per_rank = ()
