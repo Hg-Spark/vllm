@@ -12,6 +12,7 @@ def _group(rank: int) -> MagicMock:
     group = MagicMock()
     group.world_size = 4
     group.rank_in_group = rank
+    group.cpu_group = MagicMock()
     return group
 
 
@@ -80,6 +81,9 @@ def test_replication_is_deferred_until_flush() -> None:
             return_value=group,
         ),
         patch(
+            "vllm.v1.attention.ops.pcp_runahead.torch.distributed.barrier"
+        ) as barrier,
+        patch(
             "vllm.v1.attention.ops.pcp_runahead.all_gather_variable_into_tensor_async",
             side_effect=handles,
         ) as gather,
@@ -95,6 +99,7 @@ def test_replication_is_deferred_until_flush() -> None:
 
         runtime.flush()
 
+        barrier.assert_called_once_with(group=group.cpu_group)
         assert gather.call_count == 2
         assert gather.call_args_list[0].args[1].shape == (10, 3)
         assert gather.call_args_list[0].args[2].shape == (2, 3)
@@ -131,6 +136,9 @@ def test_layer_update_does_not_launch_replica_allgather() -> None:
             return_value=[send_work],
         ),
         patch(
+            "vllm.v1.attention.ops.pcp_runahead.torch.distributed.barrier"
+        ) as barrier,
+        patch(
             "vllm.v1.attention.ops.pcp_runahead.all_gather_variable_into_tensor_async",
             return_value=gather_work,
         ) as gather,
@@ -142,6 +150,7 @@ def test_layer_update_does_not_launch_replica_allgather() -> None:
         )
 
         gather.assert_not_called()
+        barrier.assert_not_called()
         apply.assert_called_once()
         visible_tensors, visible_slots = apply.call_args.args
         assert visible_tensors[0].shape == (2, 3)
@@ -150,5 +159,6 @@ def test_layer_update_does_not_launch_replica_allgather() -> None:
 
         runtime.flush()
 
+    barrier.assert_called_once_with(group=group.cpu_group)
     gather.assert_called_once()
     assert apply.call_count == 2
