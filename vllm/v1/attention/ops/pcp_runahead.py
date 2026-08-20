@@ -25,6 +25,7 @@ _REPAIR_CHUNK_BYTES = 64 * 1024 * 1024
 @dataclass
 class _PendingSend:
     works: list[Handle]
+    tensors: tuple[torch.Tensor, ...]
 
     def completed(self) -> bool:
         return all(work.is_completed() for work in self.works)
@@ -130,15 +131,20 @@ class PCPRunaheadRuntime:
         if not self.active:
             return
         ptr = kv_cache.untyped_storage().data_ptr()
-        if ptr not in self._cache_blocks:
+        existing = self._cache_blocks.get(ptr)
+        if existing is None:
             self._cache_blocks[ptr] = self._raw_cache_block_view(kv_cache)
+            return
+        if existing.shape[0] != kv_cache.shape[0]:
+            raise RuntimeError(
+                "runahead PCP found incompatible KV views sharing one backing "
+                f"allocation: registered_blocks={existing.shape[0]}, "
+                f"new_blocks={kv_cache.shape[0]}"
+            )
 
     def set_repair_block_ids(self, block_ids: torch.Tensor | None) -> None:
         """Set the step-level set of kernel-cache blocks touched by this forward."""
-        if not self.active:
-            self._repair_block_ids = None
-            return
-        if block_ids is None:
+        if not self.active or block_ids is None:
             self._repair_block_ids = None
             return
         self._repair_block_ids = block_ids.to(device=self.device, dtype=torch.long)
@@ -189,6 +195,11 @@ class PCPRunaheadRuntime:
                 f"rank={self.rank}, rows={local_rows}, "
                 f"shapes={[tuple(t.shape) for t in tensors]}"
             )
+        if slot_mapping.shape[0] < self.visible_rows:
+            raise ValueError(
+                "runahead PCP slot mapping is shorter than the causal-visible "
+                f"prefix: slots={slot_mapping.shape[0]}, visible={self.visible_rows}"
+            )
 
         if self.rank == 0:
             with pcp_nvtx_range("pcp.prefix_local_prepare"):
@@ -211,7 +222,7 @@ class PCPRunaheadRuntime:
         visible_slots = slot_mapping[: self.visible_rows]
         if self.rank + 1 < self.world_size:
             works = self._p2p(visible, peer=self.rank + 1, recv=False)
-            self._pending_sends.append(_PendingSend(works))
+            self._pending_sends.append(_PendingSend(works, visible))
             self._drain_sends()
         return visible, visible_slots
 
@@ -220,7 +231,9 @@ class PCPRunaheadRuntime:
         if block_ids is None or block_ids.numel() == 0:
             return
 
-        block_ids = block_ids[block_ids < cache_blocks.shape[0]]
+        block_ids = block_ids[
+            (block_ids >= 0) & (block_ids < cache_blocks.shape[0])
+        ]
         if block_ids.numel() == 0:
             return
 
