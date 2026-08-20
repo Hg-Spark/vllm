@@ -660,13 +660,23 @@ def maybe_build_pcp_manager(
     if pcp_size <= 1:
         return None
 
-    PCPManager.validate_config(vllm_config, supports_mm_inputs)
+    runahead = (
+        isinstance(vllm_config.additional_config, dict)
+        and bool(vllm_config.additional_config.get("pcp_runahead", False))
+    )
+    manager_cls: type[PCPManager] = PCPManager
+    if runahead:
+        from vllm.v1.worker.gpu.pcp_runahead_manager import RunaheadPCPManager
+
+        manager_cls = RunaheadPCPManager
+
+    manager_cls.validate_config(vllm_config, supports_mm_inputs)
 
     pcp_rank = get_pcp_group().rank_in_group
     dcp_size = parallel_config.decode_context_parallel_size
     dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
 
-    return PCPManager(
+    manager = manager_cls(
         pcp_world_size=pcp_size,
         pcp_rank=pcp_rank,
         device=device,
@@ -678,3 +688,8 @@ def maybe_build_pcp_manager(
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
     )
+    if runahead:
+        manager.set_standard_attention(  # type: ignore[attr-defined]
+            not vllm_config.model_config.use_mla
+        )
+    return manager

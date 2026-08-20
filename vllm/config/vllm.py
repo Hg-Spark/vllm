@@ -2169,8 +2169,14 @@ class VllmConfig:
         model_config = self.model_config
         speculative_config = self.speculative_config
 
-        if self.parallel_config.prefill_context_parallel_size > 1 and not (
-            model_config is not None and model_config.use_mla
+        pcp_runahead = (
+            isinstance(self.additional_config, dict)
+            and bool(self.additional_config.get("pcp_runahead", False))
+        )
+        if (
+            self.parallel_config.prefill_context_parallel_size > 1
+            and not (model_config is not None and model_config.use_mla)
+            and not pcp_runahead
         ):
             unsupported.append("prefill context parallelism")
         if self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:

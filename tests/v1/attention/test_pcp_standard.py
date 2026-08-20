@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from unittest.mock import MagicMock, patch
+
+import torch
+
+from vllm.v1.attention.ops.pcp_standard import (
+    prepare_standard_pcp_kv_cache_inputs,
+)
+
+
+def _flash_kv_cache(
+    num_blocks: int = 8,
+    num_kv_heads: int = 2,
+    block_size: int = 16,
+) -> torch.Tensor:
+    return torch.empty((num_blocks, num_kv_heads, block_size, 32))
+
+
+def test_standard_runahead_preserves_gqa_kv_head_shape() -> None:
+    key = torch.randn(6, 2, 16)
+    value = torch.randn(6, 2, 16)
+    slot_mapping = torch.arange(6, dtype=torch.int64)
+    kv_cache = _flash_kv_cache()
+    runtime = MagicMock()
+    runtime.exchange_prefix.return_value = ((key, value), slot_mapping)
+
+    with patch(
+        "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
+        return_value=runtime,
+    ):
+        out_key, out_value, out_slots = prepare_standard_pcp_kv_cache_inputs(
+            key, value, slot_mapping, kv_cache
+        )
+
+    runtime.exchange_prefix.assert_called_once()
+    assert out_key is key
+    assert out_value is value
+    assert out_slots is slot_mapping
+    assert out_key.shape[1:] == (2, 16)
+
+
+def test_standard_runahead_returns_causal_visible_image() -> None:
+    local_key = torch.randn(3, 2, 8)
+    local_value = torch.randn(3, 2, 8)
+    visible_key = torch.randn(7, 2, 8)
+    visible_value = torch.randn(7, 2, 8)
+    visible_slots = torch.arange(7, dtype=torch.int64)
+    kv_cache = _flash_kv_cache()
+    runtime = MagicMock()
+    runtime.exchange_prefix.return_value = (
+        (visible_key, visible_value), visible_slots
+    )
+
+    with patch(
+        "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
+        return_value=runtime,
+    ):
+        out_key, out_value, out_slots = prepare_standard_pcp_kv_cache_inputs(
+            local_key, local_value, visible_slots, kv_cache
+        )
+
+    assert out_key is visible_key
+    assert out_value is visible_value
+    assert out_slots is visible_slots
+
+
+def test_standard_fallback_reuses_baseline_allgather() -> None:
+    key = torch.randn(2, 2, 8)
+    value = torch.randn(2, 2, 8)
+    slots = torch.arange(4, dtype=torch.int64)
+    kv_cache = _flash_kv_cache()
+    group = MagicMock()
+    group.world_size = 2
+    group.all_gather.side_effect = lambda tensor, dim: torch.cat(
+        (tensor, tensor), dim=dim
+    )
+
+    with (
+        patch(
+            "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
+            return_value=None,
+        ),
+        patch(
+            "vllm.v1.attention.ops.pcp_standard.get_pcp_group",
+            return_value=group,
+        ),
+    ):
+        out_key, out_value, out_slots = prepare_standard_pcp_kv_cache_inputs(
+            key, value, slots, kv_cache
+        )
+
+    assert out_key.shape[0] == 4
+    assert out_value.shape[0] == 4
+    assert out_slots is slots
+    assert group.all_gather.call_count == 2

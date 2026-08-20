@@ -742,6 +742,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
 class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+    supports_pcp: bool = True
 
     def __init__(
         self,
@@ -820,6 +821,10 @@ class FlashAttentionImpl(AttentionImpl):
         self.supports_quant_query_input = flash_attn_supports_quant_query_input()
 
         vllm_config = get_current_vllm_config_or_none()
+        self.use_pcp = (
+            vllm_config is not None
+            and vllm_config.parallel_config.prefill_context_parallel_size > 1
+        )
         dcp_a2a = (
             vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -1107,6 +1112,15 @@ class FlashAttentionImpl(AttentionImpl):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
             return
+
+        if self.use_pcp:
+            from vllm.v1.attention.ops.pcp_standard import (
+                prepare_standard_pcp_kv_cache_inputs,
+            )
+
+            key, value, slot_mapping = prepare_standard_pcp_kv_cache_inputs(
+                key, value, slot_mapping, kv_cache
+            )
 
         # Scatter write into the KV cache using slot_mapping indices.
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
