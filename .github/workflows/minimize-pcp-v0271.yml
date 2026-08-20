@@ -1,0 +1,87 @@
+name: Minimize PCP v0.27.1 port
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  minimize:
+    if: github.event.pull_request.head.ref == 'automation/minimize-pcp-v0271'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Rebuild minimal PCP port from main
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p .tmp/scripts
+          cp .github/scripts/minimize_pcp_v0271.py .tmp/scripts/minimize_pcp_v0271.py
+          git fetch origin main pcp-runahead-v0.27.1 --no-tags
+          git checkout --detach origin/main
+          python .tmp/scripts/minimize_pcp_v0271.py
+
+      - name: Validate minimal invasion
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check origin/main --
+
+          for path in \
+            vllm/config/__init__.py \
+            vllm/config/parallel.py \
+            vllm/engine/arg_utils.py \
+            vllm/v1/worker/gpu/model_runner.py
+          do
+            git diff --quiet origin/main -- "$path"
+          done
+
+          mapfile -t pyfiles < <(git diff --name-only --diff-filter=ACM origin/main -- '*.py')
+          python -m py_compile "${pyfiles[@]}"
+
+          ! grep -R "prefill_context_parallel_mode" \
+            vllm/config vllm/engine vllm/v1/worker/gpu/pcp_manager.py \
+            vllm/v1/worker/gpu/pcp_runahead_manager.py
+          ! grep -R "AttentionBackend.supports_pcp =" vllm/v1/attention/ops
+
+          git diff --stat origin/main --
+          git diff --numstat origin/main --
+
+      - name: Commit and replace target branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name HSpark
+          git config user.email 46282235+Hg-Spark@users.noreply.github.com
+
+          git add -- \
+            docs/design/pcp_runahead.md \
+            tests/v1/attention/test_pcp_runahead_runtime.py \
+            tests/v1/attention/test_pcp_standard.py \
+            tests/v1/worker/gpu/test_pcp_runahead.py \
+            vllm/config/vllm.py \
+            vllm/model_executor/layers/attention/mla_attention.py \
+            vllm/model_executor/layers/attention/pcp.py \
+            vllm/model_executor/layers/sparse_attn_indexer.py \
+            vllm/v1/attention/backends/flash_attn.py \
+            vllm/v1/attention/ops/pcp_profile.py \
+            vllm/v1/attention/ops/pcp_runahead.py \
+            vllm/v1/attention/ops/pcp_standard.py \
+            vllm/v1/worker/gpu/pcp_manager.py \
+            vllm/v1/worker/gpu/pcp_runahead_manager.py
+
+          git diff --cached --check
+          git commit -m 'Port PCP runahead onto vLLM v0.27.1'
+
+          test "$(git rev-parse HEAD^)" = "$(git rev-parse origin/main)"
+          test "$(git rev-list --count origin/main..HEAD)" = "1"
+
+          git push \
+            --force-with-lease=refs/heads/pcp-runahead-v0.27.1:0ccafcd9d9cf57689023ef023c5c704d24fdc828 \
+            origin HEAD:refs/heads/pcp-runahead-v0.27.1
