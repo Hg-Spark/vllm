@@ -218,27 +218,33 @@ class PCPRunaheadRuntime:
         return visible, visible_slot_mapping
 
     @staticmethod
-    def _raw_cache_block_view(
-        kv_cache: torch.Tensor,
-        num_blocks: int,
-    ) -> torch.Tensor:
+    def _raw_cache_block_view(kv_cache: torch.Tensor) -> torch.Tensor:
         """View a block-major KV backing allocation as raw byte pages.
 
-        This mirrors the storage-level block view used by
-        ``copy_kv_cache_blocks_inplace``. For packed cross-layer allocations,
-        ``untyped_storage`` exposes the complete backing allocation and one raw
-        row contains every layer packed into that physical cache block.
+        The attention view may be padded or may point into a cross-layer packed
+        backing allocation. ``stride(0)`` is the physical distance between
+        consecutive cache blocks for the supported block-major PCP backends, so
+        it gives the raw page width without decoding K/V layout details. The
+        resulting storage-level view mirrors vLLM's block-copy implementation.
         """
-        if num_blocks <= 0:
-            raise ValueError(f"KV cache must expose positive block count: {num_blocks}")
+        if kv_cache.ndim == 0 or kv_cache.shape[0] <= 0:
+            raise ValueError(
+                f"runahead PCP requires a block-major KV cache view: {kv_cache.shape}"
+            )
+        block_stride_bytes = int(kv_cache.stride(0) * kv_cache.element_size())
+        if block_stride_bytes <= 0:
+            raise RuntimeError(
+                f"runahead PCP found invalid KV block stride: {block_stride_bytes}"
+            )
+
         blocks = torch.empty(0, dtype=torch.uint8, device=kv_cache.device)
         blocks.set_(kv_cache.untyped_storage())
-        if blocks.numel() % num_blocks != 0:
+        if blocks.numel() % block_stride_bytes != 0:
             raise RuntimeError(
-                "runahead PCP requires block-major KV backing storage: "
-                f"bytes={blocks.numel()}, blocks={num_blocks}"
+                "runahead PCP requires a page-strided KV backing allocation: "
+                f"bytes={blocks.numel()}, block_stride_bytes={block_stride_bytes}"
             )
-        return blocks.view(num_blocks, -1)
+        return blocks.view(-1, block_stride_bytes)
 
     def defer_paged_repair(
         self,
@@ -258,10 +264,6 @@ class PCPRunaheadRuntime:
             raise ValueError(
                 f"runahead PCP cache block size must be positive: {cache_block_size}"
             )
-        if kv_cache.ndim == 0 or kv_cache.shape[0] <= 0:
-            raise ValueError(
-                f"runahead PCP requires a block-major KV cache view: {kv_cache.shape}"
-            )
         if slot_mapping.shape[0] < self.total_rows:
             raise ValueError(
                 "runahead PCP slot mapping is shorter than the compact layout: "
@@ -270,17 +272,16 @@ class PCPRunaheadRuntime:
 
         with pcp_nvtx_range("pcp.replica_defer"):
             storage_ptr = kv_cache.untyped_storage().data_ptr()
+            cache_blocks = self._raw_cache_block_view(kv_cache)
             existing = self._deferred_repairs.get(storage_ptr)
-            num_blocks = int(kv_cache.shape[0])
             if existing is None:
-                existing = _DeferredPagedRepair(
-                    cache_blocks=self._raw_cache_block_view(kv_cache, num_blocks)
-                )
+                existing = _DeferredPagedRepair(cache_blocks=cache_blocks)
                 self._deferred_repairs[storage_ptr] = existing
-            elif existing.cache_blocks.shape[0] != num_blocks:
+            elif existing.cache_blocks.shape != cache_blocks.shape:
                 raise RuntimeError(
-                    "runahead PCP found incompatible block counts sharing one KV "
-                    f"backing storage: {existing.cache_blocks.shape[0]} vs {num_blocks}"
+                    "runahead PCP found incompatible page views sharing one KV "
+                    f"backing storage: {existing.cache_blocks.shape} vs "
+                    f"{cache_blocks.shape}"
                 )
 
             source_key = (
