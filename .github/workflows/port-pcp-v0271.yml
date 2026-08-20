@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - automation/port-pcp-v0271
+  pull_request:
+    branches:
+      - baseline0.27.1
 
 permissions:
   contents: write
