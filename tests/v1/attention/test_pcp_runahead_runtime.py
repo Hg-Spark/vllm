@@ -3,6 +3,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from vllm.v1.attention.ops.pcp_runahead import PCPRunaheadRuntime
@@ -111,6 +112,20 @@ def test_packed_backing_storage_is_registered_once_per_step() -> None:
     runtime.register_kv_cache(layer1_view)
 
     assert runtime.num_cache_block_views == 1
+
+
+def test_shared_backing_rejects_incompatible_block_counts() -> None:
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+    )
+    runtime.begin_step((2, 2, 2, 2))
+    backing = torch.zeros(128, dtype=torch.uint8)
+    runtime.register_kv_cache(backing.view(8, 16))
+
+    with pytest.raises(RuntimeError, match="incompatible KV views"):
+        runtime.register_kv_cache(backing.view(4, 32))
 
 
 def test_repair_union_ignores_ids_outside_a_storage() -> None:
