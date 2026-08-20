@@ -64,7 +64,7 @@ def test_exchange_prefix_uses_variable_rank_offsets() -> None:
     assert [tensor.shape[0] for tensor in send.call_args.args[1]] == [9, 9]
 
 
-def test_replication_is_deferred_until_flush() -> None:
+def test_paged_repair_is_deferred_until_flush() -> None:
     runtime = PCPRunaheadRuntime(
         pcp_world_size=4,
         pcp_rank=2,
@@ -72,48 +72,40 @@ def test_replication_is_deferred_until_flush() -> None:
     )
     runtime.begin_step((4, 3, 2, 1))
     group = _group(2)
-    handles = [MagicMock(), MagicMock()]
-    apply = MagicMock()
+    kv_cache = torch.zeros((8, 2, 4), dtype=torch.uint8)
 
-    with (
-        patch(
-            "vllm.v1.attention.ops.pcp_runahead.get_pcp_group",
-            return_value=group,
-        ),
-        patch(
-            "vllm.v1.attention.ops.pcp_runahead.torch.distributed.barrier"
-        ) as barrier,
-        patch(
-            "vllm.v1.attention.ops.pcp_runahead.all_gather_variable_into_tensor_async",
-            side_effect=handles,
-        ) as gather,
+    def broadcast_side_effect(payload: torch.Tensor, src: int) -> torch.Tensor:
+        assert src == 3
+        payload.fill_(7)
+        return payload
+
+    group.broadcast.side_effect = broadcast_side_effect
+
+    with patch(
+        "vllm.v1.attention.ops.pcp_runahead.get_pcp_group",
+        return_value=group,
     ):
-        runtime.defer_replication(
-            (torch.empty(2, 3), torch.empty(2, 5)),
+        runtime.defer_paged_repair(
+            kv_cache,
             torch.arange(10),
-            apply,
+            cache_block_size=2,
         )
 
-        assert gather.call_count == 0
-        assert runtime.num_deferred_replica_layers == 1
+        assert runtime.num_deferred_repair_buffers == 1
+        group.broadcast.assert_not_called()
+        group.barrier.assert_not_called()
 
         runtime.flush()
 
-        barrier.assert_called_once_with(group=group.cpu_group)
-        assert gather.call_count == 2
-        assert gather.call_args_list[0].args[1].shape == (10, 3)
-        assert gather.call_args_list[0].args[2].shape == (2, 3)
-        assert gather.call_args_list[0].args[3] == (4, 3, 2, 1)
-        assert gather.call_args_list[1].args[1].shape == (10, 5)
-
-    apply.assert_called_once()
-    gathered_tensors, gathered_slots = apply.call_args.args
-    assert [tensor.shape[0] for tensor in gathered_tensors] == [10, 10]
-    assert gathered_slots.tolist() == list(range(10))
-    assert runtime.num_deferred_replica_layers == 0
+    group.barrier.assert_called_once_with()
+    group.broadcast.assert_called_once()
+    assert group.broadcast.call_args.kwargs == {"src": 3}
+    assert torch.all(kv_cache[:5] == 7)
+    assert torch.all(kv_cache[5:] == 0)
+    assert runtime.num_deferred_repair_buffers == 0
 
 
-def test_layer_update_does_not_launch_replica_allgather() -> None:
+def test_layer_update_keeps_repair_off_critical_path() -> None:
     runtime = PCPRunaheadRuntime(
         pcp_world_size=4,
         pcp_rank=0,
@@ -123,8 +115,15 @@ def test_layer_update_does_not_launch_replica_allgather() -> None:
     group = _group(0)
     send_work = MagicMock()
     send_work.is_completed.return_value = False
-    gather_work = MagicMock()
     apply = MagicMock()
+    kv_cache = torch.zeros((8, 2, 4), dtype=torch.uint8)
+
+    def broadcast_side_effect(payload: torch.Tensor, src: int) -> torch.Tensor:
+        assert src == 3
+        payload.fill_(9)
+        return payload
+
+    group.broadcast.side_effect = broadcast_side_effect
 
     with (
         patch(
@@ -135,30 +134,60 @@ def test_layer_update_does_not_launch_replica_allgather() -> None:
             "vllm.v1.attention.ops.pcp_runahead.batch_isend_tensors",
             return_value=[send_work],
         ),
-        patch(
-            "vllm.v1.attention.ops.pcp_runahead.torch.distributed.barrier"
-        ) as barrier,
-        patch(
-            "vllm.v1.attention.ops.pcp_runahead.all_gather_variable_into_tensor_async",
-            return_value=gather_work,
-        ) as gather,
     ):
-        runtime.update_and_replicate(
+        runtime.update_visible_and_defer_repair(
             (torch.empty(2, 3),),
             torch.arange(8),
             apply,
+            kv_cache,
+            cache_block_size=2,
         )
 
-        gather.assert_not_called()
-        barrier.assert_not_called()
+        group.broadcast.assert_not_called()
+        group.barrier.assert_not_called()
         apply.assert_called_once()
         visible_tensors, visible_slots = apply.call_args.args
         assert visible_tensors[0].shape == (2, 3)
         assert visible_slots.tolist() == [0, 1]
-        assert runtime.num_deferred_replica_layers == 1
+        assert runtime.num_deferred_repair_buffers == 1
 
         runtime.flush()
 
-    barrier.assert_called_once_with(group=group.cpu_group)
-    gather.assert_called_once()
-    assert apply.call_count == 2
+    send_work.wait.assert_called_once_with()
+    group.barrier.assert_called_once_with()
+    group.broadcast.assert_called_once()
+    # Repair copies raw persistent pages. It never replays the layer cache writer
+    # with retained activation tensors.
+    assert apply.call_count == 1
+    assert torch.all(kv_cache[:4] == 9)
+    assert torch.all(kv_cache[4:] == 0)
+
+
+def test_packed_backing_storage_is_registered_once() -> None:
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+    )
+    runtime.begin_step((2, 2, 2, 2))
+    group = _group(0)
+    backing = torch.zeros((8, 16), dtype=torch.uint8)
+    layer0_view = backing.view(8, 2, 8)
+    layer1_view = backing.view(8, 4, 4)
+
+    with patch(
+        "vllm.v1.attention.ops.pcp_runahead.get_pcp_group",
+        return_value=group,
+    ):
+        runtime.defer_paged_repair(
+            layer0_view,
+            torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]),
+            cache_block_size=2,
+        )
+        runtime.defer_paged_repair(
+            layer1_view,
+            torch.tensor([2, 3, 4, 5, 6, 7, 8, 9]),
+            cache_block_size=2,
+        )
+
+    assert runtime.num_deferred_repair_buffers == 1
