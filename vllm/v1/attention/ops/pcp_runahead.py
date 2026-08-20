@@ -5,9 +5,11 @@
 The critical path forwards compact causal KV prefixes left-to-right with P2P
 sends. Full replicated-cache repair is deferred until the forward boundary so
 layer L repair traffic cannot queue ahead of layer L+1 prefix traffic on the
-same PCP ProcessGroup. Request eligibility and batch partition policy live in
-``RunaheadPCPManager``; this module owns the per-layer runtime and deferred
-repair queue.
+same PCP ProcessGroup.
+
+Deferred repair is sourced from persistent paged KV cache storage. The runtime
+records raw cache block views and the block IDs touched by the current step;
+it does not retain per-layer K/V activation tensors until the end of forward.
 """
 
 from __future__ import annotations
@@ -21,12 +23,16 @@ import torch
 from vllm.distributed.parallel_state import Handle, get_pcp_group
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 from vllm.v1.attention.ops.pcp_transport import (
-    all_gather_variable_into_tensor_async,
     batch_irecv_tensors,
     batch_isend_tensors,
 )
 
 CacheUpdate = Callable[[tuple[torch.Tensor, ...], torch.Tensor], None]
+
+# Bound temporary memory used by one raw-page broadcast. Large packed KV
+# backings can put many layers in one physical page, so chunk by bytes rather
+# than by an arbitrary number of blocks.
+_REPAIR_CHUNK_BYTES = 64 * 1024 * 1024
 
 
 @dataclass
@@ -43,10 +49,11 @@ class _PendingSend:
 
 
 @dataclass
-class _DeferredReplica:
-    local_inputs: tuple[torch.Tensor, ...]
-    slot_mapping: torch.Tensor
-    apply: CacheUpdate
+class _DeferredPagedRepair:
+    """Persistent KV storage plus the physical cache blocks to repair."""
+
+    cache_blocks: torch.Tensor  # uint8 [num_blocks, bytes_per_block]
+    block_ids: torch.Tensor  # int64, device resident
 
 
 class PCPRunaheadRuntime:
@@ -54,15 +61,14 @@ class PCPRunaheadRuntime:
 
     The runtime consumes a known variable-width token slab from each PCP rank.
     During transformer-layer execution it only propagates the causal-visible
-    prefix and records enough state to repair the replicated cache later. Full
-    PCP all-gathers are launched by ``flush`` after every rank reaches the
-    forward boundary, which keeps them out of the cross-layer prefix critical
-    path and preserves one operation order on the PCP NCCL communicator.
+    prefix, commits that visible prefix to the persistent KV cache, and records
+    which persistent cache blocks need replication later.
 
-    Deferred repair intentionally retains the local current-step tensors for
-    each participating layer until ``flush``. This is an MVP tradeoff: it proves
-    the communication schedule without requiring paged-cache pack/unpack. A
-    later implementation can source repair payloads from persistent KV cache.
+    At ``flush`` all outstanding prefix sends are drained, PCP ranks rendezvous
+    through the CPU group, and the last PCP rank broadcasts the touched raw KV
+    pages. The last rank is the cache authority because the causal prefix chain
+    gives it every current-step KV row before its layer cache write. Broadcasting
+    complete pages also makes rank boundaries inside one page safe.
     """
 
     def __init__(
@@ -78,7 +84,9 @@ class PCPRunaheadRuntime:
         self.rows_per_rank: tuple[int, ...] = ()
         self.rank_offsets: tuple[int, ...] = ()
         self._pending_sends: deque[_PendingSend] = deque()
-        self._deferred_replicas: deque[_DeferredReplica] = deque()
+        # Keyed by backing-storage data pointer. Packed cross-layer KV caches
+        # therefore register once and can be repaired as one raw page image.
+        self._deferred_repairs: dict[int, _DeferredPagedRepair] = {}
 
     @property
     def local_rows(self) -> int:
@@ -105,8 +113,8 @@ class PCPRunaheadRuntime:
         return self.rank_offsets[-1]
 
     @property
-    def num_deferred_replica_layers(self) -> int:
-        return len(self._deferred_replicas)
+    def num_deferred_repair_buffers(self) -> int:
+        return len(self._deferred_repairs)
 
     def begin_step(self, rows_per_rank: Sequence[int]) -> None:
         self.flush()
@@ -201,22 +209,50 @@ class PCPRunaheadRuntime:
 
         return visible, visible_slot_mapping
 
-    def defer_replication(
+    @staticmethod
+    def _raw_cache_block_view(
+        kv_cache: torch.Tensor,
+        num_blocks: int,
+    ) -> torch.Tensor:
+        """View a block-major KV backing allocation as raw byte pages.
+
+        This mirrors the storage-level block view used by
+        ``copy_kv_cache_blocks_inplace``. For packed cross-layer allocations,
+        ``untyped_storage`` exposes the complete backing allocation and one raw
+        row contains every layer packed into that physical cache block.
+        """
+        if num_blocks <= 0:
+            raise ValueError(f"KV cache must expose positive block count: {num_blocks}")
+        blocks = torch.empty(0, dtype=torch.uint8, device=kv_cache.device)
+        blocks.set_(kv_cache.untyped_storage())
+        if blocks.numel() % num_blocks != 0:
+            raise RuntimeError(
+                "runahead PCP requires block-major KV backing storage: "
+                f"bytes={blocks.numel()}, blocks={num_blocks}"
+            )
+        return blocks.view(num_blocks, -1)
+
+    def defer_paged_repair(
         self,
-        tensors: tuple[torch.Tensor, ...],
+        kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
-        apply: CacheUpdate,
+        cache_block_size: int,
     ) -> None:
-        """Record one layer's full-cache repair without launching communication."""
+        """Record raw paged-cache blocks touched by this runahead step.
+
+        ``cache_block_size`` is the number of token slots represented by one
+        physical block in ``kv_cache``. No K/V activation tensor is retained.
+        """
         if not self.active:
             return
-
         self._validate_groups()
-        local_rows = self.local_rows
-        if any(tensor.shape[0] != local_rows for tensor in tensors):
+        if cache_block_size <= 0:
             raise ValueError(
-                "runahead PCP deferred repair expects the configured local rows: "
-                f"rank={self.rank}, rows={local_rows}"
+                f"runahead PCP cache block size must be positive: {cache_block_size}"
+            )
+        if kv_cache.ndim == 0 or kv_cache.shape[0] <= 0:
+            raise ValueError(
+                f"runahead PCP requires a block-major KV cache view: {kv_cache.shape}"
             )
         if slot_mapping.shape[0] < self.total_rows:
             raise ValueError(
@@ -225,50 +261,49 @@ class PCPRunaheadRuntime:
             )
 
         with pcp_nvtx_range("pcp.replica_defer"):
-            self._deferred_replicas.append(
-                _DeferredReplica(
-                    local_inputs=tuple(tensor.contiguous() for tensor in tensors),
-                    slot_mapping=slot_mapping[: self.total_rows],
-                    apply=apply,
+            slots = slot_mapping[: self.total_rows]
+            valid_slots = slots[slots >= 0]
+            if valid_slots.numel() == 0:
+                return
+            block_ids = torch.unique(
+                torch.div(valid_slots, cache_block_size, rounding_mode="floor")
+            ).to(dtype=torch.long)
+            num_blocks = int(kv_cache.shape[0])
+            if bool((block_ids >= num_blocks).any().item()):
+                raise RuntimeError(
+                    "runahead PCP slot mapping addresses past the KV cache block view: "
+                    f"num_blocks={num_blocks}, max_block={int(block_ids.max().item())}"
                 )
+
+            storage_ptr = kv_cache.untyped_storage().data_ptr()
+            cache_blocks = self._raw_cache_block_view(kv_cache, num_blocks)
+            existing = self._deferred_repairs.get(storage_ptr)
+            if existing is None:
+                self._deferred_repairs[storage_ptr] = _DeferredPagedRepair(
+                    cache_blocks=cache_blocks,
+                    block_ids=block_ids,
+                )
+                return
+
+            if existing.cache_blocks.shape != cache_blocks.shape:
+                raise RuntimeError(
+                    "runahead PCP found incompatible block views sharing one KV "
+                    f"backing storage: {existing.cache_blocks.shape} vs "
+                    f"{cache_blocks.shape}"
+                )
+            existing.block_ids = torch.unique(
+                torch.cat((existing.block_ids, block_ids), dim=0)
             )
 
-    def _repair_replica(self, replica: _DeferredReplica) -> None:
-        pcp_group = get_pcp_group()
-        gathered: list[torch.Tensor] = []
-        works: list[Handle] = []
-
-        with pcp_nvtx_range("pcp.replica_buffer_prepare"):
-            for local in replica.local_inputs:
-                gathered.append(
-                    local.new_empty((self.total_rows, *local.shape[1:]))
-                )
-
-        with pcp_nvtx_range("pcp.replica_allgather_enqueue"):
-            for local, output in zip(replica.local_inputs, gathered, strict=True):
-                works.append(
-                    all_gather_variable_into_tensor_async(
-                        pcp_group,
-                        output,
-                        local,
-                        self.rows_per_rank,
-                    )
-                )
-
-        with pcp_nvtx_range("pcp.replica_wait"):
-            for work in works:
-                work.wait()
-
-        with pcp_nvtx_range("pcp.replica_cache_update"):
-            replica.apply(tuple(gathered), replica.slot_mapping)
-
-    def update_and_replicate(
+    def update_visible_and_defer_repair(
         self,
         tensors: tuple[torch.Tensor, ...],
         slot_mapping: torch.Tensor,
         apply: CacheUpdate,
+        kv_cache: torch.Tensor,
+        cache_block_size: int,
     ) -> None:
-        """Commit the causal prefix now and defer full replication to flush."""
+        """Commit the causal prefix and record paged-cache repair metadata."""
         with pcp_nvtx_range("pcp.runahead_kv_update"):
             with pcp_nvtx_range("pcp.prefix_exchange"):
                 visible, visible_slot_mapping = self.exchange_prefix(
@@ -276,28 +311,55 @@ class PCPRunaheadRuntime:
                 )
             with pcp_nvtx_range("pcp.visible_cache_update"):
                 apply(visible, visible_slot_mapping)
-            self.defer_replication(tensors, slot_mapping, apply)
+            self.defer_paged_repair(kv_cache, slot_mapping, cache_block_size)
+
+    def _repair_paged_cache(self, repair: _DeferredPagedRepair) -> None:
+        pcp_group = get_pcp_group()
+        source_rank = self.world_size - 1
+        block_ids = repair.block_ids
+        cache_blocks = repair.cache_blocks
+        bytes_per_block = int(cache_blocks.shape[1])
+        blocks_per_chunk = max(1, _REPAIR_CHUNK_BYTES // bytes_per_block)
+
+        for start in range(0, block_ids.numel(), blocks_per_chunk):
+            chunk_ids = block_ids[start : start + blocks_per_chunk]
+            with pcp_nvtx_range("pcp.replica_buffer_prepare"):
+                if self.rank == source_rank:
+                    payload = cache_blocks.index_select(0, chunk_ids).contiguous()
+                else:
+                    payload = torch.empty(
+                        (chunk_ids.numel(), bytes_per_block),
+                        dtype=torch.uint8,
+                        device=cache_blocks.device,
+                    )
+
+            with pcp_nvtx_range("pcp.replica_broadcast"):
+                pcp_group.broadcast(payload, src=source_rank)
+
+            if self.rank != source_rank:
+                with pcp_nvtx_range("pcp.replica_cache_update"):
+                    cache_blocks.index_copy_(0, chunk_ids, payload)
 
     def flush(self) -> None:
-        """Drain P2P, rendezvous on CPU, then repair replicated cache images."""
+        """Drain prefix P2P and repair touched paged-KV blocks from last rank."""
         with pcp_nvtx_range("pcp.flush"):
             while self._pending_sends:
                 self._pending_sends.popleft().wait()
 
-            if self._deferred_replicas:
-                # Early PCP ranks can reach the end of the model while later
-                # ranks are still submitting prefix P2P for trailing layers.
-                # A device-group barrier/all-gather here would re-enter the same
-                # NCCL communicator too early. Rendezvous on the CPU/Gloo group
-                # first; after every rank arrives, no further layer P2P can be
-                # submitted and the deferred NCCL collectives have one order.
+            if self._deferred_repairs:
+                # Every rank first leaves the layer-level device-group P2P
+                # sequence. GroupCoordinator.barrier() intentionally uses the
+                # CPU/Gloo group, so no repair collective can be inserted into
+                # the NCCL stream while a later rank is still submitting prefix
+                # P2P on that same device group.
                 pcp_group = get_pcp_group()
                 with pcp_nvtx_range("pcp.replica_forward_boundary"):
-                    torch.distributed.barrier(group=pcp_group.cpu_group)
+                    pcp_group.barrier()
 
-            while self._deferred_replicas:
+            for repair in self._deferred_repairs.values():
                 with pcp_nvtx_range("pcp.replica_commit"):
-                    self._repair_replica(self._deferred_replicas.popleft())
+                    self._repair_paged_cache(repair)
+            self._deferred_repairs.clear()
 
 
 _RUNTIME: PCPRunaheadRuntime | None = None
