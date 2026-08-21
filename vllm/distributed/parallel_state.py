@@ -1749,6 +1749,8 @@ def initialize_model_parallel(
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
+    *,
+    pcp_group_order: tuple[int, ...] | None = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1876,6 +1878,21 @@ def initialize_model_parallel(
             .unbind(0)
         )
         group_ranks = [x.tolist() for x in group_ranks]
+    if pcp_group_order is not None:
+        if (
+            len(pcp_group_order) != prefill_context_model_parallel_size
+            or sorted(pcp_group_order)
+            != list(range(prefill_context_model_parallel_size))
+        ):
+            raise ValueError(
+                "pcp_group_order must be a permutation of physical PCP ranks: "
+                f"order={pcp_group_order}, "
+                f"pcp_world_size={prefill_context_model_parallel_size}"
+            )
+        group_ranks = [
+            [ranks[physical_rank] for physical_rank in pcp_group_order]
+            for ranks in group_ranks
+        ]
     _PCP = init_model_parallel_group(
         group_ranks, get_world_group().local_rank, backend, group_name="pcp"
     )
@@ -1995,6 +2012,8 @@ def ensure_model_parallel_initialized(
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
+    *,
+    pcp_group_order: tuple[int, ...] | None = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -2012,6 +2031,7 @@ def ensure_model_parallel_initialized(
             prefill_context_model_parallel_size,
             decode_context_model_parallel_size,
             backend,
+            pcp_group_order=pcp_group_order,
         )
         return
 
