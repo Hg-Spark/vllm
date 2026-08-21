@@ -248,6 +248,7 @@ class PCPPagePullTransport:
 
         self._progress_stop = threading.Event()
         self._progress_wakeup = threading.Event()
+        self._progress_lock = threading.Lock()
         self._progress_thread: threading.Thread | None = None
         self._progress_error: BaseException | None = None
 
@@ -602,28 +603,29 @@ class PCPPagePullTransport:
         self._inflight[key] = _InflightRead(layer_id, source_rank, handle)
 
     def _progress_once(self) -> None:
-        if self._plan is None:
-            return
-        assert self._wrapper is not None
-        self._publish_completed_ready()
-        self._poll_ready_notifications()
-        while self._ready_waiting and len(self._inflight) < self.max_inflight_reads:
-            layer_id, source_rank = self._ready_waiting.popleft()
-            self._start_read(layer_id, source_rank)
+        with self._progress_lock:
+            if self._plan is None:
+                return
+            assert self._wrapper is not None
+            self._publish_completed_ready()
+            self._poll_ready_notifications()
+            while self._ready_waiting and len(self._inflight) < self.max_inflight_reads:
+                layer_id, source_rank = self._ready_waiting.popleft()
+                self._start_read(layer_id, source_rank)
 
-        for key, transfer in list(self._inflight.items()):
-            state = self._wrapper.check_xfer_state(transfer.handle)
-            if state == "PROC":
-                continue
-            self._wrapper.release_xfer_handle(transfer.handle)
-            del self._inflight[key]
-            if state != "DONE":
-                raise RuntimeError(
-                    "PCP page-pull NIXL READ failed: "
-                    f"state={state}, layer_id={transfer.layer_id}, "
-                    f"source_rank={transfer.source_rank}"
-                )
-            self._done_pairs.add(key)
+            for key, transfer in list(self._inflight.items()):
+                state = self._wrapper.check_xfer_state(transfer.handle)
+                if state == "PROC":
+                    continue
+                self._wrapper.release_xfer_handle(transfer.handle)
+                del self._inflight[key]
+                if state != "DONE":
+                    raise RuntimeError(
+                        "PCP page-pull NIXL READ failed: "
+                        f"state={state}, layer_id={transfer.layer_id}, "
+                        f"source_rank={transfer.source_rank}"
+                    )
+                self._done_pairs.add(key)
 
     def _progress_loop(self) -> None:
         try:
@@ -700,13 +702,14 @@ class PCPPagePullTransport:
                 time.sleep(self._POLL_INTERVAL_S)
 
         self._check_progress_error()
-        self._pending_ready.clear()
-        self._ready_waiting.clear()
-        self._inflight.clear()
-        self._done_pairs.clear()
         self._plan = None
-        self._step_finished = True
         self._progress_wakeup.set()
+        with self._progress_lock:
+            self._pending_ready.clear()
+            self._ready_waiting.clear()
+            self._inflight.clear()
+            self._done_pairs.clear()
+            self._step_finished = True
 
 
 __all__ = ["PCPPagePlan", "PCPPagePullTransport"]
