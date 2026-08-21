@@ -69,6 +69,8 @@ class PCPManager:
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
+        self._per_rank_num_tokens: tuple[int, ...] = ()
+        self._rank_token_offsets: tuple[int, ...] = ()
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
         max_num_local_reqs = 2 * max_num_reqs if max_num_reqs is not None else None
@@ -159,6 +161,13 @@ class PCPManager:
             )
         if vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs():
             raise NotImplementedError("MRV2 PCP supports PIECEWISE CUDA graphs only.")
+
+    def _compact_layout_enabled(self) -> bool:
+        """Whether rank-major gather slabs use actual variable widths."""
+        return False
+
+    def _get_batch_pcp_group(self):
+        return get_pcp_group()
 
     @staticmethod
     def _reorder_segments(
@@ -270,27 +279,30 @@ class PCPManager:
             segments_by_rank.append(segments)
             per_rank_num_tokens.append(num_rank_tokens)
 
-        # PCP=2 example:
-        #   global batch:       [A B C D E F G]
-        #   rank 0 / rank 1:    [A B G] / [C D E F]
-        #   padded gathered:    [A B G _ | C D E F]
-        #   hidden_restore_idx: [0, 1, 4, 5, 6, 7, 2]
-        #   padded_gather_idx:  [0, 1, 6, 0, 2, 3, 4, 5]
-        # Therefore global = gathered[hidden_restore_idx] and
-        # padded_gathered = global[padded_gather_idx].
+        compact = self._compact_layout_enabled()
         hidden_restore_idx = np.empty(int(query_start_loc_np[-1]), dtype=np.int64)
-        padded_num_tokens = max(per_rank_num_tokens)
-        num_expanded_tokens = padded_num_tokens * self.pcp_world_size
+        if compact:
+            offsets = [0]
+            for rows in per_rank_num_tokens:
+                offsets.append(offsets[-1] + rows)
+            num_expanded_tokens = offsets[-1]
+        else:
+            padded_num_tokens = max(per_rank_num_tokens)
+            offsets = [rank * padded_num_tokens for rank in range(self.pcp_world_size + 1)]
+            num_expanded_tokens = padded_num_tokens * self.pcp_world_size
+        self._per_rank_num_tokens = tuple(per_rank_num_tokens)
+        self._rank_token_offsets = tuple(offsets)
+
         padded_gather_idx = np.zeros(num_expanded_tokens, dtype=np.int64)
         gathered_kv_write_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
         for rank, segments in enumerate(segments_by_rank):
-            expanded_rank_offset = rank * padded_num_tokens
+            expanded_rank_offset = offsets[rank]
             for segment in segments:
-                padded_gathered_slice = slice(
+                gathered_slice = slice(
                     expanded_rank_offset + segment.rank_local_batch_slice.start,
                     expanded_rank_offset + segment.rank_local_batch_slice.stop,
                 )
-                padded_gather_idx[padded_gathered_slice] = np.arange(
+                padded_gather_idx[gathered_slice] = np.arange(
                     segment.global_batch_slice.start,
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
@@ -298,10 +310,10 @@ class PCPManager:
                 # Cache insertion pairs one slot entry with each rank's local decode.
                 if not bool(is_prefilling[segment.global_batch_req_idx]) and rank != 0:
                     continue
-                gathered_kv_write_mask[padded_gathered_slice] = True
+                gathered_kv_write_mask[gathered_slice] = True
                 hidden_restore_idx[segment.global_batch_slice] = np.arange(
-                    padded_gathered_slice.start,
-                    padded_gathered_slice.stop,
+                    gathered_slice.start,
+                    gathered_slice.stop,
                     dtype=np.int64,
                 )
 
@@ -384,7 +396,11 @@ class PCPManager:
         ]
 
         num_local_tokens = int(local_num_scheduled_tokens.sum())
-        num_local_tokens_padded = max(per_rank_num_tokens)
+        num_local_tokens_padded = (
+            num_local_tokens
+            if self._compact_layout_enabled()
+            else max(per_rank_num_tokens)
+        )
         fresh_prefills = int(
             np.count_nonzero(is_prefilling & (num_computed_tokens == 0))
         )
@@ -394,7 +410,7 @@ class PCPManager:
         logger.debug(
             "PCP batch: rank=%d global_batch_reqs=%d fresh_prefills=%d "
             "continued_prefills=%d decodes=%d local_reqs=%d "
-            "local_tokens=%d per_rank_tokens=%s",
+            "local_tokens=%d per_rank_tokens=%s compact=%s",
             self.pcp_rank,
             global_batch.num_reqs,
             fresh_prefills,
@@ -403,13 +419,14 @@ class PCPManager:
             num_local_reqs,
             num_local_tokens,
             per_rank_num_tokens,
+            self._compact_layout_enabled(),
         )
         if num_local_tokens_padded > input_buffers.max_num_tokens:
             raise RuntimeError(
                 "PCP local token count exceeds the MRV2 input buffer size: "
                 f"{num_local_tokens_padded} > {input_buffers.max_num_tokens}."
             )
-        rank_token_start = self.pcp_rank * num_local_tokens_padded
+        rank_token_start = self._rank_token_offsets[self.pcp_rank]
         assert self._padded_gather_idx is not None
         local_gather_idx = self._padded_gather_idx[
             rank_token_start : rank_token_start + num_local_tokens_padded
@@ -449,12 +466,8 @@ class PCPManager:
         is_padding[:num_local_tokens].fill_(False)
         is_padding[num_local_tokens:].fill_(True)
         if num_local_tokens_padded > num_local_tokens:
-            input_buffers.input_ids[:num_local_tokens_padded].masked_fill_(
-                is_padding, 0
-            )
-            input_buffers.positions[:num_local_tokens_padded].masked_fill_(
-                is_padding, 0
-            )
+            input_buffers.input_ids[:num_local_tokens_padded].masked_fill_(is_padding, 0)
+            input_buffers.positions[:num_local_tokens_padded].masked_fill_(is_padding, 0)
 
         total_num_logits = num_local_reqs if num_local_tokens > 0 else 0
         if total_num_logits > 0:
@@ -607,7 +620,17 @@ class PCPManager:
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._hidden_restore_idx is None:
             return hidden_states
-        gathered = get_pcp_group().all_gather(hidden_states, dim=0)
+        group = self._get_batch_pcp_group()
+        if self._compact_layout_enabled():
+            sizes = list(self._per_rank_num_tokens)
+            if len(set(sizes)) == 1:
+                gathered = group.all_gather(hidden_states.contiguous(), dim=0)
+            else:
+                gathered = group.all_gatherv(
+                    hidden_states.contiguous(), dim=0, sizes=sizes
+                )
+        else:
+            gathered = group.all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 
     def restore_for_sampling(
