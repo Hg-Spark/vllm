@@ -16,15 +16,12 @@ TransportPolicy = Literal[
 ]
 
 RUNAHEAD_CONFIG_KEY = "pcp_runahead"
-# Kept only as a stable import name for older experiment helpers. The parser no
-# longer consumes this top-level key; canonical weights live under partition.
-RUNAHEAD_WEIGHTS_KEY = "pcp_runahead_weights"
 RUNAHEAD_MIN_PREFILL_TOKENS = 1024
 
 
 @dataclass(frozen=True)
 class PCPRunaheadConfig:
-    """Only the axes that remain variable in runahead execution."""
+    """Runtime axes that remain variable in PCP runahead."""
 
     pcp_world_size: int
     transport: TransportPolicy
@@ -40,13 +37,8 @@ class PCPRunaheadConfig:
         return is_rank_permutation(self.segment_to_rank, self.pcp_world_size)
 
     @property
-    def process_group_order(self) -> tuple[int, ...]:
-        if self.mapping_is_permutation:
-            return self.segment_to_rank
-        return tuple(range(self.pcp_world_size))
-
-    @property
-    def runtime_segment_to_rank(self) -> tuple[int, ...]:
+    def logical_segment_to_rank(self) -> tuple[int, ...]:
+        """Ownership in the already-ordered primary PCP communicator."""
         if self.mapping_is_permutation:
             return tuple(range(self.pcp_world_size))
         return self.segment_to_rank
@@ -148,6 +140,10 @@ def parse_pcp_runahead_config(
 ) -> PCPRunaheadConfig | None:
     if not isinstance(additional_config, dict):
         return None
+    if "pcp_runahead_weights" in additional_config:
+        raise ValueError(
+            "pcp_runahead_weights was removed; use pcp_runahead.partition.weights"
+        )
     raw = additional_config.get(RUNAHEAD_CONFIG_KEY)
     if raw in (None, False):
         return None
@@ -228,3 +224,14 @@ def parse_pcp_runahead_config(
         max_inflight_reads=max_inflight_reads,
         nixl_backends=tuple(backends_raw),
     )
+
+
+def get_pcp_process_group_order(
+    additional_config: object,
+    pcp_world_size: int,
+) -> tuple[int, ...]:
+    """Return physical PCP members ordered by logical segment rank."""
+    config = parse_pcp_runahead_config(additional_config, pcp_world_size)
+    if config is None or not config.mapping_is_permutation:
+        return tuple(range(pcp_world_size))
+    return config.segment_to_rank
