@@ -93,9 +93,8 @@ class PCPPagePlan:
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Return local and remote descriptor IDs for one producer.
 
-        All PCP ranks derive the same global slot/block allocation. The manager
-        verifies that invariant before installing the plan, so source and
-        destination descriptor IDs are identical.
+        PCP ranks derive the same block allocation from their CPU block-table
+        mirrors, so source and destination descriptor IDs are identical.
         """
         block_ids: list[int] = []
         for segment_idx in self.required_segments(destination_rank):
@@ -158,7 +157,7 @@ class PCPPagePullTransport:
         self._memory_by_ptr: dict[int, _MemoryRegistration] = {}
         self._layer_names: tuple[str, ...] = ()
         self._layer_memory: list[_MemoryRegistration] = []
-        self._fallback_layer_cursor = 0
+        self._layer_id_by_ptr: dict[int, int] = {}
         self._remote_layer_handles: dict[tuple[int, int], int] = {}
         self._remote_num_blocks: dict[tuple[int, int], int] = {}
         self._metadata_exchanged = False
@@ -238,7 +237,6 @@ class PCPPagePullTransport:
         self._epoch = epoch
         self._plan = plan
         self._step_finished = False
-        self._fallback_layer_cursor = 0
         self._pending_ready.clear()
         self._ready_waiting.clear()
         self._inflight.clear()
@@ -251,7 +249,6 @@ class PCPPagePullTransport:
     def disable_step(self) -> None:
         self.finish_step()
         self._plan = None
-        self._fallback_layer_cursor = 0
 
     @staticmethod
     def _block_descriptors(
@@ -263,6 +260,23 @@ class PCPPagePullTransport:
         result[:, 1] = np.uint64(block_bytes)
         result[:, 2] = np.uint64(device_id)
         return result
+
+    @staticmethod
+    def _physical_page_geometry(kv_cache: torch.Tensor) -> tuple[int, int]:
+        if kv_cache.ndim < 2:
+            raise RuntimeError(
+                f"PCP page-pull expects block-major KV cache, got {kv_cache.shape}"
+            )
+        num_blocks = int(kv_cache.shape[0])
+        page_elements = math.prod(kv_cache.shape[1:])
+        # NHD and HND are different logical views of the same dense physical
+        # page. Inner logical contiguity is irrelevant for whole-page NIXL I/O.
+        if kv_cache.stride(0) != page_elements:
+            raise NotImplementedError(
+                "PCP page_pull requires dense block-major KV pages; "
+                f"shape={tuple(kv_cache.shape)}, stride={tuple(kv_cache.stride())}"
+            )
+        return num_blocks, int(page_elements * kv_cache.element_size())
 
     def _register_memory(self, kv_cache: torch.Tensor) -> _MemoryRegistration:
         self._ensure_wrapper()
@@ -276,18 +290,7 @@ class PCPPagePullTransport:
                 "PCP page-pull KV cache device changed unexpectedly: "
                 f"runtime={self.device}, cache={kv_cache.device}"
             )
-        if kv_cache.ndim < 2:
-            raise RuntimeError(
-                f"PCP page-pull expects block-major KV cache, got {kv_cache.shape}"
-            )
-        num_blocks = int(kv_cache.shape[0])
-        page_elements = math.prod(kv_cache.shape[1:])
-        if kv_cache.stride(0) != page_elements or not kv_cache[0].is_contiguous():
-            raise NotImplementedError(
-                "PCP page_pull requires contiguous block-major KV pages; "
-                f"shape={tuple(kv_cache.shape)}, stride={tuple(kv_cache.stride())}"
-            )
-        block_bytes = int(page_elements * kv_cache.element_size())
+        num_blocks, block_bytes = self._physical_page_geometry(kv_cache)
         if num_blocks <= 0 or block_bytes <= 0:
             raise RuntimeError("PCP page-pull cannot register an empty KV cache")
         device_id = max(kv_cache.get_device(), 0)
@@ -401,6 +404,10 @@ class PCPPagePullTransport:
         else:
             self._layer_names = layer_names
             self._layer_memory = registrations
+            self._layer_id_by_ptr = {
+                registration.base_addr: layer_id
+                for layer_id, registration in enumerate(registrations)
+            }
         self._exchange_layer_metadata()
         if self._plan is not None:
             self._start_progress_thread()
@@ -410,32 +417,15 @@ class PCPPagePullTransport:
             raise RuntimeError("page-pull layer registration requires an active step")
         if not self._layer_names:
             discovered = self._discover_bound_layer_caches()
-            if discovered:
-                self.register_layer_caches(discovered)
+            if not discovered:
+                raise RuntimeError("PCP page-pull requires stable bound layer KV caches")
+            self.register_layer_caches(discovered)
 
-        registration = self._register_memory(kv_cache)
-        matches = [
-            layer_id
-            for layer_id, expected in enumerate(self._layer_memory)
-            if expected.base_addr == registration.base_addr
-        ]
-        if len(matches) == 1:
-            layer_id = matches[0]
-        elif len(matches) > 1:
+        layer_id = self._layer_id_by_ptr.get(kv_cache.data_ptr())
+        if layer_id is None:
             raise RuntimeError(
-                f"PCP page-pull found ambiguous layer IDs for ptr={registration.base_addr}"
+                "PCP page-pull cache is not part of stable layer registration"
             )
-        else:
-            # Isolated-test fallback. Production discovers all layers above.
-            layer_id = self._fallback_layer_cursor
-            self._fallback_layer_cursor += 1
-            if layer_id == len(self._layer_memory):
-                self._layer_memory.append(registration)
-                self._metadata_exchanged = False
-                self._exchange_layer_metadata()
-            elif self._layer_memory[layer_id].base_addr != registration.base_addr:
-                raise RuntimeError("PCP page-pull layer cache address changed between calls")
-            self._start_progress_thread()
         self._check_progress_error()
         return layer_id
 
