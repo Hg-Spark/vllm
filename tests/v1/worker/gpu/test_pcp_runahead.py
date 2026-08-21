@@ -8,7 +8,9 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.v1.attention.ops.pcp_page_pull import PCPPagePlan
 from vllm.v1.attention.ops.pcp_runahead import PCPRunaheadRuntime
+from vllm.v1.attention.ops.pcp_standard import _write_local_kv_cache_for_page_pull
 from vllm.v1.worker.gpu.pcp_runahead_config import (
     PCPRunaheadConfig,
     parse_pcp_runahead_config,
@@ -56,9 +58,102 @@ def test_nested_config_parses_independent_experiment_axes() -> None:
     assert config.transport == "full_kv_collective"
     assert config.partition_policy == "weighted_contiguous"
     assert config.weights == (4.0, 2.5, 1.9, 1.6)
+    assert config.segment_to_rank == (0, 1, 2, 3)
     assert config.layout == "compact"
     assert config.min_tokens == 2048
     assert config.max_inflight_sends == 3
+
+
+def test_segments_compile_logical_to_physical_permutation() -> None:
+    config = parse_pcp_runahead_config(
+        {
+            "pcp_runahead": {
+                "transport": "direct_p2p",
+                "partition": {
+                    "policy": "weighted_contiguous",
+                    "segments": [
+                        {"weight": 3, "pcp_rank": 1},
+                        {"weight": 1, "pcp_rank": 0},
+                    ],
+                },
+                "layout": "compact",
+            }
+        },
+        2,
+    )
+    assert config is not None
+    assert config.weights == (3.0, 1.0)
+    assert config.segment_to_rank == (1, 0)
+
+
+def test_page_pull_accepts_repeated_rank_binding() -> None:
+    config = parse_pcp_runahead_config(
+        {
+            "pcp_runahead": {
+                "transport": "page_pull",
+                "partition": {
+                    "policy": "weighted_contiguous",
+                    "segments": [
+                        {"weight": 1, "pcp_rank": 1},
+                        {"weight": 1, "pcp_rank": 0},
+                        {"weight": 1, "pcp_rank": 1},
+                    ],
+                    "page_align": True,
+                },
+                "layout": "compact",
+                "runtime": {
+                    "max_inflight_reads": 2,
+                    "nixl_backends": ["UCX"],
+                },
+            }
+        },
+        2,
+    )
+    assert config is not None
+    assert config.segment_to_rank == (1, 0, 1)
+    assert config.weights == (1.0, 1.0, 1.0)
+    assert config.max_inflight_reads == 2
+
+
+def test_tensor_transport_rejects_repeated_rank_binding() -> None:
+    with pytest.raises(ValueError, match="repeated segment bindings"):
+        parse_pcp_runahead_config(
+            {
+                "pcp_runahead": {
+                    "transport": "direct_p2p",
+                    "partition": {
+                        "policy": "weighted_contiguous",
+                        "segments": [
+                            {"pcp_rank": 1},
+                            {"pcp_rank": 0},
+                            {"pcp_rank": 1},
+                        ],
+                    },
+                    "layout": "compact",
+                }
+            },
+            2,
+        )
+
+
+def test_segments_require_all_physical_ranks() -> None:
+    with pytest.raises(ValueError, match="cover every PCP rank"):
+        parse_pcp_runahead_config(
+            {
+                "pcp_runahead": {
+                    "transport": "page_pull",
+                    "partition": {
+                        "policy": "weighted_contiguous",
+                        "segments": [
+                            {"pcp_rank": 0},
+                            {"pcp_rank": 0},
+                        ],
+                    },
+                    "layout": "compact",
+                }
+            },
+            2,
+        )
 
 
 def test_legacy_config_is_rejected() -> None:
@@ -110,6 +205,58 @@ def test_runahead_partition_is_contiguous_and_complete() -> None:
         )
 
     assert actual == expected
+
+
+def test_permuted_rank_owns_logical_segment_not_physical_interval() -> None:
+    manager = _manager(2)
+    manager._config = replace(
+        manager._config,
+        partition_policy="weighted_contiguous",
+        weights=(3.0, 1.0),
+        segment_to_rank=(1, 0),
+    )
+    rank0 = manager._get_rank_segments(
+        0,
+        np.asarray([100], dtype=np.int32),
+        np.asarray([0], dtype=np.int32),
+        np.asarray([True]),
+        np.asarray([0, 100], dtype=np.int32),
+    )
+    rank1 = manager._get_rank_segments(
+        1,
+        np.asarray([100], dtype=np.int32),
+        np.asarray([0], dtype=np.int32),
+        np.asarray([True]),
+        np.asarray([0, 100], dtype=np.int32),
+    )
+    assert [(s.global_batch_slice.start, s.global_batch_slice.stop) for s in rank1] == [
+        (0, 75)
+    ]
+    assert [(s.global_batch_slice.start, s.global_batch_slice.stop) for s in rank0] == [
+        (75, 100)
+    ]
+
+
+def test_repeated_binding_builds_multiple_local_segments() -> None:
+    manager = _manager(2)
+    manager._config = replace(
+        manager._config,
+        transport="page_pull",
+        partition_policy="weighted_contiguous",
+        weights=(1.0, 1.0, 1.0),
+        segment_to_rank=(1, 0, 1),
+    )
+    rank1 = manager._get_rank_segments(
+        1,
+        np.asarray([12], dtype=np.int32),
+        np.asarray([0], dtype=np.int32),
+        np.asarray([True]),
+        np.asarray([0, 12], dtype=np.int32),
+    )
+    assert [(s.global_batch_slice.start, s.global_batch_slice.stop) for s in rank1] == [
+        (0, 4),
+        (8, 12),
+    ]
 
 
 def test_manual_weights_parse_and_validate() -> None:
@@ -212,6 +359,78 @@ def test_variable_width_runtime_builds_offsets() -> None:
     assert runtime.local_rows == 2
     assert runtime.prefix_rows == 7
     assert runtime.visible_rows == 9
+
+
+def test_runtime_follows_logical_peer_order_for_permutation() -> None:
+    mapping = (2, 0, 3, 1)
+    rows = (3, 1, 4, 2)
+    runtimes = []
+    for rank in range(4):
+        runtime = PCPRunaheadRuntime(
+            pcp_world_size=4,
+            pcp_rank=rank,
+            device=torch.device("cpu"),
+        )
+        runtime.begin_step(rows, segment_to_rank=mapping)
+        runtimes.append(runtime)
+
+    # Logical chain is physical rank 2 -> 0 -> 3 -> 1.
+    assert runtimes[2].prev_rank is None
+    assert runtimes[2].next_rank == 0
+    assert runtimes[0].prev_rank == 2
+    assert runtimes[0].next_rank == 3
+    assert runtimes[3].prev_rank == 0
+    assert runtimes[3].next_rank == 1
+    assert runtimes[1].prev_rank == 3
+    assert runtimes[1].next_rank is None
+
+
+def test_page_pull_runtime_accepts_repeated_mapping_with_segment_rows() -> None:
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=2,
+        pcp_rank=1,
+        device=torch.device("cpu"),
+    )
+    runtime.begin_step(
+        (4, 8),
+        transport="page_pull",
+        segment_to_rank=(1, 0, 1),
+        segment_rows=(4, 4, 4),
+    )
+    assert runtime.owned_segments == (0, 2)
+    assert runtime.local_rows == 8
+    assert runtime.visible_rows == 12
+
+
+def test_page_plan_short_circuits_locally_owned_earlier_segment() -> None:
+    plan = PCPPagePlan(
+        segment_to_rank=(1, 0, 1),
+        source_blocks_by_segment=((10, 11), (20, 21), (30,)),
+        destination_blocks_by_segment=((100, 101), (110, 111), (120,)),
+        block_size=16,
+    )
+    # rank1 owns segment0 and segment2. For its latest query (segment2), only
+    # segment1 is remote; segment0 is already local and must not be transferred.
+    assert plan.required_segments(1) == (1,)
+    assert plan.required_source_ranks(1) == (0,)
+    assert plan.transfer_block_ids(1, 0) == ((110, 111), (20, 21))
+    assert plan.consumer_ranks(0) == (1,)
+
+
+def test_page_pull_local_cache_write_uses_physical_slots() -> None:
+    # [blocks, heads, block_size, 2*head_size]
+    cache = torch.zeros((3, 1, 4, 4), dtype=torch.float32)
+    key = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
+    value = torch.tensor([[[5.0, 6.0]], [[7.0, 8.0]]])
+    slots = torch.tensor([1, 9], dtype=torch.long)
+
+    _write_local_kv_cache_for_page_pull(key, value, slots, cache)
+
+    key_cache, value_cache = cache.transpose(1, 2).split(2, dim=-1)
+    assert key_cache[0, 1, 0].tolist() == [1.0, 2.0]
+    assert value_cache[0, 1, 0].tolist() == [5.0, 6.0]
+    assert key_cache[2, 1, 0].tolist() == [3.0, 4.0]
+    assert value_cache[2, 1, 0].tolist() == [7.0, 8.0]
 
 
 @pytest.mark.parametrize(
