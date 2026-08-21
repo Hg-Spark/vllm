@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from vllm.model_executor.layers.attention.kv_transfer_utils import maybe_transfer_kv_layer
+from vllm.v1.attention.ops.pcp_runahead import PCPRunaheadRuntime
 from vllm.v1.attention.ops.pcp_standard import prepare_standard_pcp_kv_cache_inputs
 
 
@@ -24,7 +25,7 @@ def test_standard_runahead_preserves_gqa_kv_head_shape() -> None:
     kv_cache = _flash_kv_cache()
     runtime = MagicMock()
     runtime.transport = "prefix_p2p"
-    runtime.exchange_prefix.return_value = ((key, value), slot_mapping)
+    runtime.exchange_cache_inputs.return_value = ((key, value), slot_mapping)
 
     with patch(
         "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
@@ -34,7 +35,7 @@ def test_standard_runahead_preserves_gqa_kv_head_shape() -> None:
             key, value, slot_mapping, kv_cache
         )
 
-    runtime.exchange_prefix.assert_called_once()
+    runtime.exchange_cache_inputs.assert_called_once_with((key, value), slot_mapping)
     assert out_key is key
     assert out_value is value
     assert out_slots is slot_mapping
@@ -131,16 +132,19 @@ def test_standard_compact_full_kv_collective_uses_allgatherv_for_variable_width(
     value = torch.randn(2, 2, 8)
     slots = torch.arange(5, dtype=torch.int64)
     kv_cache = _flash_kv_cache()
-    runtime = MagicMock()
-    runtime.transport = "full_kv_collective"
-    runtime.local_rows = 2
-    runtime.total_rows = 5
-    runtime.rows_per_rank = (2, 3)
     group = MagicMock()
-    runtime._group.return_value = group
+    group.world_size = 2
+    group.rank_in_group = 0
     gathered_key = torch.randn(5, 2, 8)
     gathered_value = torch.randn(5, 2, 8)
     group.all_gatherv.return_value = [gathered_key, gathered_value]
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        pcp_group=group,
+    )
+    runtime.begin_step((2, 3), transport="full_kv_collective")
 
     with patch(
         "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
@@ -162,16 +166,19 @@ def test_standard_compact_full_kv_collective_keeps_equal_width_allgather_fast_pa
     value = torch.randn(2, 2, 8)
     slots = torch.arange(4, dtype=torch.int64)
     kv_cache = _flash_kv_cache()
-    runtime = MagicMock()
-    runtime.transport = "full_kv_collective"
-    runtime.local_rows = 2
-    runtime.total_rows = 4
-    runtime.rows_per_rank = (2, 2)
     group = MagicMock()
-    runtime._group.return_value = group
+    group.world_size = 2
+    group.rank_in_group = 0
     gathered_key = torch.randn(4, 2, 8)
     gathered_value = torch.randn(4, 2, 8)
     group.all_gather.side_effect = [gathered_key, gathered_value]
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        pcp_group=group,
+    )
+    runtime.begin_step((2, 2), transport="full_kv_collective")
 
     with patch(
         "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
