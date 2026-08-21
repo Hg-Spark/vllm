@@ -46,31 +46,10 @@ def prepare_standard_pcp_kv_cache_inputs(
             return key, value, local_slot_mapping
 
         if runtime.transport == "full_kv_collective":
-            if key.shape[0] != runtime.local_rows or value.shape[0] != runtime.local_rows:
-                raise RuntimeError(
-                    "PCP compact full-KV collective expects configured local rows: "
-                    f"key={key.shape[0]}, value={value.shape[0]}, "
-                    f"expected={runtime.local_rows}"
-                )
-            if slot_mapping.shape[0] < runtime.total_rows:
-                raise RuntimeError(
-                    "PCP compact slot mapping is shorter than full gathered rows: "
-                    f"slots={slot_mapping.shape[0]}, rows={runtime.total_rows}"
-                )
-            group = runtime._group()
-            sizes = list(runtime.rows_per_rank)
-            if len(set(sizes)) == 1:
-                with pcp_nvtx_range("pcp.full_kv_allgather"):
-                    key = group.all_gather(key.contiguous(), dim=0)
-                    value = group.all_gather(value.contiguous(), dim=0)
-            else:
-                with pcp_nvtx_range("pcp.full_kv_allgatherv"):
-                    key, value = group.all_gatherv(
-                        [key.contiguous(), value.contiguous()],
-                        dim=0,
-                        sizes=sizes,
-                    )
-            return key, value, slot_mapping[: runtime.total_rows]
+            (key, value), slot_mapping = runtime.exchange_full(
+                (key, value), slot_mapping
+            )
+            return key, value, slot_mapping
 
         raise RuntimeError(f"unsupported active PCP transport: {runtime.transport!r}")
 
