@@ -62,6 +62,55 @@ def test_exchange_prefix_uses_variable_rank_offsets() -> None:
     assert visible_slots.tolist() == list(range(9))
 
 
+def test_exchange_direct_keeps_p2p_fanout_with_variable_widths() -> None:
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=4,
+        pcp_rank=2,
+        device=torch.device("cpu"),
+    )
+    runtime.begin_step((4, 3, 2, 1))
+    runtime.transport = "direct_p2p"
+    group = _group(2)
+    recv0 = MagicMock()
+    recv1 = MagicMock()
+    send = MagicMock()
+    send.is_completed.return_value = False
+
+    def p2p_side_effect(tensors, *, peer: int, recv: bool):
+        if recv:
+            assert peer in (0, 1)
+            expected = 4 if peer == 0 else 3
+            assert [tensor.shape[0] for tensor in tensors] == [expected]
+            tensors[0].fill_(10 + peer)
+            return [recv0 if peer == 0 else recv1]
+        assert peer == 3
+        assert [tensor.shape[0] for tensor in tensors] == [2]
+        return [send]
+
+    with (
+        patch(
+            "vllm.v1.attention.ops.pcp_runahead.get_pcp_group",
+            return_value=group,
+        ),
+        patch.object(runtime, "_p2p", side_effect=p2p_side_effect) as p2p,
+    ):
+        visible, slots = runtime.exchange_direct(
+            (torch.ones(2, 3),),
+            torch.arange(10),
+        )
+        runtime.flush()
+
+    assert p2p.call_count == 3
+    recv0.wait.assert_called_once_with()
+    recv1.wait.assert_called_once_with()
+    send.wait.assert_called_once_with()
+    assert visible[0].shape[0] == 9
+    assert torch.all(visible[0][:4] == 10)
+    assert torch.all(visible[0][4:7] == 11)
+    assert torch.all(visible[0][7:9] == 1)
+    assert slots.tolist() == list(range(9))
+
+
 def test_flush_only_waits_outstanding_prefix_sends() -> None:
     runtime = PCPRunaheadRuntime(
         pcp_world_size=4,
