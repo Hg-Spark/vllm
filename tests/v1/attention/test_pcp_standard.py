@@ -126,21 +126,19 @@ def test_page_pull_skips_post_write_when_native_update_is_skipped() -> None:
     runtime.page_pull_after_cache_write.assert_not_called()
 
 
-def test_standard_compact_full_kv_collective_uses_allgatherv_for_variable_width() -> None:
+def test_standard_compact_full_kv_collective_uses_runtime_exchange() -> None:
     key = torch.randn(2, 2, 8)
     value = torch.randn(2, 2, 8)
     slots = torch.arange(5, dtype=torch.int64)
     kv_cache = _flash_kv_cache()
     runtime = MagicMock()
     runtime.transport = "full_kv_collective"
-    runtime.local_rows = 2
-    runtime.total_rows = 5
-    runtime.rows_per_rank = (2, 3)
-    group = MagicMock()
-    runtime._group.return_value = group
     gathered_key = torch.randn(5, 2, 8)
     gathered_value = torch.randn(5, 2, 8)
-    group.all_gatherv.return_value = [gathered_key, gathered_value]
+    runtime.exchange_full.return_value = (
+        (gathered_key, gathered_value),
+        slots,
+    )
 
     with patch(
         "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
@@ -150,41 +148,10 @@ def test_standard_compact_full_kv_collective_uses_allgatherv_for_variable_width(
             key, value, slots, kv_cache
         )
 
-    group.all_gatherv.assert_called_once()
-    group.all_gather.assert_not_called()
+    runtime.exchange_full.assert_called_once_with((key, value), slots)
     assert out_key is gathered_key
     assert out_value is gathered_value
-    assert out_slots.tolist() == list(range(5))
-
-
-def test_standard_compact_full_kv_collective_keeps_equal_width_allgather_fast_path() -> None:
-    key = torch.randn(2, 2, 8)
-    value = torch.randn(2, 2, 8)
-    slots = torch.arange(4, dtype=torch.int64)
-    kv_cache = _flash_kv_cache()
-    runtime = MagicMock()
-    runtime.transport = "full_kv_collective"
-    runtime.local_rows = 2
-    runtime.total_rows = 4
-    runtime.rows_per_rank = (2, 2)
-    group = MagicMock()
-    runtime._group.return_value = group
-    gathered_key = torch.randn(4, 2, 8)
-    gathered_value = torch.randn(4, 2, 8)
-    group.all_gather.side_effect = [gathered_key, gathered_value]
-
-    with patch(
-        "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
-        return_value=runtime,
-    ):
-        out_key, out_value, _ = prepare_standard_pcp_kv_cache_inputs(
-            key, value, slots, kv_cache
-        )
-
-    assert group.all_gather.call_count == 2
-    group.all_gatherv.assert_not_called()
-    assert out_key is gathered_key
-    assert out_value is gathered_value
+    assert out_slots is slots
 
 
 def test_standard_fallback_reuses_baseline_allgather() -> None:
