@@ -3,17 +3,21 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
 
-from vllm.v1.attention.ops.pcp_page_pull import PCPPagePlan
+from vllm.v1.attention.ops.pcp_page_pull import (
+    PCPPagePlan,
+    PCPPagePullTransport,
+)
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_name
 from vllm.v1.attention.ops.pcp_runahead import PCPRunaheadRuntime
 from vllm.v1.worker.gpu.pcp_runahead_config import (
     PCPRunaheadConfig,
+    get_pcp_process_group_order,
     parse_pcp_runahead_config,
 )
 from vllm.v1.worker.gpu.pcp_runahead_manager import (
@@ -28,8 +32,6 @@ def _manager(world_size: int) -> RunaheadPCPManager:
     manager = object.__new__(RunaheadPCPManager)
     manager.pcp_world_size = world_size
     manager.pcp_rank = 0
-    manager._physical_pcp_rank = 0
-    manager._logical_pcp_rank = 0
     manager._standard_attention_pcp = True
     manager._use_custom_partition = True
     manager._use_compact_layout = True
@@ -75,57 +77,54 @@ def test_config_parses_only_runtime_axes() -> None:
     assert config.transport == "full_kv_collective"
     assert config.weights == (4.0, 2.5, 1.9, 1.6)
     assert config.segment_to_rank == (0, 1, 2, 3)
-    assert config.runtime_segment_to_rank == (0, 1, 2, 3)
+    assert config.logical_segment_to_rank == (0, 1, 2, 3)
     assert config.min_tokens == 2048
     assert config.max_inflight_sends == 3
 
 
 def test_permutation_is_compiled_into_process_group_order() -> None:
-    config = parse_pcp_runahead_config(
-        {
-            "pcp_runahead": {
-                "transport": "direct_p2p",
-                "partition": {
-                    "segments": [
-                        {"weight": 3, "pcp_rank": 1},
-                        {"weight": 1, "pcp_rank": 0},
-                    ]
-                },
-            }
-        },
-        2,
-    )
+    raw = {
+        "pcp_runahead": {
+            "transport": "direct_p2p",
+            "partition": {
+                "segments": [
+                    {"weight": 3, "pcp_rank": 1},
+                    {"weight": 1, "pcp_rank": 0},
+                ]
+            },
+        }
+    }
+    config = parse_pcp_runahead_config(raw, 2)
     assert config is not None
     assert config.weights == (3.0, 1.0)
     assert config.segment_to_rank == (1, 0)
-    assert config.process_group_order == (1, 0)
-    assert config.runtime_segment_to_rank == (0, 1)
+    assert get_pcp_process_group_order(raw, 2) == (1, 0)
+    assert config.logical_segment_to_rank == (0, 1)
 
 
 def test_page_pull_keeps_repeated_rank_binding_in_plan_space() -> None:
-    config = parse_pcp_runahead_config(
-        {
-            "pcp_runahead": {
-                "transport": "page_pull",
-                "partition": {
-                    "segments": [
-                        {"pcp_rank": 1},
-                        {"pcp_rank": 0},
-                        {"pcp_rank": 1},
-                    ]
-                },
-                "runtime": {
-                    "max_inflight_reads": 2,
-                    "nixl_backends": ["UCX"],
-                },
-            }
-        },
-        2,
-    )
+    raw = {
+        "pcp_runahead": {
+            "transport": "page_pull",
+            "partition": {
+                "segments": [
+                    {"pcp_rank": 1},
+                    {"pcp_rank": 0},
+                    {"pcp_rank": 1},
+                ]
+            },
+            "runtime": {
+                "max_inflight_reads": 2,
+                "nixl_backends": ["UCX"],
+            },
+        }
+    }
+    config = parse_pcp_runahead_config(raw, 2)
     assert config is not None
     assert not config.mapping_is_permutation
     assert config.segment_to_rank == (1, 0, 1)
-    assert config.runtime_segment_to_rank == (1, 0, 1)
+    assert config.logical_segment_to_rank == (1, 0, 1)
+    assert get_pcp_process_group_order(raw, 2) == (0, 1)
     assert config.max_inflight_reads == 2
 
 
@@ -180,6 +179,26 @@ def test_obsolete_experiment_axes_are_rejected(config: dict, match: str) -> None
         parse_pcp_runahead_config({"pcp_runahead": config}, 4)
 
 
+def test_legacy_top_level_weights_are_rejected() -> None:
+    with pytest.raises(ValueError, match="was removed"):
+        parse_pcp_runahead_config(
+            {
+                "pcp_runahead_weights": [1, 1],
+                "pcp_runahead": {"transport": "prefix_p2p"},
+            },
+            2,
+        )
+
+
+def test_page_pull_accepts_dense_nhd_physical_pages() -> None:
+    physical = torch.empty((8, 16, 2, 32))
+    logical_nhd = physical.permute(0, 2, 1, 3)
+    assert not logical_nhd[0].is_contiguous()
+    num_blocks, block_bytes = PCPPagePullTransport._physical_page_geometry(logical_nhd)
+    assert num_blocks == 8
+    assert block_bytes == 16 * 2 * 32 * logical_nhd.element_size()
+
+
 def test_boolean_config_is_rejected() -> None:
     with pytest.raises(ValueError, match="non-empty JSON object"):
         parse_pcp_runahead_config({"pcp_runahead": True}, 4)
@@ -188,12 +207,17 @@ def test_boolean_config_is_rejected() -> None:
 def test_segment_layout_is_compiled_once_for_all_ranks() -> None:
     manager = _manager(4)
     layout = manager._compile_segment_layout(_batch([10]))
+    assert layout is not None
     assert layout.rows_per_rank == (3, 3, 2, 2)
     assert [
         (segments[0].global_batch_slice.start, segments[0].global_batch_slice.stop)
         for segments in layout.segments_by_rank
     ] == [(0, 3), (3, 6), (6, 8), (8, 10)]
-    assert sum(layout.rows_per_segment) == 10
+    assert sum(
+        piece.end_pos - piece.start_pos
+        for pieces in layout.logical_segments
+        for piece in pieces
+    ) == 10
 
 
 def test_permutation_layout_uses_logical_group_rank() -> None:
@@ -204,8 +228,7 @@ def test_permutation_layout_uses_logical_group_rank() -> None:
         segment_to_rank=(1, 0),
     )
     layout = manager._compile_segment_layout(_batch([100]))
-    # Once the communicator is ordered [physical1, physical0], logical rank 0
-    # owns the first weighted interval and no runtime reorder is required.
+    assert layout is not None
     rank0 = layout.segments_by_rank[0]
     rank1 = layout.segments_by_rank[1]
     assert [(s.global_batch_slice.start, s.global_batch_slice.stop) for s in rank0] == [
@@ -225,6 +248,7 @@ def test_repeated_binding_builds_multiple_local_segments() -> None:
         segment_to_rank=(1, 0, 1),
     )
     layout = manager._compile_segment_layout(_batch([12]))
+    assert layout is not None
     rank1 = layout.segments_by_rank[1]
     assert [(s.global_batch_slice.start, s.global_batch_slice.stop) for s in rank1] == [
         (0, 4),
@@ -319,11 +343,12 @@ def test_compact_restore_uses_allgatherv_only_for_variable_width() -> None:
     manager = _manager(4)
     manager._hidden_restore_idx = torch.tensor([0, 1, 2, 3], dtype=torch.long)
     manager._per_rank_num_tokens = (2, 1, 1, 1)
-    manager._pcp_group = MagicMock()
-    manager._pcp_group.all_gatherv.return_value = torch.arange(5).view(5, 1)
-    restored = manager.restore_hidden_states(torch.arange(2).view(2, 1))
-    manager._pcp_group.all_gatherv.assert_called_once()
-    manager._pcp_group.all_gather.assert_not_called()
+    group = MagicMock()
+    group.all_gatherv.return_value = torch.arange(5).view(5, 1)
+    with patch("vllm.v1.worker.gpu.pcp_manager.get_pcp_group", return_value=group):
+        restored = manager.restore_hidden_states(torch.arange(2).view(2, 1))
+    group.all_gatherv.assert_called_once()
+    group.all_gather.assert_not_called()
     assert restored[:, 0].tolist() == [0, 1, 2, 3]
 
 
