@@ -5,7 +5,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from vllm.v1.attention.ops.pcp_standard import prepare_standard_pcp_kv_cache_inputs
+from vllm.v1.attention.ops.pcp_standard import (
+    finish_standard_pcp_kv_cache_update,
+    prepare_standard_pcp_kv_cache_inputs,
+)
 
 
 def _flash_kv_cache(
@@ -64,6 +67,18 @@ def test_page_pull_prepare_does_not_duplicate_native_cache_write() -> None:
     assert out_value is value
     assert out_slots.tolist() == [0, 1]
     assert torch.count_nonzero(kv_cache) == 0
+
+
+def test_page_pull_finish_runs_after_native_cache_write() -> None:
+    kv_cache = _flash_kv_cache()
+    runtime = MagicMock()
+    runtime.transport = "page_pull"
+    with patch(
+        "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
+        return_value=runtime,
+    ):
+        finish_standard_pcp_kv_cache_update(kv_cache)
+    runtime.page_pull_after_cache_write.assert_called_once_with(kv_cache)
 
 
 def test_standard_compact_full_kv_collective_uses_allgatherv_for_variable_width() -> None:
