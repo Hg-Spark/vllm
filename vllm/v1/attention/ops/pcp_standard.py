@@ -4,48 +4,11 @@
 
 from __future__ import annotations
 
-from functools import wraps
-
 import torch
 
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 from vllm.v1.attention.ops.pcp_runahead import get_pcp_runahead_runtime
-
-_PAGE_PULL_CACHE_HOOK_INSTALLED = False
-
-
-def install_page_pull_cache_update_hook() -> None:
-    """Publish page READY only after FlashAttention's native cache write.
-
-    This is deliberately isolated here rather than duplicating
-    ``reshape_and_cache_flash``. The wrapper can be replaced by a native backend
-    post-cache-write hook if one is added to the common AttentionBackend API.
-    """
-    global _PAGE_PULL_CACHE_HOOK_INSTALLED
-    if _PAGE_PULL_CACHE_HOOK_INSTALLED:
-        return
-
-    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
-
-    original = FlashAttentionImpl.do_kv_cache_update
-
-    @wraps(original)
-    def pcp_cache_update(
-        self,
-        layer: torch.nn.Module,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        original(self, layer, key, value, kv_cache, slot_mapping)
-        runtime = get_pcp_runahead_runtime()
-        if runtime is not None and runtime.transport == "page_pull":
-            runtime.page_pull_after_cache_write(kv_cache)
-
-    FlashAttentionImpl.do_kv_cache_update = pcp_cache_update
-    _PAGE_PULL_CACHE_HOOK_INSTALLED = True
 
 
 def prepare_standard_pcp_kv_cache_inputs(
@@ -80,9 +43,6 @@ def prepare_standard_pcp_kv_cache_inputs(
                 )
             local_slot_mapping = runtime.rank_local_slot_mapping(slot_mapping)
             runtime.page_pull_prepare_layer(kv_cache)
-            # FlashAttention performs the one and only local cache write after
-            # this function returns. The installed post-write hook publishes
-            # READY and waits for this layer's required remote pages.
             return key, value, local_slot_mapping
 
         if runtime.transport == "full_kv_collective":
@@ -127,8 +87,8 @@ def prepare_standard_pcp_kv_cache_inputs(
     local_rows = slot_mapping.shape[0] // pcp_size
     if key.shape[0] < local_rows or value.shape[0] < local_rows:
         raise RuntimeError(
-            "PCP standard-attention K/V rows are smaller than the rank-local "
-            f"slab: key={key.shape[0]}, value={value.shape[0]}, rows={local_rows}"
+            "PCP standard-attention K/V rows are smaller than the rank-local slab: "
+            f"key={key.shape[0]}, value={value.shape[0]}, rows={local_rows}"
         )
 
     with pcp_nvtx_range("pcp.baseline_kv_allgather"):
@@ -137,7 +97,14 @@ def prepare_standard_pcp_kv_cache_inputs(
     return key, value, slot_mapping
 
 
+def finish_standard_pcp_kv_cache_update(kv_cache: torch.Tensor) -> None:
+    """Publish page-pull READY after FlashAttention's native cache write."""
+    runtime = get_pcp_runahead_runtime()
+    if runtime is not None and runtime.transport == "page_pull":
+        runtime.page_pull_after_cache_write(kv_cache)
+
+
 __all__ = [
-    "install_page_pull_cache_update_hook",
+    "finish_standard_pcp_kv_cache_update",
     "prepare_standard_pcp_kv_cache_inputs",
 ]
