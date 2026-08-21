@@ -15,7 +15,7 @@ def ensure_model_parallel_initialized(
 ) -> None:
     """Initialize model-parallel groups with runahead PCP ordering at startup."""
     from vllm.config import get_current_vllm_config_or_none
-    from vllm.v1.worker.gpu.pcp_runahead_config import parse_pcp_runahead_config
+    from vllm.config.pcp_runahead import parse_pcp_runahead_config
 
     from . import parallel_state as ps
 
@@ -52,8 +52,8 @@ def ensure_model_parallel_initialized(
         and (decode_context_model_parallel_size or 1) == 1
     )
     order = (
-        runahead.segment_to_rank
-        if supported_layout and runahead.mapping_is_permutation
+        runahead.pcp_group_order
+        if supported_layout
         else tuple(range(prefill_context_model_parallel_size))
     )
     if order == tuple(range(prefill_context_model_parallel_size)):

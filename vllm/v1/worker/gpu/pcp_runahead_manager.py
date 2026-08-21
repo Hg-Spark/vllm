@@ -11,6 +11,12 @@ import numpy as np
 import torch
 
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.config.pcp_runahead import (
+    RUNAHEAD_MIN_PREFILL_TOKENS,
+    TransportPolicy,
+    parse_pcp_runahead_config,
+    parse_runahead_weights,
+)
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.ops.pcp_page_pull import PCPPagePlan
@@ -22,11 +28,6 @@ from vllm.v1.attention.ops.pcp_runahead import (
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
-from vllm.v1.worker.gpu.pcp_runahead_config import (
-    RUNAHEAD_MIN_PREFILL_TOKENS,
-    parse_pcp_runahead_config,
-    parse_runahead_weights,
-)
 from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
@@ -37,7 +38,7 @@ class LogicalSegment:
     global_batch_req_idx: int
     start_pos: int
     end_pos: int
-    owner_rank: int
+    owner_group_rank: int
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,14 @@ class SegmentLayout:
     segments_by_rank: tuple[tuple[RankSegment, ...], ...]
     rows_per_rank: tuple[int, ...]
     logical_segments: tuple[tuple[LogicalSegment, ...], ...]
+
+
+@dataclass(frozen=True)
+class RunaheadStep:
+    """All per-step runahead state consumed by batch and KV paths."""
+
+    layout: SegmentLayout
+    transport: TransportPolicy
 
 
 def weighted_partition_lengths(
@@ -164,10 +173,7 @@ class RunaheadPCPManager(PCPManager):
             cp_interleave=cp_interleave,
         )
         self._standard_attention_pcp = False
-        self._use_custom_partition = False
-        self._use_compact_layout = False
-        self._active_layout: SegmentLayout | None = None
-        self._step_transport: str | None = None
+        self._active_step: RunaheadStep | None = None
         self._page_alignment = (
             math.lcm(*block_tables.kernel_block_sizes)
             if config.transport == "page_pull"
@@ -204,7 +210,7 @@ class RunaheadPCPManager(PCPManager):
         )
 
     def _compact_layout_enabled(self) -> bool:
-        return self._use_compact_layout
+        return self._active_step is not None
 
     def _resize_local_request_buffers_if_needed(
         self,
@@ -214,7 +220,7 @@ class RunaheadPCPManager(PCPManager):
         block_tables: BlockTables | None,
         device: torch.device,
     ) -> None:
-        mapping = self._config.logical_segment_to_rank
+        mapping = self._config.segment_to_group_rank
         max_segments_per_rank = max(
             mapping.count(rank) for rank in range(self.pcp_world_size)
         )
@@ -298,7 +304,7 @@ class RunaheadPCPManager(PCPManager):
         )
 
     def _compile_segment_layout(self, input_batch: InputBatch) -> SegmentLayout | None:
-        mapping = self._config.logical_segment_to_rank
+        mapping = self._config.segment_to_group_rank
         num_segments = len(mapping)
         segments_by_rank: list[list[RankSegment]] = [
             [] for _ in range(self.pcp_world_size)
@@ -322,13 +328,13 @@ class RunaheadPCPManager(PCPManager):
             for segment_idx, length in enumerate(lengths):
                 next_offset = offset + length
                 end_pos = absolute + length
-                owner = mapping[segment_idx]
+                owner_group_rank = mapping[segment_idx]
                 if length > 0:
                     global_slice = slice(
                         global_start + offset, global_start + next_offset
                     )
-                    local_start = rank_rows[owner]
-                    segments_by_rank[owner].append(
+                    local_start = rank_rows[owner_group_rank]
+                    segments_by_rank[owner_group_rank].append(
                         RankSegment(
                             global_batch_req_idx=req_idx,
                             global_batch_slice=global_slice,
@@ -342,10 +348,10 @@ class RunaheadPCPManager(PCPManager):
                             global_batch_req_idx=req_idx,
                             start_pos=absolute,
                             end_pos=end_pos,
-                            owner_rank=owner,
+                            owner_group_rank=owner_group_rank,
                         )
                     )
-                    rank_rows[owner] += length
+                    rank_rows[owner_group_rank] += length
                 if (
                     segment_idx + 1 < num_segments
                     and self._page_alignment > 1
@@ -369,8 +375,9 @@ class RunaheadPCPManager(PCPManager):
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
     ) -> list[RankSegment]:
-        if self._use_custom_partition and self._active_layout is not None:
-            return list(self._active_layout.segments_by_rank[rank])
+        step = self._active_step
+        if step is not None:
+            return list(step.layout.segments_by_rank[rank])
         return super()._get_rank_segments(
             rank,
             num_scheduled_tokens,
@@ -410,30 +417,29 @@ class RunaheadPCPManager(PCPManager):
             eligible = False
             layout = None
 
-        self._use_custom_partition = eligible
-        self._active_layout = layout
-        self._use_compact_layout = eligible
-        self._step_transport = self._config.transport if eligible else None
-
+        self._active_step = (
+            RunaheadStep(layout=layout, transport=self._config.transport)
+            if eligible and layout is not None
+            else None
+        )
         local_batch = super().partition_batch(input_batch)
-        if not eligible or layout is None:
+        step = self._active_step
+        if step is None:
             self._runahead_runtime.disable_step()
             return local_batch
 
         self._runahead_runtime.begin_step(
-            layout.rows_per_rank,
-            transport=self._config.transport,
+            step.layout.rows_per_rank,
+            transport=step.transport,
         )
         return local_batch
 
     def _configure_page_pull_plan(self) -> None:
-        if self._config.transport != "page_pull":
-            return
-        layout = self._active_layout
+        step = self._active_step
         global_batch = self._global_batch
         block_tables = self._block_tables
-        if layout is None or global_batch is None:
-            raise RuntimeError("PCP page_pull has no active segment layout")
+        if step is None or step.transport != "page_pull" or global_batch is None:
+            raise RuntimeError("PCP page_pull has no active page-pull step")
         if block_tables is None:
             raise RuntimeError("PCP page_pull requires block tables")
         if block_tables.num_kv_cache_groups != 1:
@@ -441,7 +447,7 @@ class RunaheadPCPManager(PCPManager):
 
         block_size = int(block_tables.kernel_block_sizes[0])
         blocks_by_segment: list[tuple[int, ...]] = []
-        for pieces in layout.logical_segments:
+        for pieces in step.layout.logical_segments:
             blocks: list[int] = []
             for piece in pieces:
                 req_state_idx = int(
@@ -458,7 +464,7 @@ class RunaheadPCPManager(PCPManager):
 
         self._runahead_runtime.configure_page_plan(
             PCPPagePlan(
-                segment_to_rank=self._config.logical_segment_to_rank,
+                segment_to_rank=self._config.segment_to_group_rank,
                 blocks_by_segment=tuple(blocks_by_segment),
                 block_size=block_size,
             )
@@ -466,7 +472,8 @@ class RunaheadPCPManager(PCPManager):
 
     def prepare_slot_mappings(self) -> torch.Tensor:
         slot_mappings = super().prepare_slot_mappings()
-        if self._use_compact_layout and self._config.transport == "page_pull":
+        step = self._active_step
+        if step is not None and step.transport == "page_pull":
             with pcp_nvtx_range("pcp.page_pull_plan"):
                 self._configure_page_pull_plan()
         return slot_mappings
@@ -475,12 +482,17 @@ class RunaheadPCPManager(PCPManager):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, InputBatch]:
+        step = self._active_step
         self._runahead_runtime.flush()
         result = super().restore_for_sampling(hidden_states)
-        if self._step_transport in ("prefix_p2p", "direct_p2p", "page_pull"):
+        if step is not None and step.transport in (
+            "prefix_p2p",
+            "direct_p2p",
+            "page_pull",
+        ):
             self._sharded_kv_history = True
         self._runahead_runtime.disable_step()
-        self._step_transport = None
+        self._active_step = None
         return result
 
 
@@ -488,6 +500,7 @@ __all__ = [
     "LogicalSegment",
     "RUNAHEAD_MIN_PREFILL_TOKENS",
     "RunaheadPCPManager",
+    "RunaheadStep",
     "SegmentLayout",
     "parse_runahead_weights",
     "runahead_batch_eligible",

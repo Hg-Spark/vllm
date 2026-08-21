@@ -9,16 +9,17 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.config.pcp_runahead import (
+    PCPRunaheadConfig,
+    compile_pcp_binding,
+    parse_pcp_runahead_config,
+)
 from vllm.v1.attention.ops.pcp_page_pull import (
     PCPPagePlan,
     PCPPagePullTransport,
 )
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_name
 from vllm.v1.attention.ops.pcp_runahead import PCPRunaheadRuntime
-from vllm.v1.worker.gpu.pcp_runahead_config import (
-    PCPRunaheadConfig,
-    parse_pcp_runahead_config,
-)
 from vllm.v1.worker.gpu.pcp_runahead_manager import (
     RunaheadPCPManager,
     parse_runahead_weights,
@@ -32,14 +33,11 @@ def _manager(world_size: int) -> RunaheadPCPManager:
     manager.pcp_world_size = world_size
     manager.pcp_rank = 0
     manager._standard_attention_pcp = True
-    manager._use_custom_partition = True
-    manager._use_compact_layout = True
-    manager._active_layout = None
+    manager._active_step = None
     manager._config = PCPRunaheadConfig(
-        pcp_world_size=world_size,
         transport="prefix_p2p",
         weights=(1.0,) * world_size,
-        segment_to_rank=tuple(range(world_size)),
+        binding=compile_pcp_binding(tuple(range(world_size)), world_size),
     )
     manager._page_alignment = 1
     return manager
@@ -75,13 +73,14 @@ def test_config_parses_only_runtime_axes() -> None:
     assert config is not None
     assert config.transport == "full_kv_collective"
     assert config.weights == (4.0, 2.5, 1.9, 1.6)
-    assert config.segment_to_rank == (0, 1, 2, 3)
-    assert config.logical_segment_to_rank == (0, 1, 2, 3)
+    assert config.segment_to_physical_rank == (0, 1, 2, 3)
+    assert config.segment_to_group_rank == (0, 1, 2, 3)
+    assert config.pcp_group_order == (0, 1, 2, 3)
     assert config.min_tokens == 2048
     assert config.max_inflight_sends == 3
 
 
-def test_permutation_becomes_logical_identity_after_primary_group_order() -> None:
+def test_permutation_compiles_physical_binding_into_primary_group_order() -> None:
     config = parse_pcp_runahead_config(
         {
             "pcp_runahead": {
@@ -98,8 +97,10 @@ def test_permutation_becomes_logical_identity_after_primary_group_order() -> Non
     )
     assert config is not None
     assert config.weights == (3.0, 1.0)
-    assert config.segment_to_rank == (1, 0)
-    assert config.logical_segment_to_rank == (0, 1)
+    assert config.segment_to_physical_rank == (1, 0)
+    assert config.segment_to_group_rank == (0, 1)
+    assert config.pcp_group_order == (1, 0)
+    assert config.binding.physical_rank_to_group_rank == (1, 0)
 
 
 def test_page_pull_keeps_repeated_rank_binding_in_plan_space() -> None:
@@ -123,9 +124,10 @@ def test_page_pull_keeps_repeated_rank_binding_in_plan_space() -> None:
         2,
     )
     assert config is not None
-    assert not config.mapping_is_permutation
-    assert config.segment_to_rank == (1, 0, 1)
-    assert config.logical_segment_to_rank == (1, 0, 1)
+    assert not config.binding.is_permutation
+    assert config.segment_to_physical_rank == (1, 0, 1)
+    assert config.segment_to_group_rank == (1, 0, 1)
+    assert config.pcp_group_order == (0, 1)
     assert config.max_inflight_reads == 2
 
 
@@ -221,12 +223,12 @@ def test_segment_layout_is_compiled_once_for_all_ranks() -> None:
     ) == 10
 
 
-def test_permutation_layout_uses_logical_group_rank() -> None:
+def test_permutation_layout_uses_primary_group_rank() -> None:
     manager = _manager(2)
     manager._config = replace(
         manager._config,
         weights=(3.0, 1.0),
-        segment_to_rank=(1, 0),
+        binding=compile_pcp_binding((1, 0), 2),
     )
     layout = manager._compile_segment_layout(_batch([100]))
     assert layout is not None
@@ -246,7 +248,7 @@ def test_repeated_binding_builds_multiple_local_segments() -> None:
         manager._config,
         transport="page_pull",
         weights=(1.0, 1.0, 1.0),
-        segment_to_rank=(1, 0, 1),
+        binding=compile_pcp_binding((1, 0, 1), 2),
     )
     layout = manager._compile_segment_layout(_batch([12]))
     assert layout is not None
