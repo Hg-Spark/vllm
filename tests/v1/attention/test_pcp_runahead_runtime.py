@@ -196,3 +196,49 @@ def test_variable_width_runtime_rejects_empty_rank() -> None:
         assert "positive rows" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_exchange_full_batches_variable_width_allgatherv() -> None:
+    group = _group(0)
+    gathered_key = torch.randn(5, 2, 8)
+    gathered_value = torch.randn(5, 2, 8)
+    group.all_gatherv.return_value = [gathered_key, gathered_value]
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        pcp_group=group,
+    )
+    runtime.begin_step((2, 1, 1, 1), transport="full_kv_collective")
+    key = torch.randn(2, 2, 8)
+    value = torch.randn(2, 2, 8)
+
+    gathered, slots = runtime.exchange_full((key, value), torch.arange(5))
+
+    group.all_gatherv.assert_called_once()
+    group.all_gather.assert_not_called()
+    assert gathered == (gathered_key, gathered_value)
+    assert slots.tolist() == list(range(5))
+
+
+def test_exchange_full_keeps_equal_width_allgather_fast_path() -> None:
+    group = _group(0)
+    gathered_key = torch.randn(8, 2, 8)
+    gathered_value = torch.randn(8, 2, 8)
+    group.all_gather.side_effect = [gathered_key, gathered_value]
+    runtime = PCPRunaheadRuntime(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        pcp_group=group,
+    )
+    runtime.begin_step((2, 2, 2, 2), transport="full_kv_collective")
+    key = torch.randn(2, 2, 8)
+    value = torch.randn(2, 2, 8)
+
+    gathered, slots = runtime.exchange_full((key, value), torch.arange(8))
+
+    assert group.all_gather.call_count == 2
+    group.all_gatherv.assert_not_called()
+    assert gathered == (gathered_key, gathered_value)
+    assert slots.tolist() == list(range(8))
