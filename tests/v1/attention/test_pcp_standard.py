@@ -5,9 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from vllm.v1.attention.ops.pcp_standard import (
-    prepare_standard_pcp_kv_cache_inputs,
-)
+from vllm.v1.attention.ops.pcp_standard import prepare_standard_pcp_kv_cache_inputs
 
 
 def _flash_kv_cache(
@@ -42,33 +40,33 @@ def test_standard_runahead_preserves_gqa_kv_head_shape() -> None:
     assert out_key.shape[1:] == (2, 16)
 
 
-def test_standard_runahead_returns_causal_visible_image() -> None:
-    local_key = torch.randn(3, 2, 8)
-    local_value = torch.randn(3, 2, 8)
-    visible_key = torch.randn(7, 2, 8)
-    visible_value = torch.randn(7, 2, 8)
-    visible_slots = torch.arange(7, dtype=torch.int64)
-    kv_cache = _flash_kv_cache()
+def test_page_pull_prepare_does_not_duplicate_native_cache_write() -> None:
+    key = torch.randn(2, 2, 8)
+    value = torch.randn(2, 2, 8)
+    slots = torch.arange(4, dtype=torch.int64)
+    kv_cache = torch.zeros((8, 2, 16, 16))
     runtime = MagicMock()
-    runtime.transport = "prefix_p2p"
-    runtime.exchange_prefix.return_value = (
-        (visible_key, visible_value), visible_slots
-    )
+    runtime.transport = "page_pull"
+    runtime.local_rows = 2
+    runtime.rank_local_slot_mapping.return_value = slots[:2]
 
     with patch(
         "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
         return_value=runtime,
     ):
         out_key, out_value, out_slots = prepare_standard_pcp_kv_cache_inputs(
-            local_key, local_value, visible_slots, kv_cache
+            key, value, slots, kv_cache
         )
 
-    assert out_key is visible_key
-    assert out_value is visible_value
-    assert out_slots is visible_slots
+    runtime.page_pull_prepare_layer.assert_called_once_with(kv_cache)
+    runtime.page_pull_after_cache_write.assert_not_called()
+    assert out_key is key
+    assert out_value is value
+    assert out_slots.tolist() == [0, 1]
+    assert torch.count_nonzero(kv_cache) == 0
 
 
-def test_standard_compact_full_kv_collective_uses_allgatherv() -> None:
+def test_standard_compact_full_kv_collective_uses_allgatherv_for_variable_width() -> None:
     key = torch.randn(2, 2, 8)
     value = torch.randn(2, 2, 8)
     slots = torch.arange(5, dtype=torch.int64)
@@ -79,28 +77,54 @@ def test_standard_compact_full_kv_collective_uses_allgatherv() -> None:
     runtime.total_rows = 5
     runtime.rows_per_rank = (2, 3)
     group = MagicMock()
+    runtime._group.return_value = group
     gathered_key = torch.randn(5, 2, 8)
     gathered_value = torch.randn(5, 2, 8)
     group.all_gatherv.return_value = [gathered_key, gathered_value]
 
-    with (
-        patch(
-            "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
-            return_value=runtime,
-        ),
-        patch(
-            "vllm.v1.attention.ops.pcp_standard.get_pcp_group",
-            return_value=group,
-        ),
+    with patch(
+        "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
+        return_value=runtime,
     ):
         out_key, out_value, out_slots = prepare_standard_pcp_kv_cache_inputs(
             key, value, slots, kv_cache
         )
 
     group.all_gatherv.assert_called_once()
+    group.all_gather.assert_not_called()
     assert out_key is gathered_key
     assert out_value is gathered_value
     assert out_slots.tolist() == list(range(5))
+
+
+def test_standard_compact_full_kv_collective_keeps_equal_width_allgather_fast_path() -> None:
+    key = torch.randn(2, 2, 8)
+    value = torch.randn(2, 2, 8)
+    slots = torch.arange(4, dtype=torch.int64)
+    kv_cache = _flash_kv_cache()
+    runtime = MagicMock()
+    runtime.transport = "full_kv_collective"
+    runtime.local_rows = 2
+    runtime.total_rows = 4
+    runtime.rows_per_rank = (2, 2)
+    group = MagicMock()
+    runtime._group.return_value = group
+    gathered_key = torch.randn(4, 2, 8)
+    gathered_value = torch.randn(4, 2, 8)
+    group.all_gather.side_effect = [gathered_key, gathered_value]
+
+    with patch(
+        "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
+        return_value=runtime,
+    ):
+        out_key, out_value, _ = prepare_standard_pcp_kv_cache_inputs(
+            key, value, slots, kv_cache
+        )
+
+    assert group.all_gather.call_count == 2
+    group.all_gatherv.assert_not_called()
+    assert out_key is gathered_key
+    assert out_value is gathered_value
 
 
 def test_standard_fallback_reuses_baseline_allgather() -> None:
