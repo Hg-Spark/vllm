@@ -24,7 +24,7 @@ import torch.distributed as dist
 
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.platforms import current_platform
-from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
+from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_mark, pcp_nvtx_range
 
 
 @dataclass(frozen=True)
@@ -119,6 +119,7 @@ class _InflightRead:
     layer_id: int
     source_rank: int
     handle: int
+    num_pages: int
 
 
 @dataclass
@@ -185,6 +186,11 @@ class PCPPagePullTransport:
     def registered_layer_names(self) -> tuple[str, ...]:
         return self._layer_names
 
+    def _layer_label(self, layer_id: int) -> str | int:
+        if 0 <= layer_id < len(self._layer_names):
+            return self._layer_names[layer_id]
+        return layer_id
+
     def _ensure_wrapper(self) -> None:
         if self._wrapper is not None:
             return
@@ -245,6 +251,7 @@ class PCPPagePullTransport:
         if self._layer_memory:
             self._ensure_remote_agents()
             self._start_progress_thread()
+        pcp_nvtx_mark("pcp.page_pull_step_begin", e=self._epoch, rank=self.rank)
 
     def disable_step(self) -> None:
         self.finish_step()
@@ -449,6 +456,13 @@ class PCPPagePullTransport:
             self._wrapper.send_notif(
                 self._remote_agents[destination_rank], notif_msg=msg
             )
+            pcp_nvtx_mark(
+                "pcp.page_pull_ready_send",
+                e=self._epoch,
+                l=self._layer_label(layer_id),
+                src=self.rank,
+                dst=destination_rank,
+            )
 
     def _publish_completed_ready(self) -> None:
         while self._pending_ready:
@@ -456,6 +470,12 @@ class PCPPagePullTransport:
             if pending.event is not None and not pending.event.query():
                 break
             self._pending_ready.popleft()
+            pcp_nvtx_mark(
+                "pcp.page_pull_ready",
+                e=self._epoch,
+                l=self._layer_label(pending.layer_id),
+                src=self.rank,
+            )
             self._send_ready(pending.layer_id)
 
     def _poll_ready_notifications(self) -> None:
@@ -487,6 +507,13 @@ class PCPPagePullTransport:
                 key = (layer_i, source_i)
                 if key not in self._done_pairs and key not in self._inflight:
                     self._ready_waiting.append(key)
+                    pcp_nvtx_mark(
+                        "pcp.page_pull_ready_recv",
+                        e=self._epoch,
+                        l=self._layer_label(layer_i),
+                        src=source_i,
+                        dst=self.rank,
+                    )
 
     def _start_read(self, layer_id: int, source_rank: int) -> None:
         assert self._wrapper is not None and self._plan is not None
@@ -495,8 +522,17 @@ class PCPPagePullTransport:
             self.rank, source_rank
         )
         key = (layer_id, source_rank)
+        num_pages = len(destination_ids)
         if not destination_ids:
             self._done_pairs.add(key)
+            pcp_nvtx_mark(
+                "pcp.page_pull_read_done",
+                e=self._epoch,
+                l=self._layer_label(layer_id),
+                src=source_rank,
+                dst=self.rank,
+                pages=0,
+            )
             return
         if max(destination_ids) >= local.num_blocks:
             raise RuntimeError(
@@ -509,7 +545,14 @@ class PCPPagePullTransport:
                 "PCP page-pull source block id exceeds remote cache: "
                 f"max={max(source_ids)}, num_blocks={remote_num_blocks}"
             )
-        with pcp_nvtx_range("pcp.page_pull_read_submit"):
+        with pcp_nvtx_range(
+            "pcp.page_pull_read_submit",
+            e=self._epoch,
+            l=self._layer_label(layer_id),
+            src=source_rank,
+            dst=self.rank,
+            pages=num_pages,
+        ):
             handle = self._wrapper.make_prepped_xfer(
                 "READ",
                 local.local_xfer_handle,
@@ -518,7 +561,9 @@ class PCPPagePullTransport:
                 np.asarray(source_ids, dtype=np.int64),
             )
             self._wrapper.transfer(handle)
-        self._inflight[key] = _InflightRead(layer_id, source_rank, handle)
+        self._inflight[key] = _InflightRead(
+            layer_id, source_rank, handle, num_pages
+        )
 
     def _progress_once(self) -> None:
         if self._plan is None:
@@ -543,6 +588,14 @@ class PCPPagePullTransport:
                     f"source_rank={transfer.source_rank}"
                 )
             self._done_pairs.add(key)
+            pcp_nvtx_mark(
+                "pcp.page_pull_read_done",
+                e=self._epoch,
+                l=self._layer_label(transfer.layer_id),
+                src=transfer.source_rank,
+                dst=self.rank,
+                pages=transfer.num_pages,
+            )
 
     def _progress_loop(self) -> None:
         try:
@@ -550,6 +603,9 @@ class PCPPagePullTransport:
                 self._progress_once()
                 time.sleep(self._POLL_INTERVAL_S)
         except BaseException as exc:
+            pcp_nvtx_mark(
+                "pcp.page_pull_progress_error", e=self._epoch, rank=self.rank
+            )
             self._progress_error = exc
             self._progress_stop.set()
 
@@ -582,7 +638,13 @@ class PCPPagePullTransport:
             (layer_id, source_rank)
             for source_rank in self._plan.required_source_ranks(self.rank)
         }
-        with pcp_nvtx_range("pcp.page_pull_wait"):
+        with pcp_nvtx_range(
+            "pcp.page_pull_wait",
+            e=self._epoch,
+            l=self._layer_label(layer_id),
+            dst=self.rank,
+            sources=len(required),
+        ):
             while not required.issubset(self._done_pairs):
                 self._check_progress_error()
                 if self._progress_thread is None:
@@ -615,6 +677,7 @@ class PCPPagePullTransport:
             self._progress_thread.join()
             self._progress_thread = None
         self._check_progress_error()
+        pcp_nvtx_mark("pcp.page_pull_step_end", e=self._epoch, rank=self.rank)
         self._pending_ready.clear()
         self._ready_waiting.clear()
         self._inflight.clear()

@@ -313,12 +313,22 @@ persistent sharded-KV continuation/decode path is implemented.
 
 ## Profiling
 
-Set:
+Set the PCP profiling flag before worker startup:
 
 ```bash
 VLLM_PCP_NVTX=1
 ```
 
-Profiling consists only of direct call-site ranges/marks. It does not patch
+The flag is registered with vLLM's environment registry and is read when the PCP
+profiling helper is imported. PCP scopes use structured fields such as epoch,
+rank, layer, source/destination rank, rows, and page count. Important events
+include P2P send/receive waits and the page-pull lifecycle from READY publication
+through READ submission/completion and per-layer wait.
+
+PCP profiling consists only of direct call-site ranges/marks. It does not patch
 FlashAttention or the page-pull progress engine and does not add CUDA
-synchronization.
+synchronization. For generic vLLM execution scopes, it can be combined with:
+
+```bash
+VLLM_NVTX_SCOPES_FOR_PROFILING=1
+```

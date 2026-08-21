@@ -6,6 +6,7 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_tp_group,
 )
+from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 from vllm.v1.attention.ops.pcp_runahead import get_pcp_runahead_runtime
 
 
@@ -23,10 +24,15 @@ def _gather_prefill_cache_inputs(
         return tensors, slot_mapping[:num_decode_tokens]
 
     pcp_group = get_pcp_group()
-    gathered_prefills = tuple(
-        pcp_group.all_gather(tensor[num_decode_tokens:].contiguous(), dim=0)
-        for tensor in tensors
-    )
+    with pcp_nvtx_range(
+        "pcp.mla_baseline_kv_allgather",
+        rank=pcp_group.rank_in_group,
+        rows=local_num_tokens - num_decode_tokens,
+    ):
+        gathered_prefills = tuple(
+            pcp_group.all_gather(tensor[num_decode_tokens:].contiguous(), dim=0)
+            for tensor in tensors
+        )
     pcp_size = pcp_group.world_size
     gathered_slot_mapping = slot_mapping[: pcp_size * local_num_tokens]
     if num_decode_tokens == 0:
@@ -55,11 +61,29 @@ def _exchange_runahead_cache_inputs(
     if runtime is None:
         return None
     if runtime.transport == "full_kv_collective":
-        return runtime.exchange_full(tensors, slot_mapping)
+        with pcp_nvtx_range(
+            "pcp.mla_full_kv_exchange",
+            e=runtime.epoch,
+            rank=runtime.rank,
+            rows=runtime.local_rows,
+        ):
+            return runtime.exchange_full(tensors, slot_mapping)
     if runtime.transport == "prefix_p2p":
-        return runtime.exchange_prefix(tensors, slot_mapping)
+        with pcp_nvtx_range(
+            "pcp.mla_prefix_exchange",
+            e=runtime.epoch,
+            rank=runtime.rank,
+            rows=runtime.local_rows,
+        ):
+            return runtime.exchange_prefix(tensors, slot_mapping)
     if runtime.transport == "direct_p2p":
-        return runtime.exchange_direct(tensors, slot_mapping)
+        with pcp_nvtx_range(
+            "pcp.mla_direct_exchange",
+            e=runtime.epoch,
+            rank=runtime.rank,
+            rows=runtime.local_rows,
+        ):
+            return runtime.exchange_direct(tensors, slot_mapping)
     if runtime.transport == "page_pull":
         raise NotImplementedError("MLA PCP runahead does not support page_pull yet")
     raise RuntimeError(f"unexpected PCP runahead transport: {runtime.transport!r}")

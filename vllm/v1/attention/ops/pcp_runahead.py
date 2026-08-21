@@ -14,7 +14,7 @@ import torch.distributed as dist
 
 from vllm.distributed.parallel_state import Handle, get_pcp_group
 from vllm.v1.attention.ops.pcp_page_pull import PCPPagePlan, PCPPagePullTransport
-from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
+from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_mark, pcp_nvtx_range
 
 
 @dataclass
@@ -73,6 +73,10 @@ class PCPRunaheadRuntime:
 
     def _group(self):
         return self.group if self.group is not None else get_pcp_group()
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
 
     @property
     def local_rows(self) -> int:
@@ -274,7 +278,13 @@ class PCPRunaheadRuntime:
             )
             recv_views = tuple(tensor[: self.prefix_rows] for tensor in visible)
             works = self._p2p(recv_views, peer=self.prev_rank, recv=True)
-            with pcp_nvtx_range("pcp.prefix_recv_wait"):
+            with pcp_nvtx_range(
+                "pcp.prefix_recv_wait",
+                e=self._epoch,
+                rank=self.rank,
+                src=self.prev_rank,
+                rows=self.prefix_rows,
+            ):
                 for work in works:
                     work.wait()
             for output, local in zip(visible, tensors, strict=True):
@@ -283,6 +293,13 @@ class PCPRunaheadRuntime:
         visible_slots = slot_mapping[: self.visible_rows]
         if self.next_rank is not None:
             works = self._p2p(visible, peer=self.next_rank, recv=False)
+            pcp_nvtx_mark(
+                "pcp.prefix_send",
+                e=self._epoch,
+                src=self.rank,
+                dst=self.next_rank,
+                rows=self.visible_rows,
+            )
             self._pending_sends.append(_PendingSend(works, visible))
             self._bound_pending_sends()
         return visible, visible_slots
@@ -319,13 +336,33 @@ class PCPRunaheadRuntime:
             stop = self.rank_offsets[source_rank + 1]
             views = tuple(output[start:stop] for output in visible)
             recv_works.extend(self._p2p(views, peer=source_rank, recv=True))
+            pcp_nvtx_mark(
+                "pcp.direct_recv_submit",
+                e=self._epoch,
+                src=source_rank,
+                dst=self.rank,
+                rows=stop - start,
+            )
 
         for destination_rank in range(self.rank + 1, self.world_size):
             works = self._p2p(tensors, peer=destination_rank, recv=False)
+            pcp_nvtx_mark(
+                "pcp.direct_send",
+                e=self._epoch,
+                src=self.rank,
+                dst=destination_rank,
+                rows=self.local_rows,
+            )
             self._pending_sends.append(_PendingSend(works, tensors))
         self._bound_pending_sends()
 
-        with pcp_nvtx_range("pcp.direct_recv_wait"):
+        with pcp_nvtx_range(
+            "pcp.direct_recv_wait",
+            e=self._epoch,
+            rank=self.rank,
+            sources=self.rank,
+            rows=self.prefix_rows,
+        ):
             for work in recv_works:
                 work.wait()
         return visible, slot_mapping[: self.visible_rows]
@@ -349,7 +386,7 @@ class PCPRunaheadRuntime:
         self._page_pull.wait_layer(layer_id)
 
     def flush(self) -> None:
-        with pcp_nvtx_range("pcp.flush"):
+        with pcp_nvtx_range("pcp.flush", e=self._epoch, rank=self.rank):
             while self._pending_sends:
                 self._pending_sends.popleft().wait()
             if self._pending_page_layers:

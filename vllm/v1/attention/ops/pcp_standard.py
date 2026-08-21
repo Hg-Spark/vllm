@@ -21,14 +21,24 @@ def prepare_standard_pcp_kv_cache_inputs(
     runtime = get_pcp_runahead_runtime()
     if runtime is not None:
         if runtime.transport == "prefix_p2p":
-            with pcp_nvtx_range("pcp.prefix_exchange"):
+            with pcp_nvtx_range(
+                "pcp.prefix_exchange",
+                e=runtime.epoch,
+                rank=runtime.rank,
+                rows=runtime.local_rows,
+            ):
                 (key, value), slot_mapping = runtime.exchange_prefix(
                     (key, value), slot_mapping
                 )
             return key, value, slot_mapping
 
         if runtime.transport == "direct_p2p":
-            with pcp_nvtx_range("pcp.direct_exchange"):
+            with pcp_nvtx_range(
+                "pcp.direct_exchange",
+                e=runtime.epoch,
+                rank=runtime.rank,
+                rows=runtime.local_rows,
+            ):
                 (key, value), slot_mapping = runtime.exchange_direct(
                     (key, value), slot_mapping
                 )
@@ -60,11 +70,23 @@ def prepare_standard_pcp_kv_cache_inputs(
             group = runtime._group()
             sizes = list(runtime.rows_per_rank)
             if len(set(sizes)) == 1:
-                with pcp_nvtx_range("pcp.full_kv_allgather"):
+                with pcp_nvtx_range(
+                    "pcp.full_kv_allgather",
+                    e=runtime.epoch,
+                    rank=runtime.rank,
+                    rows=runtime.local_rows,
+                    total=runtime.total_rows,
+                ):
                     key = group.all_gather(key.contiguous(), dim=0)
                     value = group.all_gather(value.contiguous(), dim=0)
             else:
-                with pcp_nvtx_range("pcp.full_kv_allgatherv"):
+                with pcp_nvtx_range(
+                    "pcp.full_kv_allgatherv",
+                    e=runtime.epoch,
+                    rank=runtime.rank,
+                    rows=runtime.local_rows,
+                    total=runtime.total_rows,
+                ):
                     key, value = group.all_gatherv(
                         [key.contiguous(), value.contiguous()],
                         dim=0,
@@ -91,7 +113,11 @@ def prepare_standard_pcp_kv_cache_inputs(
             f"key={key.shape[0]}, value={value.shape[0]}, rows={local_rows}"
         )
 
-    with pcp_nvtx_range("pcp.baseline_kv_allgather"):
+    with pcp_nvtx_range(
+        "pcp.baseline_kv_allgather",
+        rank=pcp_group.rank_in_group,
+        rows=local_rows,
+    ):
         key = pcp_group.all_gather(key[:local_rows].contiguous(), dim=0)
         value = pcp_group.all_gather(value[:local_rows].contiguous(), dim=0)
     return key, value, slot_mapping

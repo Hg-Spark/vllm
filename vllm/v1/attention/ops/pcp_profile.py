@@ -9,18 +9,14 @@ changing transport scheduling or adding synchronization.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import torch
 
-_PCP_NVTX_ENABLED = os.environ.get("VLLM_PCP_NVTX", "0").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+from vllm import envs
+
+_PCP_NVTX_ENABLED = envs.VLLM_PCP_NVTX
 
 
 def pcp_nvtx_enabled() -> bool:
@@ -36,10 +32,12 @@ def pcp_nvtx_name(event: str, **fields: object) -> str:
 
 
 @contextmanager
-def pcp_nvtx_range(name: str) -> Iterator[None]:
+def pcp_nvtx_range(name: str, **fields: object) -> Iterator[None]:
     if not _PCP_NVTX_ENABLED:
         yield
         return
+    if fields:
+        name = pcp_nvtx_name(name, **fields)
     torch.cuda.nvtx.range_push(name)
     try:
         yield
@@ -47,9 +45,12 @@ def pcp_nvtx_range(name: str) -> Iterator[None]:
         torch.cuda.nvtx.range_pop()
 
 
-def pcp_nvtx_mark(name: str) -> None:
-    if _PCP_NVTX_ENABLED:
-        torch.cuda.nvtx.mark(name)
+def pcp_nvtx_mark(name: str, **fields: object) -> None:
+    if not _PCP_NVTX_ENABLED:
+        return
+    if fields:
+        name = pcp_nvtx_name(name, **fields)
+    torch.cuda.nvtx.mark(name)
 
 
 __all__ = [
