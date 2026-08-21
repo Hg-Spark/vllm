@@ -52,13 +52,7 @@ def pcp_nvtx_mark(name: str) -> None:
         torch.cuda.nvtx.mark(name)
 
 
-def install_pcp_nvtx_hooks() -> None:
-    """Compatibility no-op for callers from older experimental revisions."""
-    return None
-
-
 __all__ = [
-    "install_pcp_nvtx_hooks",
     "pcp_nvtx_enabled",
     "pcp_nvtx_mark",
     "pcp_nvtx_name",
