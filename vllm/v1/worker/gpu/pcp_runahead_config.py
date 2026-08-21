@@ -16,6 +16,9 @@ TransportPolicy = Literal[
 ]
 
 RUNAHEAD_CONFIG_KEY = "pcp_runahead"
+# Kept only as a stable import name for older experiment helpers. The parser no
+# longer consumes this top-level key; canonical weights live under partition.
+RUNAHEAD_WEIGHTS_KEY = "pcp_runahead_weights"
 RUNAHEAD_MIN_PREFILL_TOKENS = 1024
 
 
