@@ -33,17 +33,16 @@ def install_page_pull_cache_update_hook() -> None:
     @wraps(original)
     def pcp_cache_update(
         self,
-        layer,
+        layer: torch.nn.Module,
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata,
-    ):
-        result = original(self, layer, key, value, kv_cache, attn_metadata)
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        original(self, layer, key, value, kv_cache, slot_mapping)
         runtime = get_pcp_runahead_runtime()
         if runtime is not None and runtime.transport == "page_pull":
             runtime.page_pull_after_cache_write(kv_cache)
-        return result
 
     FlashAttentionImpl.do_kv_cache_update = pcp_cache_update
     _PAGE_PULL_CACHE_HOOK_INSTALLED = True
