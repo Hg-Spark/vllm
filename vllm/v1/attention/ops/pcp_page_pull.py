@@ -15,6 +15,8 @@ memory / one-sided transfer primitives.
 
 from __future__ import annotations
 
+import math
+import threading
 import time
 import uuid
 from collections import deque
@@ -154,14 +156,16 @@ class _InflightRead:
 class PCPPagePullTransport:
     """Consumer-driven PCP page pull using NIXL READ.
 
-    All attention-layer KV caches can be registered once at model-runner cache
-    initialization. That lets a consumer pre-post READY receives for future
-    layers on the *first* runahead step, so a producer that runs ahead can make
-    a later layer available while the consumer is still working on an earlier
-    one.
+    On the first real layer invocation the transport discovers all bound,
+    write-owning attention KV caches from the current vLLM ForwardContext and
+    registers them in one pass. READY receives for every layer can therefore be
+    posted before layer 0 finishes, and a dedicated progress thread can start a
+    future-layer READ while the model thread is still executing an earlier
+    layer's attention/MLP.
     """
 
     _READY_FIELDS = 6
+    _POLL_INTERVAL_S = 0.00005
 
     def __init__(
         self,
@@ -198,6 +202,10 @@ class PCPPagePullTransport:
         self._pending_ready_sends: list[tuple[Any, torch.Tensor]] = []
         self._inflight: dict[tuple[int, int], _InflightRead] = {}
         self._done_pairs: set[tuple[int, int]] = set()
+
+        self._progress_stop = threading.Event()
+        self._progress_thread: threading.Thread | None = None
+        self._progress_error: BaseException | None = None
 
     @property
     def enabled(self) -> bool:
@@ -255,7 +263,6 @@ class PCPPagePullTransport:
                 "page plan PCP world size mismatch: "
                 f"plan={plan.world_size}, runtime={self.world_size}"
             )
-        self._ensure_remote_agents()
         self._epoch = epoch
         self._plan = plan
         self._fallback_layer_cursor = 0
@@ -263,11 +270,15 @@ class PCPPagePullTransport:
         self._ready_waiting.clear()
         self._inflight.clear()
         self._done_pairs.clear()
+        self._progress_error = None
 
-        # Layer addresses were registered at KV-cache initialization, so READY
-        # receives for every layer can be posted before layer 0 starts.
-        for layer_id in range(len(self._layer_memory)):
-            self._post_ready_recvs(layer_id)
+        # If this runtime has already discovered/registerd its layer caches,
+        # pre-post all READY receives before layer 0 starts. On the first step
+        # this setup is completed by register_current_layer().
+        if self._layer_memory:
+            self._ensure_remote_agents()
+            self._post_all_ready_recvs()
+            self._start_progress_thread()
 
     def disable_step(self) -> None:
         self.finish_step()
@@ -307,7 +318,13 @@ class PCPPagePullTransport:
             )
 
         num_blocks = int(kv_cache.shape[0])
-        block_bytes = int(kv_cache.stride(0) * kv_cache.element_size())
+        page_elements = math.prod(kv_cache.shape[1:])
+        if kv_cache.stride(0) != page_elements or not kv_cache[0].is_contiguous():
+            raise NotImplementedError(
+                "PCP page_pull currently requires contiguous block-major KV pages; "
+                f"shape={tuple(kv_cache.shape)}, stride={tuple(kv_cache.stride())}"
+            )
+        block_bytes = int(page_elements * kv_cache.element_size())
         if num_blocks <= 0 or block_bytes <= 0:
             raise RuntimeError(
                 "PCP page-pull cannot register an empty KV cache: "
@@ -339,18 +356,30 @@ class PCPPagePullTransport:
         self._memory_by_ptr[ptr] = registration
         return registration
 
-    def register_layer_caches(self, kv_caches: dict[str, Any]) -> None:
-        """Register all standard-attention layer caches before the first step."""
-        tensor_caches = {
-            name: cache for name, cache in kv_caches.items() if isinstance(cache, torch.Tensor)
-        }
-        if not tensor_caches:
-            raise RuntimeError("PCP page_pull received no tensor KV caches to register")
+    @staticmethod
+    def _discover_bound_layer_caches() -> dict[str, torch.Tensor]:
+        """Discover only layers that own/write their KV cache in this forward."""
+        from vllm.forward_context import get_forward_context
 
-        # Layer names are stable and identical across PCP workers; sorting makes
-        # the integer wire ID independent of dictionary construction details.
-        layer_names = tuple(sorted(tensor_caches))
-        registrations = [self._register_memory(tensor_caches[name]) for name in layer_names]
+        forward_context = get_forward_context()
+        result: dict[str, torch.Tensor] = {}
+        for layer_name, layer in forward_context.no_compile_layers.items():
+            kv_cache = getattr(layer, "kv_cache", None)
+            if not isinstance(kv_cache, torch.Tensor):
+                continue
+            # KV-sharing followers intentionally skip do_kv_cache_update and
+            # must not create an unmatched READY receive.
+            if getattr(layer, "kv_sharing_target_layer_name", None) is not None:
+                continue
+            result[layer_name] = kv_cache
+        return result
+
+    def register_layer_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        """Register all write-owning attention layer caches as stable wire IDs."""
+        if not kv_caches:
+            raise RuntimeError("PCP page_pull received no tensor KV caches to register")
+        layer_names = tuple(sorted(kv_caches))
+        registrations = [self._register_memory(kv_caches[name]) for name in layer_names]
         if self._layer_names:
             if layer_names != self._layer_names:
                 raise RuntimeError(
@@ -370,36 +399,38 @@ class PCPPagePullTransport:
             }
             self._layer_memory = registrations
 
-        # Exchange agent connection metadata only after local memory is
+        # Exchange agent connection metadata only after all local memory is
         # registered, matching the lifecycle used by vLLM's NIXL connector.
         self._ensure_remote_agents()
+        if self._plan is not None:
+            self._post_all_ready_recvs()
+            self._start_progress_thread()
 
-    def register_current_layer(
-        self, kv_cache: torch.Tensor, layer_name: str | None = None
-    ) -> int:
+    def register_current_layer(self, kv_cache: torch.Tensor) -> int:
         if self._plan is None:
             raise RuntimeError("page-pull layer registration requires an active step")
-        self._ensure_remote_agents()
-        registration = self._register_memory(kv_cache)
 
-        if layer_name is not None and self._layer_id_by_name:
-            try:
-                layer_id = self._layer_id_by_name[layer_name]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"PCP page-pull encountered an unregistered layer: {layer_name}"
-                ) from exc
-            expected = self._layer_memory[layer_id]
-            if expected.base_addr != registration.base_addr:
-                raise RuntimeError(
-                    "PCP page-pull layer pointer differs from pre-registered cache: "
-                    f"layer={layer_name}, expected={expected.base_addr}, "
-                    f"actual={registration.base_addr}"
-                )
+        if not self._layer_names:
+            discovered = self._discover_bound_layer_caches()
+            if discovered:
+                self.register_layer_caches(discovered)
+
+        registration = self._register_memory(kv_cache)
+        matches = [
+            layer_id
+            for layer_id, expected in enumerate(self._layer_memory)
+            if expected.base_addr == registration.base_addr
+        ]
+        if len(matches) == 1:
+            layer_id = matches[0]
+        elif len(matches) > 1:
+            raise RuntimeError(
+                "PCP page-pull found ambiguous layer IDs for one KV cache pointer: "
+                f"ptr={registration.base_addr}, matches={matches}"
+            )
         else:
-            # Compatibility fallback for focused unit tests and callers that do
-            # not expose a layer name. Production model-runner setup pre-registers
-            # all caches and always passes layer.layer_name.
+            # Compatibility fallback for isolated tests where no ForwardContext
+            # is installed. Production execution discovers all layers above.
             layer_id = self._fallback_layer_cursor
             self._fallback_layer_cursor += 1
             if layer_id == len(self._layer_memory):
@@ -409,10 +440,15 @@ class PCPPagePullTransport:
                     "PCP page-pull layer cache address changed between calls: "
                     f"layer_id={layer_id}"
                 )
+            self._post_ready_recvs(layer_id)
+            self._start_progress_thread()
 
-        self._post_ready_recvs(layer_id)
-        self.progress()
+        self._check_progress_error()
         return layer_id
+
+    def _post_all_ready_recvs(self) -> None:
+        for layer_id in range(len(self._layer_memory)):
+            self._post_ready_recvs(layer_id)
 
     def _post_ready_recvs(self, layer_id: int) -> None:
         if self._plan is None:
@@ -473,6 +509,7 @@ class PCPPagePullTransport:
             )
             self._pending_ready_sends.append((work, tensor))
         self._drain_ready_sends()
+        self._check_progress_error()
 
     def _remote_handle(
         self,
@@ -553,7 +590,7 @@ class PCPPagePullTransport:
             handle=handle,
         )
 
-    def progress(self) -> None:
+    def _progress_once(self) -> None:
         if self._plan is None:
             return
         assert self._wrapper is not None
@@ -575,9 +612,9 @@ class PCPPagePullTransport:
             self._ready_waiting.append((expected_layer_id, source_rank, meta))
             del self._ready_recvs[key]
 
-        # READY arrival determines service order. Because every destination
-        # layer cache is pre-registered, an available future layer can start
-        # immediately even while model execution is still on an earlier layer.
+        # READY arrival determines service order. The model thread does not
+        # participate here; this background progress engine can start a future
+        # layer while the model is still executing an earlier one.
         while self._ready_waiting and len(self._inflight) < self.max_inflight_reads:
             layer_id, source_rank, meta = self._ready_waiting.popleft()
             self._start_read(layer_id, source_rank, meta)
@@ -598,7 +635,38 @@ class PCPPagePullTransport:
             del self._inflight[key]
             self._done_pairs.add(key)
 
-        self._drain_ready_sends()
+    def _progress_loop(self) -> None:
+        try:
+            while not self._progress_stop.is_set():
+                self._progress_once()
+                time.sleep(self._POLL_INTERVAL_S)
+        except BaseException as exc:
+            self._progress_error = exc
+            self._progress_stop.set()
+
+    def _start_progress_thread(self) -> None:
+        if self._plan is None or self._progress_thread is not None:
+            return
+        if self._wrapper is None:
+            self._ensure_remote_agents()
+        self._progress_stop.clear()
+        self._progress_error = None
+        self._progress_thread = threading.Thread(
+            target=self._progress_loop,
+            name=f"pcp-page-pull-r{self.rank}",
+            daemon=True,
+        )
+        self._progress_thread.start()
+
+    def _check_progress_error(self) -> None:
+        if self._progress_error is not None:
+            raise RuntimeError("PCP page-pull progress engine failed") from self._progress_error
+
+    def progress(self) -> None:
+        """Drive one progress iteration when no background engine is running."""
+        self._check_progress_error()
+        if self._progress_thread is None:
+            self._progress_once()
 
     def wait_layer(self, layer_id: int) -> None:
         if self._plan is None:
@@ -609,22 +677,46 @@ class PCPPagePullTransport:
         }
         with pcp_nvtx_range("pcp.page_pull_wait"):
             while not required.issubset(self._done_pairs):
-                self.progress()
-                time.sleep(0.00005)
-        # Starting future-layer reads here overlaps them with this layer's
-        # attention/MLP work after the current dependencies have completed.
-        self.progress()
+                self._check_progress_error()
+                if self._progress_thread is None:
+                    self._progress_once()
+                time.sleep(self._POLL_INTERVAL_S)
+        self._check_progress_error()
+
+    def _expected_pairs(self) -> set[tuple[int, int]]:
+        if self._plan is None:
+            return set()
+        sources = self._plan.required_source_ranks(self.rank)
+        return {
+            (layer_id, source_rank)
+            for layer_id in range(len(self._layer_memory))
+            for source_rank in sources
+        }
 
     def finish_step(self) -> None:
-        if self._wrapper is not None:
-            while self._inflight:
-                self.progress()
-                time.sleep(0.00005)
+        if self._plan is not None and self._layer_memory:
+            expected = self._expected_pairs()
+            # A normal full model forward publishes every registered layer. Let
+            # the progress engine finish any last future-layer transfer before
+            # tearing down its outstanding CPU receives.
+            while not expected.issubset(self._done_pairs):
+                self._check_progress_error()
+                if self._progress_thread is None:
+                    self._progress_once()
+                time.sleep(self._POLL_INTERVAL_S)
+
+        self._progress_stop.set()
+        if self._progress_thread is not None:
+            self._progress_thread.join()
+            self._progress_thread = None
+        self._check_progress_error()
+
         for work, _tensor in self._pending_ready_sends:
             work.wait()
         self._pending_ready_sends.clear()
         self._ready_recvs.clear()
         self._ready_waiting.clear()
+        self._inflight.clear()
         self._done_pairs.clear()
 
 
