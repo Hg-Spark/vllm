@@ -395,7 +395,7 @@ def test_mla_latent_cache_uses_runahead_prefix_transport() -> None:
     visible_kv = torch.arange(12, dtype=torch.float32).view(3, 4)
     visible_kpe_flat = torch.arange(6, dtype=torch.float32).view(3, 2)
     visible_slots = torch.tensor([10, 11, 12], dtype=torch.int64)
-    runtime.exchange_prefix.return_value = (
+    runtime.exchange_cache_inputs.return_value = (
         (visible_kv, visible_kpe_flat),
         visible_slots,
     )
@@ -415,7 +415,7 @@ def test_mla_latent_cache_uses_runahead_prefix_transport() -> None:
             use_pcp=True,
         )
 
-    runtime.exchange_prefix.assert_called_once()
+    runtime.exchange_cache_inputs.assert_called_once()
     assert torch.equal(cache_kv, visible_kv)
     assert torch.equal(cache_kpe, visible_kpe_flat.view(3, 1, 2))
     assert torch.equal(cache_slots, visible_slots)
