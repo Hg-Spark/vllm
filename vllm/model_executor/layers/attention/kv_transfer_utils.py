@@ -47,9 +47,14 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
         layer_name = _resolve_layer_name(args[layer_name_index])
 
         # Extract attention context (metadata, layer, kv_cache, layer_slot_mapping)
-        attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
+        attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(
+            layer_name
+        )
 
-        if page_pull:
+        # unified_kv_cache_update calls do_kv_cache_update under the same
+        # layer_slot_mapping condition, so only a real native write gets a
+        # page-pull post-write/READY transition.
+        if page_pull and layer_slot_mapping is not None:
             assert runtime is not None
             runtime.page_pull_after_cache_write(kv_cache)
 
