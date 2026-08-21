@@ -197,14 +197,19 @@ class PCPRunaheadRuntime:
         group = self._group()
         sizes = list(self.rows_per_rank)
         if len(set(sizes)) == 1:
-            gathered = tuple(
-                group.all_gather(tensor.contiguous(), dim=0) for tensor in tensors
-            )
+            with pcp_nvtx_range("pcp.full_kv_allgather"):
+                gathered = tuple(
+                    group.all_gather(tensor.contiguous(), dim=0) for tensor in tensors
+                )
         else:
-            gathered = tuple(
-                group.all_gatherv(tensor.contiguous(), dim=0, sizes=sizes)
-                for tensor in tensors
-            )
+            with pcp_nvtx_range("pcp.full_kv_allgatherv"):
+                gathered = tuple(
+                    group.all_gatherv(
+                        [tensor.contiguous() for tensor in tensors],
+                        dim=0,
+                        sizes=sizes,
+                    )
+                )
         return gathered, slot_mapping[: self.total_rows]
 
     def _validate_group(self) -> None:
