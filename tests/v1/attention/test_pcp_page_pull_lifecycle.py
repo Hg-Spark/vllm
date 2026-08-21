@@ -50,12 +50,12 @@ def test_configure_step_switches_state_under_progress_lock() -> None:
     lock = _ObservedLock()
     lock.acquire()
     transport._progress_lock = lock  # type: ignore[assignment]
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def configure() -> None:
         try:
             transport.configure_step(epoch=7, plan=_plan())
-        except BaseException as exc:  # pragma: no cover - surfaced below
+        except Exception as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
 
     thread = threading.Thread(target=configure)
@@ -93,12 +93,12 @@ def test_finish_step_clears_plan_under_progress_lock() -> None:
     lock = _ObservedLock()
     lock.acquire()
     transport._progress_lock = lock  # type: ignore[assignment]
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def finish() -> None:
         try:
             transport.finish_step()
-        except BaseException as exc:  # pragma: no cover - surfaced below
+        except Exception as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
 
     thread = threading.Thread(target=finish)
