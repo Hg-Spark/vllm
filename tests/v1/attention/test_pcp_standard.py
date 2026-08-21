@@ -5,10 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from vllm.v1.attention.ops.pcp_standard import (
-    finish_standard_pcp_kv_cache_update,
-    prepare_standard_pcp_kv_cache_inputs,
-)
+from vllm.model_executor.layers.attention.kv_transfer_utils import maybe_transfer_kv_layer
+from vllm.v1.attention.ops.pcp_standard import prepare_standard_pcp_kv_cache_inputs
 
 
 def _flash_kv_cache(
@@ -69,16 +67,40 @@ def test_page_pull_prepare_does_not_duplicate_native_cache_write() -> None:
     assert torch.count_nonzero(kv_cache) == 0
 
 
-def test_page_pull_finish_runs_after_native_cache_write() -> None:
+def test_page_pull_ready_is_published_before_attention() -> None:
     kv_cache = _flash_kv_cache()
     runtime = MagicMock()
     runtime.transport = "page_pull"
-    with patch(
-        "vllm.v1.attention.ops.pcp_standard.get_pcp_runahead_runtime",
-        return_value=runtime,
+    order: list[str] = []
+    runtime.page_pull_after_cache_write.side_effect = lambda _: order.append("ready")
+
+    def attention(layer_name: str) -> str:
+        order.append("attention")
+        return layer_name
+
+    with (
+        patch(
+            "vllm.v1.attention.ops.pcp_runahead.get_pcp_runahead_runtime",
+            return_value=runtime,
+        ),
+        patch(
+            "vllm.model_executor.layers.attention.kv_transfer_utils.get_pcp_runahead_runtime",
+            return_value=runtime,
+        ),
+        patch(
+            "vllm.model_executor.layers.attention.kv_transfer_utils.has_kv_transfer_group",
+            return_value=False,
+        ),
+        patch(
+            "vllm.model_executor.layers.attention.attention.get_attention_context",
+            return_value=(None, MagicMock(), kv_cache, None),
+        ),
     ):
-        finish_standard_pcp_kv_cache_update(kv_cache)
+        wrapped = maybe_transfer_kv_layer(attention)
+        assert wrapped("layer") == "layer"
+
     runtime.page_pull_after_cache_write.assert_called_once_with(kv_cache)
+    assert order == ["ready", "attention"]
 
 
 def test_standard_compact_full_kv_collective_uses_allgatherv_for_variable_width() -> None:
