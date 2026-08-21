@@ -224,14 +224,3 @@ def parse_pcp_runahead_config(
         max_inflight_reads=max_inflight_reads,
         nixl_backends=tuple(backends_raw),
     )
-
-
-def get_pcp_process_group_order(
-    additional_config: object,
-    pcp_world_size: int,
-) -> tuple[int, ...]:
-    """Return physical PCP members ordered by logical segment rank."""
-    config = parse_pcp_runahead_config(additional_config, pcp_world_size)
-    if config is None or not config.mapping_is_permutation:
-        return tuple(range(pcp_world_size))
-    return config.segment_to_rank
