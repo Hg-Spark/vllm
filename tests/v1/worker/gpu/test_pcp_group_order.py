@@ -4,13 +4,23 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import vllm.distributed as distributed
 from vllm.distributed import parallel_state
 
 
+def _config(additional_config: dict, *, kv_transfer_config=None) -> SimpleNamespace:
+    return SimpleNamespace(
+        additional_config=additional_config,
+        kv_transfer_config=kv_transfer_config,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+
+
 def test_primary_pcp_group_uses_runahead_permutation() -> None:
-    config = SimpleNamespace(
-        additional_config={
+    config = _config(
+        {
             "pcp_runahead": {
                 "transport": "direct_p2p",
                 "partition": {
@@ -20,8 +30,7 @@ def test_primary_pcp_group_uses_runahead_permutation() -> None:
                     ]
                 },
             }
-        },
-        parallel_config=SimpleNamespace(data_parallel_size=1),
+        }
     )
     group_init = MagicMock()
 
@@ -50,8 +59,8 @@ def test_primary_pcp_group_uses_runahead_permutation() -> None:
 
 
 def test_repeated_page_pull_binding_does_not_reorder_primary_group() -> None:
-    config = SimpleNamespace(
-        additional_config={
+    config = _config(
+        {
             "pcp_runahead": {
                 "transport": "page_pull",
                 "partition": {
@@ -62,8 +71,7 @@ def test_repeated_page_pull_binding_does_not_reorder_primary_group() -> None:
                     ]
                 },
             }
-        },
-        parallel_config=SimpleNamespace(data_parallel_size=1),
+        }
     )
     group_init = MagicMock()
 
@@ -88,3 +96,15 @@ def test_repeated_page_pull_binding_does_not_reorder_primary_group() -> None:
 
     group_init.assert_called_once()
     assert group_init.call_args.args[0] == [[10, 11]]
+
+
+def test_runahead_rejects_request_level_kv_connector() -> None:
+    config = _config(
+        {"pcp_runahead": {"transport": "prefix_p2p"}},
+        kv_transfer_config=object(),
+    )
+    with (
+        patch("vllm.config.get_current_vllm_config_or_none", return_value=config),
+        pytest.raises(NotImplementedError, match="KV transfer connectors"),
+    ):
+        distributed.ensure_model_parallel_initialized(1, 1, 2, 1)
