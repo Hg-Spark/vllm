@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -29,11 +29,29 @@ from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 
 @dataclass(frozen=True)
 class PCPPagePlan:
-    """Per-step logical segment ownership and deterministic physical pages."""
+    """Per-step logical segment ownership and precompiled physical-page routes."""
 
     segment_to_rank: tuple[int, ...]
     blocks_by_segment: tuple[tuple[int, ...], ...]
     block_size: int
+    _required_sources_by_rank: tuple[tuple[int, ...], ...] = field(
+        init=False, repr=False, compare=False
+    )
+    _required_source_sets_by_rank: tuple[frozenset[int], ...] = field(
+        init=False, repr=False, compare=False
+    )
+    _consumers_by_rank: tuple[tuple[int, ...], ...] = field(
+        init=False, repr=False, compare=False
+    )
+    _transfer_ids_by_rank: tuple[tuple[tuple[int, ...], ...], ...] = field(
+        init=False, repr=False, compare=False
+    )
+    _transfer_arrays_by_rank: tuple[tuple[np.ndarray, ...], ...] = field(
+        init=False, repr=False, compare=False
+    )
+    _transfer_max_by_rank: tuple[tuple[int, ...], ...] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if not self.segment_to_rank:
@@ -42,6 +60,71 @@ class PCPPagePlan:
             raise ValueError("page map must match logical segment count")
         if self.block_size <= 0:
             raise ValueError("page-pull block_size must be positive")
+
+        world_size = self.world_size
+        missing = set(range(world_size)) - set(self.segment_to_rank)
+        if missing:
+            raise ValueError(
+                "page-pull segment map must cover every PCP rank; "
+                f"missing={sorted(missing)}"
+            )
+
+        required_sources_by_rank: list[tuple[int, ...]] = []
+        transfer_ids_by_rank: list[tuple[tuple[int, ...], ...]] = []
+        transfer_arrays_by_rank: list[tuple[np.ndarray, ...]] = []
+        transfer_max_by_rank: list[tuple[int, ...]] = []
+        for rank in range(world_size):
+            owned = [
+                segment_idx
+                for segment_idx, owner in enumerate(self.segment_to_rank)
+                if owner == rank
+            ]
+            max_segment = owned[-1]
+            source_blocks: list[list[int]] = [[] for _ in range(world_size)]
+            source_order: list[int] = []
+            seen_sources: set[int] = set()
+            for segment_idx in range(max_segment):
+                source_rank = self.segment_to_rank[segment_idx]
+                if source_rank == rank:
+                    continue
+                if source_rank not in seen_sources:
+                    seen_sources.add(source_rank)
+                    source_order.append(source_rank)
+                source_blocks[source_rank].extend(self.blocks_by_segment[segment_idx])
+
+            ids_by_source = tuple(tuple(blocks) for blocks in source_blocks)
+            arrays_by_source = tuple(
+                np.asarray(blocks, dtype=np.int64) for blocks in ids_by_source
+            )
+            max_by_source = tuple(
+                max(blocks) if blocks else -1 for blocks in ids_by_source
+            )
+            required_sources_by_rank.append(tuple(source_order))
+            transfer_ids_by_rank.append(ids_by_source)
+            transfer_arrays_by_rank.append(arrays_by_source)
+            transfer_max_by_rank.append(max_by_source)
+
+        required_sources = tuple(required_sources_by_rank)
+        required_source_sets = tuple(frozenset(items) for items in required_sources)
+        consumers = tuple(
+            tuple(
+                rank
+                for rank in range(world_size)
+                if rank != source_rank
+                and source_rank in required_source_sets[rank]
+            )
+            for source_rank in range(world_size)
+        )
+        object.__setattr__(self, "_required_sources_by_rank", required_sources)
+        object.__setattr__(
+            self, "_required_source_sets_by_rank", required_source_sets
+        )
+        object.__setattr__(self, "_consumers_by_rank", consumers)
+        object.__setattr__(self, "_transfer_ids_by_rank", tuple(transfer_ids_by_rank))
+        object.__setattr__(
+            self, "_transfer_arrays_by_rank", tuple(transfer_arrays_by_rank)
+        )
+        object.__setattr__(self, "_transfer_max_by_rank", tuple(transfer_max_by_rank))
 
     @property
     def num_segments(self) -> int:
@@ -73,35 +156,27 @@ class PCPPagePlan:
         )
 
     def required_source_ranks(self, rank: int) -> tuple[int, ...]:
-        return tuple(
-            dict.fromkeys(
-                self.segment_to_rank[segment_idx]
-                for segment_idx in self.required_segments(rank)
-            )
-        )
+        return self._required_sources_by_rank[rank]
+
+    def requires_source(self, rank: int, source_rank: int) -> bool:
+        return source_rank in self._required_source_sets_by_rank[rank]
 
     def consumer_ranks(self, source_rank: int) -> tuple[int, ...]:
-        return tuple(
-            rank
-            for rank in range(self.world_size)
-            if rank != source_rank
-            and source_rank in self.required_source_ranks(rank)
-        )
+        return self._consumers_by_rank[source_rank]
 
     def transfer_block_ids(
         self, destination_rank: int, source_rank: int
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """Return local and remote descriptor IDs for one producer.
-
-        PCP ranks derive the same block allocation from their CPU block-table
-        mirrors, so source and destination descriptor IDs are identical.
-        """
-        block_ids: list[int] = []
-        for segment_idx in self.required_segments(destination_rank):
-            if self.segment_to_rank[segment_idx] == source_rank:
-                block_ids.extend(self.blocks_by_segment[segment_idx])
-        ids = tuple(block_ids)
+        """Return stable local and remote descriptor IDs for one producer."""
+        ids = self._transfer_ids_by_rank[destination_rank][source_rank]
         return ids, ids
+
+    def transfer_block_arrays(
+        self, destination_rank: int, source_rank: int
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        """Return prebuilt int64 descriptor arrays and their maximum block ID."""
+        ids = self._transfer_arrays_by_rank[destination_rank][source_rank]
+        return ids, ids, self._transfer_max_by_rank[destination_rank][source_rank]
 
 
 @dataclass
@@ -158,6 +233,7 @@ class PCPPagePullTransport:
         self._layer_names: tuple[str, ...] = ()
         self._layer_memory: list[_MemoryRegistration] = []
         self._layer_id_by_ptr: dict[int, int] = {}
+        self._ready_events: list[Any | None] = []
         self._remote_layer_handles: dict[tuple[int, int], int] = {}
         self._remote_num_blocks: dict[tuple[int, int], int] = {}
         self._metadata_exchanged = False
@@ -171,6 +247,7 @@ class PCPPagePullTransport:
         self._done_pairs: set[tuple[int, int]] = set()
 
         self._progress_stop = threading.Event()
+        self._progress_wakeup = threading.Event()
         self._progress_thread: threading.Thread | None = None
         self._progress_error: BaseException | None = None
 
@@ -229,6 +306,7 @@ class PCPPagePullTransport:
 
     def configure_step(self, *, epoch: int, plan: PCPPagePlan) -> None:
         self.finish_step()
+        self._check_progress_error()
         if plan.world_size != self.world_size:
             raise ValueError(
                 "page plan PCP world size mismatch: "
@@ -241,14 +319,13 @@ class PCPPagePullTransport:
         self._ready_waiting.clear()
         self._inflight.clear()
         self._done_pairs.clear()
-        self._progress_error = None
         if self._layer_memory:
             self._ensure_remote_agents()
             self._start_progress_thread()
+        self._progress_wakeup.set()
 
     def disable_step(self) -> None:
         self.finish_step()
-        self._plan = None
 
     @staticmethod
     def _block_descriptors(
@@ -269,8 +346,6 @@ class PCPPagePullTransport:
             )
         num_blocks = int(kv_cache.shape[0])
         page_elements = math.prod(kv_cache.shape[1:])
-        # NHD and HND are different logical views of the same dense physical
-        # page. Inner logical contiguity is irrelevant for whole-page NIXL I/O.
         if kv_cache.stride(0) != page_elements:
             raise NotImplementedError(
                 "PCP page_pull requires dense block-major KV pages; "
@@ -408,9 +483,15 @@ class PCPPagePullTransport:
                 registration.base_addr: layer_id
                 for layer_id, registration in enumerate(registrations)
             }
+            self._ready_events = (
+                [torch.cuda.Event() for _ in layer_names]
+                if self.device.type == "cuda"
+                else [None] * len(layer_names)
+            )
         self._exchange_layer_metadata()
+        self._start_progress_thread()
         if self._plan is not None:
-            self._start_progress_thread()
+            self._progress_wakeup.set()
 
     def register_current_layer(self, kv_cache: torch.Tensor) -> int:
         if self._plan is None:
@@ -434,12 +515,12 @@ class PCPPagePullTransport:
             return
         if not 0 <= layer_id < len(self._layer_memory):
             raise ValueError(f"invalid page-pull layer id: {layer_id}")
-        event = None
-        if self.device.type == "cuda":
-            event = torch.cuda.Event()
+        event = self._ready_events[layer_id]
+        if event is not None:
             event.record(torch.cuda.current_stream(self.device))
         self._pending_ready.append(_PendingReady(layer_id=layer_id, event=event))
         self._start_progress_thread()
+        self._progress_wakeup.set()
         self._check_progress_error()
 
     def _send_ready(self, layer_id: int) -> None:
@@ -478,8 +559,8 @@ class PCPPagePullTransport:
                         "PCP page-pull READY epoch mismatch: "
                         f"got={epoch_i}, expected={self._epoch}"
                     )
-                if self._plan is None or source_i not in self._plan.required_source_ranks(
-                    self.rank
+                if self._plan is None or not self._plan.requires_source(
+                    self.rank, source_i
                 ):
                     raise RuntimeError(
                         f"unexpected PCP READY source rank {source_i} for rank {self.rank}"
@@ -491,31 +572,31 @@ class PCPPagePullTransport:
     def _start_read(self, layer_id: int, source_rank: int) -> None:
         assert self._wrapper is not None and self._plan is not None
         local = self._layer_memory[layer_id]
-        destination_ids, source_ids = self._plan.transfer_block_ids(
+        destination_ids, source_ids, max_block_id = self._plan.transfer_block_arrays(
             self.rank, source_rank
         )
         key = (layer_id, source_rank)
-        if not destination_ids:
+        if destination_ids.size == 0:
             self._done_pairs.add(key)
             return
-        if max(destination_ids) >= local.num_blocks:
+        if max_block_id >= local.num_blocks:
             raise RuntimeError(
                 "PCP page-pull destination block id exceeds local cache: "
-                f"max={max(destination_ids)}, num_blocks={local.num_blocks}"
+                f"max={max_block_id}, num_blocks={local.num_blocks}"
             )
         remote_num_blocks = self._remote_num_blocks[(source_rank, layer_id)]
-        if max(source_ids) >= remote_num_blocks:
+        if max_block_id >= remote_num_blocks:
             raise RuntimeError(
                 "PCP page-pull source block id exceeds remote cache: "
-                f"max={max(source_ids)}, num_blocks={remote_num_blocks}"
+                f"max={max_block_id}, num_blocks={remote_num_blocks}"
             )
         with pcp_nvtx_range("pcp.page_pull_read_submit"):
             handle = self._wrapper.make_prepped_xfer(
                 "READ",
                 local.local_xfer_handle,
-                np.asarray(destination_ids, dtype=np.int64),
+                destination_ids,
                 self._remote_layer_handles[(source_rank, layer_id)],
-                np.asarray(source_ids, dtype=np.int64),
+                source_ids,
             )
             self._wrapper.transfer(handle)
         self._inflight[key] = _InflightRead(layer_id, source_rank, handle)
@@ -547,18 +628,24 @@ class PCPPagePullTransport:
     def _progress_loop(self) -> None:
         try:
             while not self._progress_stop.is_set():
+                if self._plan is None:
+                    self._progress_wakeup.wait()
+                    self._progress_wakeup.clear()
+                    continue
                 self._progress_once()
-                time.sleep(self._POLL_INTERVAL_S)
+                self._progress_wakeup.wait(self._POLL_INTERVAL_S)
+                self._progress_wakeup.clear()
         except BaseException as exc:
             self._progress_error = exc
             self._progress_stop.set()
 
     def _start_progress_thread(self) -> None:
-        if self._plan is None or self._progress_thread is not None:
+        if self._progress_thread is not None:
+            return
+        if not self._layer_memory:
             return
         self._ensure_remote_agents()
         self._progress_stop.clear()
-        self._progress_error = None
         self._progress_thread = threading.Thread(
             target=self._progress_loop,
             name=f"pcp-page-pull-r{self.rank}",
@@ -576,14 +663,15 @@ class PCPPagePullTransport:
             self._progress_once()
 
     def wait_layer(self, layer_id: int) -> None:
-        if self._plan is None:
+        plan = self._plan
+        if plan is None:
             return
-        required = {
-            (layer_id, source_rank)
-            for source_rank in self._plan.required_source_ranks(self.rank)
-        }
+        required_sources = plan.required_source_ranks(self.rank)
         with pcp_nvtx_range("pcp.page_pull_wait"):
-            while not required.issubset(self._done_pairs):
+            while any(
+                (layer_id, source_rank) not in self._done_pairs
+                for source_rank in required_sources
+            ):
                 self._check_progress_error()
                 if self._progress_thread is None:
                     self._progress_once()
@@ -593,10 +681,11 @@ class PCPPagePullTransport:
     def _expected_pairs(self) -> set[tuple[int, int]]:
         if self._plan is None:
             return set()
+        required_sources = self._plan.required_source_ranks(self.rank)
         return {
             (layer_id, source_rank)
             for layer_id in range(len(self._layer_memory))
-            for source_rank in self._plan.required_source_ranks(self.rank)
+            for source_rank in required_sources
         }
 
     def finish_step(self) -> None:
@@ -610,16 +699,14 @@ class PCPPagePullTransport:
                     self._progress_once()
                 time.sleep(self._POLL_INTERVAL_S)
 
-        self._progress_stop.set()
-        if self._progress_thread is not None:
-            self._progress_thread.join()
-            self._progress_thread = None
         self._check_progress_error()
         self._pending_ready.clear()
         self._ready_waiting.clear()
         self._inflight.clear()
         self._done_pairs.clear()
+        self._plan = None
         self._step_finished = True
+        self._progress_wakeup.set()
 
 
 __all__ = ["PCPPagePlan", "PCPPagePullTransport"]
