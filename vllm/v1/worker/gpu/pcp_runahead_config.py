@@ -8,9 +8,15 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
-TransportPolicy = Literal["full_kv_collective", "prefix_p2p"]
+TransportPolicy = Literal[
+    "full_kv_collective",
+    "prefix_p2p",
+    "direct_p2p",
+    "page_pull",
+]
 PartitionPolicy = Literal["stock", "equal_contiguous", "weighted_contiguous"]
 LayoutPolicy = Literal["padded", "compact"]
+PagePullBackend = Literal["nixl"]
 
 RUNAHEAD_CONFIG_KEY = "pcp_runahead"
 RUNAHEAD_WEIGHTS_KEY = "pcp_runahead_weights"
@@ -28,13 +34,24 @@ class PCPRunaheadConfig:
     require_full_prefill: bool = True
     min_tokens: int = RUNAHEAD_MIN_PREFILL_TOKENS
     max_inflight_sends: int = 4
+    max_inflight_reads: int = 4
+    page_pull_backend: PagePullBackend = "nixl"
+    nixl_backends: tuple[str, ...] = ("UCX",)
+
+    @property
+    def num_segments(self) -> int:
+        if self.segment_to_rank:
+            return len(self.segment_to_rank)
+        if self.weights is not None:
+            return len(self.weights)
+        return 0
 
 
 def parse_runahead_weights(
     raw: object,
     pcp_world_size: int,
 ) -> tuple[float, ...] | None:
-    """Parse manually supplied positive per-segment load weights."""
+    """Parse legacy one-segment-per-rank positive load weights."""
     if raw is None:
         return None
     if not isinstance(raw, (list, tuple)):
@@ -58,16 +75,21 @@ def parse_runahead_segments(
     raw: object,
     pcp_world_size: int,
 ) -> tuple[tuple[float, ...], tuple[int, ...]] | None:
-    """Parse logical segments and their physical PCP-rank bindings."""
+    """Parse logical segments and physical PCP-rank bindings.
+
+    ``segments`` may contain more entries than physical PCP ranks. Repeated
+    ``pcp_rank`` values are therefore allowed, but every physical rank must own
+    at least one logical segment. Transports that still require a one-to-one
+    mapping reject repetitions later in ``parse_pcp_runahead_config``.
+    """
     if raw is None:
         return None
     if not isinstance(raw, (list, tuple)):
+        raise ValueError("segments must be a JSON list of objects")
+    if len(raw) < pcp_world_size:
         raise ValueError(
-            f"segments must be a JSON list with {pcp_world_size} objects"
-        )
-    if len(raw) != pcp_world_size:
-        raise ValueError(
-            f"segments requires {pcp_world_size} entries, got {len(raw)}: {raw}"
+            "segments must contain at least one logical segment per PCP rank: "
+            f"segments={len(raw)}, pcp_world_size={pcp_world_size}"
         )
 
     weights: list[float] = []
@@ -110,17 +132,33 @@ def parse_runahead_segments(
         weights.append(weight)
         segment_to_rank.append(pcp_rank)
 
-    expected_ranks = list(range(pcp_world_size))
-    if sorted(segment_to_rank) != expected_ranks:
+    present = set(segment_to_rank)
+    expected = set(range(pcp_world_size))
+    if present != expected:
+        missing = sorted(expected - present)
         raise ValueError(
-            "segments[].pcp_rank must be a permutation of PCP ranks "
-            f"{expected_ranks}, got {segment_to_rank}"
+            "segments[].pcp_rank must cover every PCP rank at least once; "
+            f"missing={missing}, mapping={segment_to_rank}"
         )
     return tuple(weights), tuple(segment_to_rank)
 
 
+def is_rank_permutation(
+    segment_to_rank: tuple[int, ...], pcp_world_size: int
+) -> bool:
+    return len(segment_to_rank) == pcp_world_size and sorted(segment_to_rank) == list(
+        range(pcp_world_size)
+    )
+
+
 def invert_segment_to_rank(segment_to_rank: tuple[int, ...]) -> tuple[int, ...]:
-    """Return physical-rank -> logical-segment mapping for a rank permutation."""
+    """Return physical-rank -> logical-segment mapping for a permutation.
+
+    Repeated bindings intentionally have no single inverse. Callers supporting
+    repeated ownership should build ``segments_by_rank`` instead.
+    """
+    if len(set(segment_to_rank)) != len(segment_to_rank):
+        raise ValueError("segment_to_rank is not invertible because ranks repeat")
     rank_to_segment = [0] * len(segment_to_rank)
     for segment_idx, rank in enumerate(segment_to_rank):
         rank_to_segment[rank] = segment_idx
@@ -133,6 +171,15 @@ def _mapping(raw: object, name: str) -> dict:
     if not isinstance(raw, dict):
         raise ValueError(f"{name} must be a JSON object")
     return raw
+
+
+def _string_tuple(raw: object, name: str) -> tuple[str, ...]:
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError(f"{name} must be a non-empty JSON list of strings")
+    values = tuple(raw)
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError(f"{name} must contain only non-empty strings: {raw}")
+    return values
 
 
 def parse_pcp_runahead_config(
@@ -193,8 +240,16 @@ def parse_pcp_runahead_config(
     require_full_prefill = eligibility.get("require_full_prefill", True)
     min_tokens = eligibility.get("min_tokens", RUNAHEAD_MIN_PREFILL_TOKENS)
     max_inflight_sends = runtime.get("max_inflight_sends", 4)
+    max_inflight_reads = runtime.get("max_inflight_reads", 4)
+    page_pull_backend = runtime.get("page_pull_backend", "nixl")
+    nixl_backends = _string_tuple(runtime.get("nixl_backends", ["UCX"]), "runtime.nixl_backends")
 
-    if transport not in ("full_kv_collective", "prefix_p2p"):
+    if transport not in (
+        "full_kv_collective",
+        "prefix_p2p",
+        "direct_p2p",
+        "page_pull",
+    ):
         raise ValueError(f"unsupported PCP runahead transport: {transport!r}")
     if partition_policy not in (
         "stock",
@@ -204,6 +259,8 @@ def parse_pcp_runahead_config(
         raise ValueError(f"unsupported PCP partition policy: {partition_policy!r}")
     if layout not in ("padded", "compact"):
         raise ValueError(f"unsupported PCP layout: {layout!r}")
+    if page_pull_backend != "nixl":
+        raise ValueError(f"unsupported PCP page-pull backend: {page_pull_backend!r}")
     if not isinstance(page_align, bool):
         raise ValueError("partition.page_align must be boolean")
     if not isinstance(require_full_prefill, bool):
@@ -220,6 +277,12 @@ def parse_pcp_runahead_config(
         or max_inflight_sends <= 0
     ):
         raise ValueError("runtime.max_inflight_sends must be a positive integer")
+    if (
+        not isinstance(max_inflight_reads, int)
+        or isinstance(max_inflight_reads, bool)
+        or max_inflight_reads <= 0
+    ):
+        raise ValueError("runtime.max_inflight_reads must be a positive integer")
 
     if partition_policy == "weighted_contiguous" and weights is None:
         raise ValueError("weighted_contiguous partition requires weights or segments")
@@ -234,15 +297,27 @@ def parse_pcp_runahead_config(
                 "stock partition is only supported with "
                 "transport=full_kv_collective and layout=padded"
             )
-    if transport == "prefix_p2p":
+
+    permutation = is_rank_permutation(segment_to_rank, pcp_world_size)
+    if transport != "page_pull" and not permutation:
+        raise ValueError(
+            f"transport={transport} currently requires one logical segment per "
+            "PCP rank; repeated segment bindings require transport=page_pull"
+        )
+
+    if transport in ("prefix_p2p", "direct_p2p", "page_pull"):
         if partition_policy == "stock":
-            raise ValueError("prefix_p2p requires a contiguous partition")
+            raise ValueError(f"{transport} requires a contiguous partition")
         if layout != "compact":
-            raise ValueError("prefix_p2p requires layout=compact")
+            raise ValueError(f"{transport} requires layout=compact")
         if not require_full_prefill:
             raise ValueError(
-                "prefix_p2p currently requires eligibility.require_full_prefill=true"
+                f"{transport} currently requires "
+                "eligibility.require_full_prefill=true"
             )
+
+    if transport == "page_pull" and not page_align:
+        raise ValueError("page_pull requires partition.page_align=true")
 
     return PCPRunaheadConfig(
         transport=transport,
@@ -254,4 +329,7 @@ def parse_pcp_runahead_config(
         require_full_prefill=require_full_prefill,
         min_tokens=min_tokens,
         max_inflight_sends=max_inflight_sends,
+        max_inflight_reads=max_inflight_reads,
+        page_pull_backend=page_pull_backend,
+        nixl_backends=nixl_backends,
     )
