@@ -4,21 +4,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 from dataclasses import dataclass
-from typing import Any, ClassVar
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed.parallel_state import (
-    get_pcp_group,
-    get_world_group,
-    init_model_parallel_group,
-)
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.ops.pcp_page_pull import PCPPagePlan
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
@@ -31,8 +24,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
 from vllm.v1.worker.gpu.pcp_runahead_config import (
     RUNAHEAD_MIN_PREFILL_TOKENS,
-    RUNAHEAD_WEIGHTS_KEY,
-    PCPRunaheadConfig,
     parse_pcp_runahead_config,
     parse_runahead_weights,
 )
@@ -40,8 +31,13 @@ from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
 
-_RUNAHEAD_PCP_GROUP: Any | None = None
-_RUNAHEAD_PCP_GROUP_ORDER: tuple[int, ...] | None = None
+
+@dataclass(frozen=True)
+class LogicalSegment:
+    global_batch_req_idx: int
+    start_pos: int
+    end_pos: int
+    owner_rank: int
 
 
 @dataclass(frozen=True)
@@ -50,9 +46,7 @@ class SegmentLayout:
 
     segments_by_rank: tuple[tuple[RankSegment, ...], ...]
     rows_per_rank: tuple[int, ...]
-    rows_per_segment: tuple[int, ...]
-    logical_segment_slices: tuple[tuple[slice, ...], ...]
-    boundaries_aligned: bool
+    logical_segments: tuple[tuple[LogicalSegment, ...], ...]
 
 
 def weighted_partition_lengths(
@@ -107,8 +101,7 @@ def weighted_partition_lengths(
         boundaries.append(candidate_abs - start_pos)
     boundaries.append(num_tokens)
     return tuple(
-        boundaries[index + 1] - boundaries[index]
-        for index in range(num_segments)
+        boundaries[index + 1] - boundaries[index] for index in range(num_segments)
     )
 
 
@@ -136,48 +129,7 @@ def runahead_batch_eligible(
     return total_prefill_tokens >= max(pcp_world_size, min_prefill_tokens)
 
 
-def _build_logical_pcp_group(config: PCPRunaheadConfig):
-    """Build a communicator whose rank order is logical segment order."""
-    base = get_pcp_group()
-    if not config.mapping_is_permutation or config.process_group_order == tuple(
-        range(config.pcp_world_size)
-    ):
-        return base
-
-    global _RUNAHEAD_PCP_GROUP, _RUNAHEAD_PCP_GROUP_ORDER
-    order = config.process_group_order
-    if _RUNAHEAD_PCP_GROUP is not None:
-        if _RUNAHEAD_PCP_GROUP_ORDER != order:
-            raise RuntimeError(
-                "PCP runahead process-group order changed in one process: "
-                f"old={_RUNAHEAD_PCP_GROUP_ORDER}, new={order}"
-            )
-        return _RUNAHEAD_PCP_GROUP
-
-    world = get_world_group()
-    if world.world_size % config.pcp_world_size != 0:
-        raise RuntimeError(
-            "world size is not divisible by PCP size for runahead group binding"
-        )
-    groups = []
-    for first in range(0, world.world_size, config.pcp_world_size):
-        natural = list(range(first, first + config.pcp_world_size))
-        groups.append([natural[physical_rank] for physical_rank in order])
-
-    backend = torch.distributed.get_backend(base.device_group)
-    _RUNAHEAD_PCP_GROUP = init_model_parallel_group(
-        groups,
-        world.local_rank,
-        backend,
-        group_name="pcp_runahead",
-    )
-    _RUNAHEAD_PCP_GROUP_ORDER = order
-    return _RUNAHEAD_PCP_GROUP
-
-
 class RunaheadPCPManager(PCPManager):
-    _validated_config: ClassVar[PCPRunaheadConfig | None] = None
-
     def __init__(
         self,
         pcp_world_size: int,
@@ -191,13 +143,13 @@ class RunaheadPCPManager(PCPManager):
         dcp_rank: int = 0,
         cp_interleave: int = 1,
     ) -> None:
-        config = type(self)._validated_config
+        vllm_config = get_current_vllm_config()
+        config = parse_pcp_runahead_config(
+            vllm_config.additional_config, pcp_world_size
+        )
         if config is None:
-            raise RuntimeError("PCP runahead manager was built without validated config")
+            raise RuntimeError("PCP runahead manager requires an enabled config")
         self._config = config
-        self._physical_pcp_rank = pcp_rank
-        self._pcp_group = _build_logical_pcp_group(config)
-        self._logical_pcp_rank = self._pcp_group.rank_in_group
 
         super().__init__(
             pcp_world_size=pcp_world_size,
@@ -233,29 +185,17 @@ class RunaheadPCPManager(PCPManager):
                 f"group, got {block_tables.num_kv_cache_groups}"
             )
 
-        self._rows_per_rank: tuple[int, ...] = ()
-        self._logical_segment_slices: tuple[tuple[slice, ...], ...] = ()
         self._sharded_kv_history = False
-        runtime_rank = (
-            self._logical_pcp_rank if config.mapping_is_permutation else pcp_rank
-        )
-        runtime_group = self._pcp_group if config.mapping_is_permutation else get_pcp_group()
         self._runahead_runtime = PCPRunaheadRuntime(
             pcp_world_size=pcp_world_size,
-            pcp_rank=runtime_rank,
+            pcp_rank=pcp_rank,
             device=device,
             max_inflight_sends=config.max_inflight_sends,
             max_inflight_reads=config.max_inflight_reads,
             nixl_backends=config.nixl_backends,
-            pcp_group=runtime_group,
+            pcp_group=get_pcp_group(),
         )
         register_pcp_runahead_runtime(self._runahead_runtime)
-        if config.transport == "page_pull":
-            from vllm.v1.attention.ops.pcp_standard import (
-                install_page_pull_cache_update_hook,
-            )
-
-            install_page_pull_cache_update_hook()
         self._resize_local_request_buffers_if_needed(
             max_num_reqs=max_num_reqs,
             max_num_tokens=max_num_tokens,
@@ -266,12 +206,6 @@ class RunaheadPCPManager(PCPManager):
     def _compact_layout_enabled(self) -> bool:
         return self._use_compact_layout
 
-    def _get_batch_pcp_group(self):
-        return self._pcp_group if self._use_compact_layout else get_pcp_group()
-
-    def _effective_segment_to_rank(self) -> tuple[int, ...]:
-        return self._config.runtime_segment_to_rank
-
     def _resize_local_request_buffers_if_needed(
         self,
         *,
@@ -280,7 +214,7 @@ class RunaheadPCPManager(PCPManager):
         block_tables: BlockTables | None,
         device: torch.device,
     ) -> None:
-        mapping = self._effective_segment_to_rank()
+        mapping = self._config.logical_segment_to_rank
         max_segments_per_rank = max(
             mapping.count(rank) for rank in range(self.pcp_world_size)
         )
@@ -320,7 +254,6 @@ class RunaheadPCPManager(PCPManager):
         )
         if config is None:
             raise ValueError("pcp_runahead manager requires an enabled config")
-        cls._validated_config = config
 
         if model.use_mla:
             raise NotImplementedError("PCP runahead currently supports standard attention only")
@@ -357,24 +290,23 @@ class RunaheadPCPManager(PCPManager):
                 )
 
     def _partition_lengths(self, query_len: int, start_pos: int = 0) -> tuple[int, ...]:
-        weights = self._config.weights or (1.0,) * self.pcp_world_size
         return weighted_partition_lengths(
             query_len,
-            weights,
+            self._config.weights,
             start_pos=start_pos,
             alignment=self._page_alignment,
         )
 
-    def _compile_segment_layout(self, input_batch: InputBatch) -> SegmentLayout:
-        mapping = self._effective_segment_to_rank()
+    def _compile_segment_layout(self, input_batch: InputBatch) -> SegmentLayout | None:
+        mapping = self._config.logical_segment_to_rank
         num_segments = len(mapping)
         segments_by_rank: list[list[RankSegment]] = [
             [] for _ in range(self.pcp_world_size)
         ]
-        logical_slices: list[list[slice]] = [[] for _ in range(num_segments)]
+        logical_segments: list[list[LogicalSegment]] = [
+            [] for _ in range(num_segments)
+        ]
         rank_rows = [0] * self.pcp_world_size
-        segment_rows = [0] * num_segments
-        aligned = True
 
         for req_idx, num_tokens in enumerate(
             input_batch.num_scheduled_tokens[: input_batch.num_reqs]
@@ -389,6 +321,7 @@ class RunaheadPCPManager(PCPManager):
             absolute = start_pos
             for segment_idx, length in enumerate(lengths):
                 next_offset = offset + length
+                end_pos = absolute + length
                 owner = mapping[segment_idx]
                 if length > 0:
                     global_slice = slice(
@@ -404,20 +337,28 @@ class RunaheadPCPManager(PCPManager):
                             ),
                         )
                     )
-                    logical_slices[segment_idx].append(global_slice)
+                    logical_segments[segment_idx].append(
+                        LogicalSegment(
+                            global_batch_req_idx=req_idx,
+                            start_pos=absolute,
+                            end_pos=end_pos,
+                            owner_rank=owner,
+                        )
+                    )
                     rank_rows[owner] += length
-                    segment_rows[segment_idx] += length
+                if (
+                    segment_idx + 1 < num_segments
+                    and self._page_alignment > 1
+                    and end_pos % self._page_alignment != 0
+                ):
+                    return None
                 offset = next_offset
-                absolute += length
-                if segment_idx + 1 < num_segments and self._page_alignment > 1:
-                    aligned = aligned and absolute % self._page_alignment == 0
+                absolute = end_pos
 
         return SegmentLayout(
             segments_by_rank=tuple(tuple(items) for items in segments_by_rank),
             rows_per_rank=tuple(rank_rows),
-            rows_per_segment=tuple(segment_rows),
-            logical_segment_slices=tuple(tuple(items) for items in logical_slices),
-            boundaries_aligned=aligned,
+            logical_segments=tuple(tuple(items) for items in logical_segments),
         )
 
     def _get_rank_segments(
@@ -456,6 +397,11 @@ class RunaheadPCPManager(PCPManager):
             min_prefill_tokens=self._config.min_tokens,
         )
         layout = self._compile_segment_layout(input_batch) if eligible else None
+        if eligible and layout is None:
+            logger.debug(
+                "PCP page_pull falling back because a segment boundary is off-page"
+            )
+            eligible = False
         if layout is not None and any(rows <= 0 for rows in layout.rows_per_rank):
             logger.debug(
                 "PCP runahead partition produced an empty rank; falling back: rows=%s",
@@ -463,98 +409,57 @@ class RunaheadPCPManager(PCPManager):
             )
             eligible = False
             layout = None
-        if (
-            layout is not None
-            and self._config.transport == "page_pull"
-            and not layout.boundaries_aligned
-        ):
-            logger.debug("PCP page_pull falling back because a segment boundary is off-page")
-            eligible = False
-            layout = None
 
         self._use_custom_partition = eligible
         self._active_layout = layout
         self._use_compact_layout = eligible
         self._step_transport = self._config.transport if eligible else None
-        self.pcp_rank = (
-            self._logical_pcp_rank
-            if eligible and self._config.mapping_is_permutation
-            else self._physical_pcp_rank
-        )
 
         local_batch = super().partition_batch(input_batch)
         if not eligible or layout is None:
-            self._rows_per_rank = ()
-            self._logical_segment_slices = ()
             self._runahead_runtime.disable_step()
             return local_batch
 
-        self._rows_per_rank = layout.rows_per_rank
-        self._logical_segment_slices = layout.logical_segment_slices
         self._runahead_runtime.begin_step(
             layout.rows_per_rank,
             transport=self._config.transport,
         )
         return local_batch
 
-    @staticmethod
-    def _blocks_from_segment_slots(
-        slots: torch.Tensor,
-        *,
-        block_size: int,
-    ) -> tuple[int, ...]:
-        if slots.numel() == 0:
-            return ()
-        if bool((slots < 0).any()):
-            raise RuntimeError("PCP page_pull encountered PAD slot inside a segment")
-        block_ids = torch.div(slots, block_size, rounding_mode="floor")
-        return tuple(int(value) for value in torch.unique_consecutive(block_ids).cpu())
-
-    def _verify_page_mapping_invariant(
-        self, blocks_by_segment: tuple[tuple[int, ...], ...]
-    ) -> None:
-        payload = repr(blocks_by_segment).encode("utf-8")
-        fingerprint = int.from_bytes(
-            hashlib.blake2b(payload, digest_size=8).digest(), "little"
-        ) & ((1 << 63) - 1)
-        local = torch.tensor([fingerprint], dtype=torch.int64, device="cpu")
-        gathered = [torch.empty_like(local) for _ in range(self.pcp_world_size)]
-        dist.all_gather(gathered, local, group=self._pcp_group.cpu_group)
-        values = [int(item.item()) for item in gathered]
-        if len(set(values)) != 1:
-            raise RuntimeError(
-                "PCP page_pull requires identical global block allocation across ranks; "
-                f"fingerprints={values}"
-            )
-
     def _configure_page_pull_plan(self) -> None:
         if self._config.transport != "page_pull":
             return
-        if not self._logical_segment_slices:
-            raise RuntimeError("PCP page_pull has no logical segment slices")
-        if self._block_tables is None or self._global_batch_slot_mappings is None:
-            raise RuntimeError("PCP page_pull requires block tables and global slots")
-        if self._block_tables.num_kv_cache_groups != 1:
+        layout = self._active_layout
+        global_batch = self._global_batch
+        block_tables = self._block_tables
+        if layout is None or global_batch is None:
+            raise RuntimeError("PCP page_pull has no active segment layout")
+        if block_tables is None:
+            raise RuntimeError("PCP page_pull requires block tables")
+        if block_tables.num_kv_cache_groups != 1:
             raise RuntimeError("PCP page_pull currently requires one KV cache group")
 
-        block_size = int(self._block_tables.kernel_block_sizes[0])
-        global_slots = self._global_batch_slot_mappings[0]
+        block_size = int(block_tables.kernel_block_sizes[0])
         blocks_by_segment: list[tuple[int, ...]] = []
-        for segment_slices in self._logical_segment_slices:
+        for pieces in layout.logical_segments:
             blocks: list[int] = []
-            for segment_slice in segment_slices:
+            for piece in pieces:
+                req_state_idx = int(
+                    global_batch.idx_mapping_np[piece.global_batch_req_idx]
+                )
+                start_block = piece.start_pos // block_size
+                end_block = (piece.end_pos + block_size - 1) // block_size
                 blocks.extend(
-                    self._blocks_from_segment_slots(
-                        global_slots[segment_slice], block_size=block_size
+                    block_tables.get_block_ids_cpu(
+                        0, req_state_idx, start_block, end_block
                     )
                 )
             blocks_by_segment.append(tuple(blocks))
-        blocks = tuple(blocks_by_segment)
-        self._verify_page_mapping_invariant(blocks)
+
         self._runahead_runtime.configure_page_plan(
             PCPPagePlan(
-                segment_to_rank=self._effective_segment_to_rank(),
-                blocks_by_segment=blocks,
+                segment_to_rank=self._config.logical_segment_to_rank,
+                blocks_by_segment=tuple(blocks_by_segment),
                 block_size=block_size,
             )
         )
@@ -580,8 +485,8 @@ class RunaheadPCPManager(PCPManager):
 
 
 __all__ = [
+    "LogicalSegment",
     "RUNAHEAD_MIN_PREFILL_TOKENS",
-    "RUNAHEAD_WEIGHTS_KEY",
     "RunaheadPCPManager",
     "SegmentLayout",
     "parse_runahead_weights",
