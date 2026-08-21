@@ -80,9 +80,34 @@ def test_page_pull_ready_is_published_before_attention() -> None:
 
     with (
         patch(
-            "vllm.v1.attention.ops.pcp_runahead.get_pcp_runahead_runtime",
+            "vllm.model_executor.layers.attention.kv_transfer_utils.get_pcp_runahead_runtime",
             return_value=runtime,
         ),
+        patch(
+            "vllm.model_executor.layers.attention.kv_transfer_utils.has_kv_transfer_group",
+            return_value=False,
+        ),
+        patch(
+            "vllm.model_executor.layers.attention.attention.get_attention_context",
+            return_value=(None, MagicMock(), kv_cache, torch.tensor([0])),
+        ),
+    ):
+        wrapped = maybe_transfer_kv_layer(attention)
+        assert wrapped("layer") == "layer"
+
+    runtime.page_pull_after_cache_write.assert_called_once_with(kv_cache)
+    assert order == ["ready", "attention"]
+
+
+def test_page_pull_skips_post_write_when_native_update_is_skipped() -> None:
+    kv_cache = _flash_kv_cache()
+    runtime = MagicMock()
+    runtime.transport = "page_pull"
+
+    def attention(layer_name: str) -> str:
+        return layer_name
+
+    with (
         patch(
             "vllm.model_executor.layers.attention.kv_transfer_utils.get_pcp_runahead_runtime",
             return_value=runtime,
@@ -96,11 +121,9 @@ def test_page_pull_ready_is_published_before_attention() -> None:
             return_value=(None, MagicMock(), kv_cache, None),
         ),
     ):
-        wrapped = maybe_transfer_kv_layer(attention)
-        assert wrapped("layer") == "layer"
+        assert maybe_transfer_kv_layer(attention)("layer") == "layer"
 
-    runtime.page_pull_after_cache_write.assert_called_once_with(kv_cache)
-    assert order == ["ready", "attention"]
+    runtime.page_pull_after_cache_write.assert_not_called()
 
 
 def test_standard_compact_full_kv_collective_uses_allgatherv_for_variable_width() -> None:
