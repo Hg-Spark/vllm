@@ -13,24 +13,35 @@ def ensure_model_parallel_initialized(
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
 ) -> None:
-    """Initialize model-parallel groups, applying PCP runahead rank binding once.
-
-    A one-to-one runahead segment permutation changes the member order of the
-    primary PCP group during startup. No second PCP communicator is created.
-    """
+    """Initialize model-parallel groups with runahead PCP ordering at startup."""
     from vllm.config import get_current_vllm_config_or_none
-    from vllm.v1.worker.gpu.pcp_runahead_config import get_pcp_process_group_order
+    from vllm.v1.worker.gpu.pcp_runahead_config import parse_pcp_runahead_config
 
-    from . import parallel_state as _parallel_state
+    from . import parallel_state as ps
 
-    config = get_current_vllm_config_or_none()
-    if config is None or prefill_context_model_parallel_size <= 1:
-        return _parallel_state.ensure_model_parallel_initialized(
+    def initialize() -> None:
+        ps.ensure_model_parallel_initialized(
             tensor_model_parallel_size,
             pipeline_model_parallel_size,
             prefill_context_model_parallel_size,
             decode_context_model_parallel_size,
             backend,
+        )
+
+    config = get_current_vllm_config_or_none()
+    if config is None or prefill_context_model_parallel_size <= 1:
+        initialize()
+        return
+
+    runahead = parse_pcp_runahead_config(
+        config.additional_config, prefill_context_model_parallel_size
+    )
+    if runahead is None:
+        initialize()
+        return
+    if config.kv_transfer_config is not None:
+        raise NotImplementedError(
+            "PCP runahead does not support request-level KV transfer connectors"
         )
 
     parallel = config.parallel_config
@@ -41,49 +52,31 @@ def ensure_model_parallel_initialized(
         and (decode_context_model_parallel_size or 1) == 1
     )
     order = (
-        get_pcp_process_group_order(
-            config.additional_config, prefill_context_model_parallel_size
-        )
-        if supported_layout
+        runahead.segment_to_rank
+        if supported_layout and runahead.mapping_is_permutation
         else tuple(range(prefill_context_model_parallel_size))
     )
     if order == tuple(range(prefill_context_model_parallel_size)):
-        return _parallel_state.ensure_model_parallel_initialized(
-            tensor_model_parallel_size,
-            pipeline_model_parallel_size,
-            prefill_context_model_parallel_size,
-            decode_context_model_parallel_size,
-            backend,
-        )
+        initialize()
+        return
 
-    original_init_group = _parallel_state.init_model_parallel_group
+    original_init_group = ps.init_model_parallel_group
 
-    def _init_group(*args, **kwargs):
-        group_name = kwargs.get("group_name")
-        if group_name == "pcp":
+    def init_group(*args, **kwargs):
+        if kwargs.get("group_name") == "pcp":
+            group_ranks = args[0] if args else kwargs["group_ranks"]
+            group_ranks = [
+                [ranks[physical_rank] for physical_rank in order]
+                for ranks in group_ranks
+            ]
             if args:
-                group_ranks = args[0]
-                group_ranks = [
-                    [ranks[physical_rank] for physical_rank in order]
-                    for ranks in group_ranks
-                ]
                 args = (group_ranks, *args[1:])
             else:
-                group_ranks = kwargs["group_ranks"]
-                kwargs["group_ranks"] = [
-                    [ranks[physical_rank] for physical_rank in order]
-                    for ranks in group_ranks
-                ]
+                kwargs["group_ranks"] = group_ranks
         return original_init_group(*args, **kwargs)
 
-    _parallel_state.init_model_parallel_group = _init_group
+    ps.init_model_parallel_group = init_group
     try:
-        _parallel_state.ensure_model_parallel_initialized(
-            tensor_model_parallel_size,
-            pipeline_model_parallel_size,
-            prefill_context_model_parallel_size,
-            decode_context_model_parallel_size,
-            backend,
-        )
+        initialize()
     finally:
-        _parallel_state.init_model_parallel_group = original_init_group
+        ps.init_model_parallel_group = original_init_group
