@@ -17,7 +17,6 @@ from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_name
 from vllm.v1.attention.ops.pcp_runahead import PCPRunaheadRuntime
 from vllm.v1.worker.gpu.pcp_runahead_config import (
     PCPRunaheadConfig,
-    get_pcp_process_group_order,
     parse_pcp_runahead_config,
 )
 from vllm.v1.worker.gpu.pcp_runahead_manager import (
@@ -82,49 +81,51 @@ def test_config_parses_only_runtime_axes() -> None:
     assert config.max_inflight_sends == 3
 
 
-def test_permutation_is_compiled_into_process_group_order() -> None:
-    raw = {
-        "pcp_runahead": {
-            "transport": "direct_p2p",
-            "partition": {
-                "segments": [
-                    {"weight": 3, "pcp_rank": 1},
-                    {"weight": 1, "pcp_rank": 0},
-                ]
-            },
-        }
-    }
-    config = parse_pcp_runahead_config(raw, 2)
+def test_permutation_becomes_logical_identity_after_primary_group_order() -> None:
+    config = parse_pcp_runahead_config(
+        {
+            "pcp_runahead": {
+                "transport": "direct_p2p",
+                "partition": {
+                    "segments": [
+                        {"weight": 3, "pcp_rank": 1},
+                        {"weight": 1, "pcp_rank": 0},
+                    ]
+                },
+            }
+        },
+        2,
+    )
     assert config is not None
     assert config.weights == (3.0, 1.0)
     assert config.segment_to_rank == (1, 0)
-    assert get_pcp_process_group_order(raw, 2) == (1, 0)
     assert config.logical_segment_to_rank == (0, 1)
 
 
 def test_page_pull_keeps_repeated_rank_binding_in_plan_space() -> None:
-    raw = {
-        "pcp_runahead": {
-            "transport": "page_pull",
-            "partition": {
-                "segments": [
-                    {"pcp_rank": 1},
-                    {"pcp_rank": 0},
-                    {"pcp_rank": 1},
-                ]
-            },
-            "runtime": {
-                "max_inflight_reads": 2,
-                "nixl_backends": ["UCX"],
-            },
-        }
-    }
-    config = parse_pcp_runahead_config(raw, 2)
+    config = parse_pcp_runahead_config(
+        {
+            "pcp_runahead": {
+                "transport": "page_pull",
+                "partition": {
+                    "segments": [
+                        {"pcp_rank": 1},
+                        {"pcp_rank": 0},
+                        {"pcp_rank": 1},
+                    ]
+                },
+                "runtime": {
+                    "max_inflight_reads": 2,
+                    "nixl_backends": ["UCX"],
+                },
+            }
+        },
+        2,
+    )
     assert config is not None
     assert not config.mapping_is_permutation
     assert config.segment_to_rank == (1, 0, 1)
     assert config.logical_segment_to_rank == (1, 0, 1)
-    assert get_pcp_process_group_order(raw, 2) == (0, 1)
     assert config.max_inflight_reads == 2
 
 
