@@ -36,6 +36,7 @@ def _manager(world_size: int) -> RunaheadPCPManager:
     manager._active_layout = None
     manager._config = PCPRunaheadConfig(
         pcp_world_size=world_size,
+        transport="prefix_p2p",
         weights=(1.0,) * world_size,
         segment_to_rank=tuple(range(world_size)),
     )
@@ -58,21 +59,13 @@ def _batch(
     )
 
 
-def test_config_derives_compact_full_prefill_invariants() -> None:
+def test_config_parses_only_runtime_axes() -> None:
     config = parse_pcp_runahead_config(
         {
             "pcp_runahead": {
                 "transport": "full_kv_collective",
-                "partition": {
-                    "policy": "weighted_contiguous",
-                    "weights": [4, 2.5, 1.9, 1.6],
-                    "page_align": True,
-                },
-                "layout": "compact",
-                "eligibility": {
-                    "require_full_prefill": True,
-                    "min_tokens": 2048,
-                },
+                "partition": {"weights": [4, 2.5, 1.9, 1.6]},
+                "eligibility": {"min_tokens": 2048},
                 "runtime": {"max_inflight_sends": 3},
             }
         },
@@ -119,8 +112,7 @@ def test_page_pull_keeps_repeated_rank_binding_in_plan_space() -> None:
                         {"pcp_rank": 1},
                         {"pcp_rank": 0},
                         {"pcp_rank": 1},
-                    ],
-                    "page_align": True,
+                    ]
                 },
                 "runtime": {
                     "max_inflight_reads": 2,
@@ -156,45 +148,41 @@ def test_tensor_transport_rejects_repeated_rank_binding() -> None:
         )
 
 
-def test_derived_invariants_reject_old_experiment_modes() -> None:
-    with pytest.raises(ValueError, match="partition.policy"):
-        parse_pcp_runahead_config(
+@pytest.mark.parametrize(
+    "config,match",
+    [
+        (
+            {"transport": "prefix_p2p", "partition": {"policy": "stock"}},
+            "unsupported partition keys",
+        ),
+        (
+            {"transport": "prefix_p2p", "layout": "padded"},
+            "unsupported pcp_runahead keys",
+        ),
+        (
             {
-                "pcp_runahead": {
-                    "transport": "prefix_p2p",
-                    "partition": {"policy": "stock"},
-                }
+                "transport": "prefix_p2p",
+                "eligibility": {"require_full_prefill": False},
             },
-            4,
-        )
-    with pytest.raises(ValueError, match="layout=compact"):
-        parse_pcp_runahead_config(
-            {"pcp_runahead": {"transport": "prefix_p2p", "layout": "padded"}},
-            4,
-        )
-    with pytest.raises(ValueError, match="require_full_prefill=true"):
-        parse_pcp_runahead_config(
+            "unsupported eligibility keys",
+        ),
+        (
             {
-                "pcp_runahead": {
-                    "transport": "prefix_p2p",
-                    "eligibility": {"require_full_prefill": False},
-                }
+                "transport": "page_pull",
+                "partition": {"page_align": False},
             },
-            4,
-        )
+            "unsupported partition keys",
+        ),
+    ],
+)
+def test_obsolete_experiment_axes_are_rejected(config: dict, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        parse_pcp_runahead_config({"pcp_runahead": config}, 4)
 
 
-def test_legacy_config_is_rejected() -> None:
-    with pytest.raises(ValueError, match="must be a JSON object"):
+def test_boolean_config_is_rejected() -> None:
+    with pytest.raises(ValueError, match="non-empty JSON object"):
         parse_pcp_runahead_config({"pcp_runahead": True}, 4)
-    with pytest.raises(ValueError, match="partition.weights"):
-        parse_pcp_runahead_config(
-            {
-                "pcp_runahead": {"transport": "prefix_p2p"},
-                "pcp_runahead_weights": [4, 2, 1, 1],
-            },
-            4,
-        )
 
 
 def test_segment_layout_is_compiled_once_for_all_ranks() -> None:
@@ -247,7 +235,7 @@ def test_repeated_binding_builds_multiple_local_segments() -> None:
 
 def test_manual_weights_parse_and_validate() -> None:
     assert parse_runahead_weights([4, 2.5, 1.9, 1.6], 4) == (4.0, 2.5, 1.9, 1.6)
-    with pytest.raises(ValueError, match="requires 4 values"):
+    with pytest.raises(ValueError, match="requires 4"):
         parse_runahead_weights([1, 1], 4)
     with pytest.raises(ValueError, match="finite and positive"):
         parse_runahead_weights([1, 1, 0, 1], 4)
