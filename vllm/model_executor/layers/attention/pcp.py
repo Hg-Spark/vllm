@@ -10,6 +10,13 @@ from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 from vllm.v1.attention.ops.pcp_runahead import get_pcp_runahead_runtime
 
 
+_MLA_RUNAHEAD_RANGES = {
+    "full_kv_collective": "pcp.mla_full_kv_exchange",
+    "prefix_p2p": "pcp.mla_prefix_exchange",
+    "direct_p2p": "pcp.mla_direct_exchange",
+}
+
+
 def _gather_prefill_cache_inputs(
     tensors: tuple[torch.Tensor, ...],
     slot_mapping: torch.Tensor,
@@ -60,33 +67,18 @@ def _exchange_runahead_cache_inputs(
     runtime = get_pcp_runahead_runtime()
     if runtime is None:
         return None
-    if runtime.transport == "full_kv_collective":
-        with pcp_nvtx_range(
-            "pcp.mla_full_kv_exchange",
-            e=runtime.epoch,
-            rank=runtime.rank,
-            rows=runtime.local_rows,
-        ):
-            return runtime.exchange_full(tensors, slot_mapping)
-    if runtime.transport == "prefix_p2p":
-        with pcp_nvtx_range(
-            "pcp.mla_prefix_exchange",
-            e=runtime.epoch,
-            rank=runtime.rank,
-            rows=runtime.local_rows,
-        ):
-            return runtime.exchange_prefix(tensors, slot_mapping)
-    if runtime.transport == "direct_p2p":
-        with pcp_nvtx_range(
-            "pcp.mla_direct_exchange",
-            e=runtime.epoch,
-            rank=runtime.rank,
-            rows=runtime.local_rows,
-        ):
-            return runtime.exchange_direct(tensors, slot_mapping)
     if runtime.transport == "page_pull":
         raise NotImplementedError("MLA PCP runahead does not support page_pull yet")
-    raise RuntimeError(f"unexpected PCP runahead transport: {runtime.transport!r}")
+    range_name = _MLA_RUNAHEAD_RANGES.get(runtime.transport)
+    if range_name is None:
+        raise RuntimeError(f"unexpected PCP runahead transport: {runtime.transport!r}")
+    with pcp_nvtx_range(
+        range_name,
+        e=runtime.epoch,
+        rank=runtime.rank,
+        rows=runtime.local_rows,
+    ):
+        return runtime.exchange_cache_inputs(tensors, slot_mapping)
 
 
 def maybe_gather_mla_latent_cache_inputs(
