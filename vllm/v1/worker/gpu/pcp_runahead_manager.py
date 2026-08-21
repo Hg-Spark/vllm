@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import numpy as np
@@ -136,28 +136,6 @@ def runahead_batch_eligible(
     return total_prefill_tokens >= max(pcp_world_size, min_prefill_tokens)
 
 
-def compact_hidden_restore_idx(
-    padded_restore_idx: torch.Tensor,
-    *,
-    padded_rows: int,
-    rows_per_rank: tuple[int, ...],
-) -> torch.Tensor:
-    """Map the base manager's padded restore index into compact rank-major space."""
-    if padded_rows <= 0:
-        raise ValueError(f"padded_rows must be positive, got {padded_rows}")
-    offsets = [0]
-    for rows in rows_per_rank[:-1]:
-        offsets.append(offsets[-1] + int(rows))
-    offset_tensor = torch.tensor(
-        offsets,
-        dtype=padded_restore_idx.dtype,
-        device=padded_restore_idx.device,
-    )
-    ranks = torch.div(padded_restore_idx, padded_rows, rounding_mode="floor")
-    local = padded_restore_idx - ranks * padded_rows
-    return offset_tensor[ranks] + local
-
-
 def _build_logical_pcp_group(config: PCPRunaheadConfig):
     """Build a communicator whose rank order is logical segment order."""
     base = get_pcp_group()
@@ -257,7 +235,6 @@ class RunaheadPCPManager(PCPManager):
 
         self._rows_per_rank: tuple[int, ...] = ()
         self._logical_segment_slices: tuple[tuple[slice, ...], ...] = ()
-        self._compact_hidden_restore_idx: torch.Tensor | None = None
         self._sharded_kv_history = False
         runtime_rank = (
             self._logical_pcp_rank if config.mapping_is_permutation else pcp_rank
@@ -285,6 +262,12 @@ class RunaheadPCPManager(PCPManager):
             block_tables=block_tables,
             device=device,
         )
+
+    def _compact_layout_enabled(self) -> bool:
+        return self._use_compact_layout
+
+    def _get_batch_pcp_group(self):
+        return self._pcp_group if self._use_compact_layout else get_pcp_group()
 
     def _effective_segment_to_rank(self) -> tuple[int, ...]:
         return self._config.runtime_segment_to_rank
@@ -503,27 +486,11 @@ class RunaheadPCPManager(PCPManager):
         if not eligible or layout is None:
             self._rows_per_rank = ()
             self._logical_segment_slices = ()
-            self._compact_hidden_restore_idx = None
             self._runahead_runtime.disable_step()
             return local_batch
 
-        padded_rows = int(local_batch.num_tokens_after_padding)
-        local_rows = layout.rows_per_rank[self.pcp_rank]
-        assert self._hidden_restore_idx is not None
-        self._compact_hidden_restore_idx = compact_hidden_restore_idx(
-            self._hidden_restore_idx,
-            padded_rows=padded_rows,
-            rows_per_rank=layout.rows_per_rank,
-        )
         self._rows_per_rank = layout.rows_per_rank
         self._logical_segment_slices = layout.logical_segment_slices
-        local_batch = replace(
-            local_batch,
-            num_tokens_after_padding=local_rows,
-            input_ids=local_batch.input_ids[:local_rows],
-            positions=local_batch.positions[:local_rows],
-            is_padding=local_batch.is_padding[:local_rows],
-        )
         self._runahead_runtime.begin_step(
             layout.rows_per_rank,
             transport=self._config.transport,
@@ -594,29 +561,10 @@ class RunaheadPCPManager(PCPManager):
 
     def prepare_slot_mappings(self) -> torch.Tensor:
         slot_mappings = super().prepare_slot_mappings()
-        if not self._use_compact_layout:
-            return slot_mappings
-        assert self._gathered_kv_write_mask is not None
-        with pcp_nvtx_range("pcp.compact_slot_mapping"):
-            compact = slot_mappings[:, self._gathered_kv_write_mask].contiguous()
-        if self._config.transport == "page_pull":
+        if self._use_compact_layout and self._config.transport == "page_pull":
             with pcp_nvtx_range("pcp.page_pull_plan"):
                 self._configure_page_pull_plan()
-        return compact
-
-    def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._compact_hidden_restore_idx is None:
-            return super().restore_hidden_states(hidden_states)
-        sizes = list(self._rows_per_rank)
-        if len(set(sizes)) == 1:
-            with pcp_nvtx_range("pcp.restore_hidden_allgather"):
-                gathered = self._pcp_group.all_gather(hidden_states.contiguous(), dim=0)
-        else:
-            with pcp_nvtx_range("pcp.restore_hidden_allgatherv"):
-                gathered = self._pcp_group.all_gatherv(
-                    hidden_states.contiguous(), dim=0, sizes=sizes
-                )
-        return gathered[self._compact_hidden_restore_idx]
+        return slot_mappings
 
     def restore_for_sampling(
         self,
@@ -636,7 +584,6 @@ __all__ = [
     "RUNAHEAD_WEIGHTS_KEY",
     "RunaheadPCPManager",
     "SegmentLayout",
-    "compact_hidden_restore_idx",
     "parse_runahead_weights",
     "runahead_batch_eligible",
     "weighted_partition_lengths",
