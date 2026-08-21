@@ -1,18 +1,19 @@
 # PCP causal-prefix runahead
 
 This experimental path extends vLLM V2 PCP for standard FlashAttention prefill.
-The design keeps stock PCP batch/block-table machinery and adds three narrowly
-scoped pieces:
+It reuses stock PCP batch/block-table machinery and keeps four transport choices:
+`full_kv_collective`, `prefix_p2p`, `direct_p2p`, and `page_pull`.
 
-1. a contiguous logical-segment compiler;
-2. a logical PCP communicator for one-segment-per-rank bindings;
-3. causal-prefix transports, including one-sided paged-KV pull.
+The refactor has three core rules:
+
+1. compile logical segments once per batch;
+2. encode one-segment-per-rank permutations in the primary PCP group order;
+3. keep repeated ownership local to the page-pull plan.
 
 ## Configuration
 
-A non-empty `pcp_runahead` object enables the path. Runahead has a fixed compact
-layout and requires a fresh complete prefill, so those are derived invariants
-rather than independent experiment axes.
+A non-empty `pcp_runahead` object enables the path. Runahead always uses compact
+rank-major execution and requires a fresh complete prefill.
 
 ### One segment per rank with arbitrary binding
 
@@ -41,19 +42,18 @@ logical segment:  0     1     2     3
 physical rank:    2     0     3     1
 ```
 
-For a permutation, runahead creates a PCP communicator whose member order is
-`[rank2, rank0, rank3, rank1]`. Inside the runahead hot path:
+For a permutation, startup constructs the **primary PCP group** with member order
+`[rank2, rank0, rank3, rank1]`. No second runahead communicator exists. After
+startup:
 
 ```text
-logical segment index == communicator rank
+logical segment index == get_pcp_group().rank_in_group
 ```
 
-Tensor collectives and P2P therefore need no per-layer `segment_to_rank`
-translation or rank-major-to-segment-major reorder. The original PCP group is
-left unchanged and remains available for fallback execution.
+Tensor collectives and both P2P transports therefore use ordinary PCP ranks with
+no per-layer rank translation or rank-major/segment-major reorder.
 
-`partition.weights` is still accepted as a compact compatibility form and
-implies identity binding.
+`partition.weights` remains accepted and implies identity binding.
 
 ### Repeated ownership
 
@@ -78,35 +78,31 @@ Repeated ownership is supported only by `page_pull`:
 }
 ```
 
-A process group cannot contain one process at two logical ranks, so repeated
-ownership remains local to `SegmentLayout` and `PCPPagePlan`. Every physical PCP
-rank must own at least one segment.
+A process cannot occupy two ranks in one process group. Repeated ownership thus
+leaves the primary PCP group in its normal order and remains in `SegmentLayout`
+and `PCPPagePlan`. Every physical PCP rank must own at least one segment.
 
-## Segment compilation
+## Segment compilation and compact layout
 
-The manager partitions every scheduled request once and compiles a
-`SegmentLayout` containing:
+The manager partitions every scheduled request once into a `SegmentLayout`:
 
 ```text
 segments_by_rank
 rows_per_rank
-rows_per_segment
-logical_segment_slices
-page-boundary validity
+logical_segments(req, start_pos, end_pos, owner_rank)
 ```
 
-This replaces repeated per-rank/per-feature partition passes. The cost is
-`O(batch * logical_segments)` for the layout compiler.
+Internal page-alignment validity is checked during this same pass. The compiler
+cost is `O(batch * logical_segments)`.
 
-PCPManager now has a generic compact rank-major layout mode. Stock PCP remains
-padded. Runahead uses cumulative actual rank widths directly:
+Runahead uses exact rank widths:
 
 ```text
 rank0 rows | rank1 rows | ... | rankN rows
 ```
 
-No max-width slab is materialized and sliced afterward. Restore and full-KV
-collectives keep the fixed-size fast path:
+No max-width padded slab is created. Hidden-state restore and full-KV transport
+retain the equal-width fast path:
 
 ```text
 equal rank widths     -> all_gather
@@ -117,9 +113,9 @@ variable rank widths  -> all_gatherv
 
 | Transport | Data unit | Route | Repeated ownership |
 | --- | --- | --- | --- |
-| `full_kv_collective` | contiguous K/V rows | logical PCP collective | no |
+| `full_kv_collective` | contiguous K/V rows | primary PCP collective | no |
 | `prefix_p2p` | accumulated prefix rows | logical rank chain | no |
-| `direct_p2p` | one logical segment | owner to later logical ranks | no |
+| `direct_p2p` | one logical segment | rank to all later ranks | no |
 | `page_pull` | physical KV pages | consumer NIXL READ | yes |
 
 All runahead transports require:
@@ -130,23 +126,23 @@ num_scheduled_tokens == prefill_len
 ```
 
 Continued prefill and decode remain unsupported after a causal-prefix transport
-because persistent KV is intentionally sharded/asymmetric.
+because persistent KV state is rank-specific.
 
 ## Prefix P2P
 
-For four logical ranks:
+For four logical PCP ranks:
 
 ```text
 rank0 -> rank1 -> rank2 -> rank3
   S0      S0+S1   S0+S1+S2
 ```
 
-The communicator already encodes configured physical binding, so neighbor
-selection is simply `rank-1` / `rank+1`.
+Configured physical binding is already represented by the primary PCP group, so
+neighbors are simply `rank-1` and `rank+1`.
 
 ## Direct P2P
 
-Each logical rank sends only its local segment to every later logical rank:
+Each logical rank sends only its local segment directly to later ranks:
 
 ```text
 S0 -> S1, S2, S3
@@ -154,97 +150,98 @@ S1 ->     S2, S3
 S2 ->         S3
 ```
 
-This removes relay dependencies. It does not reduce the fresh-prefill
-information volume by itself.
+This removes relay dependencies while preserving the fresh-prefill information
+volume.
 
 ## Page pull
 
 `page_pull` moves completed physical KV pages instead of temporary K/V rows.
-Internal segment boundaries are aligned to the common kernel page granularity
-from `BlockTables.kernel_block_sizes`. A step whose required internal cuts are
-not page aligned falls back.
+Internal segment boundaries are aligned to the common kernel-page granularity
+from `BlockTables.kernel_block_sizes`. An unaligned step falls back.
+
+### CPU block plan
+
+`BlockTables` maintains a lightweight CPU mirror of the kernel block IDs written
+to its staged GPU table. Page-plan compilation therefore stays on CPU:
+
+```text
+logical segment
+  -> request state index
+  -> token-position block interval
+  -> BlockTables.get_block_ids_cpu(...)
+  -> physical block IDs
+```
+
+The supported PCP execution receives the same scheduler block allocation on all
+model workers, so source and destination descriptor IDs are identical. There is
+no per-step GPU slot-map readback, Python-object block-map all-gather, or block
+fingerprint collective.
 
 ### Stable registration phase
 
-The first layer-cache discovery registers all write-owning attention KV caches.
-NIXL agent metadata and layer memory geometry are exchanged once:
+The first layer-cache discovery registers every write-owning attention KV cache.
+NIXL agent metadata and stable layer geometry are exchanged once:
 
 ```text
 layer_id -> base address, block bytes, block count, device
 ```
 
-Remote transfer descriptor lists are prepared from this stable metadata and
-reused. Cache addresses must remain stable while the transport is alive.
+Remote descriptor lists are prepared once and reused. Cache addresses must stay
+stable while the transport is alive.
 
-### Per-layer protocol
+NHD and HND logical views are accepted when `stride(0)` proves that each physical
+block still occupies one dense whole-page byte span.
+
+### Per-layer ordering
+
+The normal FlashAttention KV update remains the only local cache write:
 
 ```text
 projection K/V
     |
     v
-prepare local slot mapping
+prepare_standard_pcp_kv_cache_inputs
+    |  - select local slots
+    |  - register pending page-pull layer
+    v
+native reshape_and_cache_flash
     |
     v
-FlashAttention native reshape_and_cache_flash   (single local KV write)
+unified KV-update dummy dependency
     |
     v
-record CUDA event
+attention-entry PCP hook
+    |  - page_pull_after_cache_write
+    |  - record CUDA event
+    v
+progress thread event.query()
     |
-    +-----------------------------> model/progress overlap
-                                      |
-                              progress thread event.query()
-                                      |
-                                      v
-                         NIXL READY(epoch, layer, source)
-                                      |
-                                      v
-                         consumer NIXL one-sided READ
-                                      |
-                                      v
-                         destination paged KV cache
-                                      |
-                              required reads DONE
-                                      |
-                                      v
-                              current attention
+    v
+NIXL READY(epoch, layer, source)
+    |
+    v
+consumer NIXL READ -> destination KV pages
+    |
+    v
+all required reads DONE
+    |
+    v
+FlashAttention
 ```
 
-The old early manual cache write has been removed. READY is published only after
-the backend's native cache-write event completes.
+The attention custom op already depends on the unified KV-update custom op via
+`kv_cache_dummy_dep`; the page-pull hook uses that existing ordering instead of
+patching FlashAttention. READY becomes externally visible only after the CUDA
+event recorded after the native write reports completion. The model thread does
+not call `event.synchronize()`.
 
-The model thread does not call `event.synchronize()` for READY. A background
-progress thread queries the event and sends the notification when the write is
-complete.
-
-### NIXL control and data plane
-
-READY uses NIXL notifications rather than a parallel Gloo `isend/irecv` control
-path. The per-layer message contains only changing state:
+READY uses NIXL notifications. Per-layer messages contain only changing state:
 
 ```text
 epoch, layer_id, source_rank
 ```
 
-Address and page geometry stay in the registration phase.
-
-The data path uses prepared NIXL READ descriptors and polls transfer handles for
-`DONE`.
-
-### Block-plan invariant
-
-All PCP workers execute the same scheduler block allocation for the supported
-configuration. Each rank derives physical block IDs from the same global slot
-mapping. `PCPPagePlan` therefore stores one deterministic page list per logical
-segment:
-
-```text
-segment -> owner rank -> block IDs
-```
-
-Source and destination descriptor IDs are identical. Before installing a plan,
-workers exchange only a fixed-size fingerprint of the derived mapping. A
-mismatch fails fast instead of falling back to the previous Python-object block
-metadata all-gather.
+Memory geometry remains in the registration phase.
 
 ### Repeated-owner short circuit
 
@@ -254,22 +251,21 @@ For:
 segment_to_rank = [1, 0, 1]
 ```
 
-rank 1 owns `S0` and `S2`. While executing its latest segment it already has
-`S0`; only `S1` is pulled from rank 0.
+rank 1 owns `S0` and `S2`. While executing `S2`, `S0` is already local and only
+`S1` is pulled from rank 0.
 
 ## Performance and scaling notes
 
-The refactor removes hot-path work that grows with PCP size:
+The refactor removes several PCP-size-sensitive costs:
 
-- repeated segment partition passes;
-- rank/segment reorder for permutation bindings;
+- repeated partition passes;
+- runtime rank/segment reorder for permutations;
 - padded compact staging;
-- duplicate local KV-cache write;
-- per-layer Gloo READY tensors and receives;
-- per-step Python-object block-map exchange.
+- duplicate local KV-cache writes;
+- per-layer Gloo READY tensors/receives;
+- per-step GPU block-map readback/object exchange.
 
-The long-term page-pull scaling limit is still producer fanout. With `P` logical
-segments, early segments serve more downstream consumers:
+Page-pull still has a producer-fanout scaling limit. With `P` logical segments:
 
 ```text
 S0: P-1 consumers
@@ -277,25 +273,22 @@ S1: P-2 consumers
 ...
 ```
 
-At large PCP sizes this can saturate one source GPU/NIC even when aggregate
-fabric bandwidth remains available. Hierarchical relay, replication, or
-resident-page-aware source selection can be added later without changing the
-segment compiler.
-
-Physical binding should also be topology aware for multi-node runs so adjacent
-causal ranks stay on high-bandwidth links where possible.
+At larger PCP sizes this can saturate an early source GPU or NIC. Hierarchical
+relay, replication, or resident-page-aware source selection are future options.
+Physical rank binding should also consider multi-node topology.
 
 ## Current validation constraints
 
 - standard MHA/GQA/MQA with FlashAttention;
 - PCP > 1;
 - TP = 1, PP = 1, DP = 1, DCP = 1;
-- no EP/MoE, DBO, speculative decoding, or async scheduling;
+- no EP/MoE, DBO, speculative decoding, async scheduling, or request-level KV
+  transfer connector;
 - eager execution (`cudagraph_mode=NONE`);
-- fresh complete prefill only for runahead;
+- fresh complete prefill only;
 - `page_pull`: NIXL available, one standard-attention KV-cache group,
-  contiguous block-major FP16/BF16 cache, page-aligned internal cuts, stable KV
-  cache addresses.
+  block-major dense FP16/BF16 physical pages, page-aligned internal cuts, stable
+  KV-cache addresses.
 
 ## Persistent KV semantics
 
@@ -303,7 +296,7 @@ causal ranks stay on high-bandwidth links where possible.
 transports leave rank-specific prefix state:
 
 - `prefix_p2p`: prefix through this logical rank;
-- `direct_p2p`: same semantic state without relay;
+- `direct_p2p`: the same state without relay;
 - `page_pull`: pages required through the rank's latest owned logical segment.
 
 Sampling the current forward is valid. A later model step is rejected until a
@@ -317,6 +310,6 @@ Set:
 VLLM_PCP_NVTX=1
 ```
 
-Profiling helpers are direct call-site ranges/marks only. They do not monkey
-patch FlashAttention or the page-pull progress engine and do not introduce CUDA
+Profiling consists only of direct call-site ranges/marks. It does not patch
+FlashAttention or the page-pull progress engine and does not add CUDA
 synchronization.
