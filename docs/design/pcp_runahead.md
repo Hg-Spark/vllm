@@ -1,83 +1,76 @@
 # PCP causal-prefix runahead
 
-This experimental path is based on vLLM 0.27.1 V2 PCP. It reuses the existing
-PCP batch construction, `RankSegment` mapping compiler, block tables, slot
-mapping, sampling restore lifecycle, and `GroupCoordinator` collectives, while
-separating two coordinate systems that stock PCP normally treats as identical:
+This experimental path extends vLLM V2 PCP for standard FlashAttention prefill.
+The design keeps stock PCP batch/block-table machinery and adds three narrowly
+scoped pieces:
 
-1. **logical segment order** owns causal order and load weights;
-2. **physical PCP rank** owns the worker, process-group membership, and GPU.
-
-The bridge is `segment_to_rank`. Causal dependency never implies a fixed network
-route.
+1. a contiguous logical-segment compiler;
+2. a logical PCP communicator for one-segment-per-rank bindings;
+3. causal-prefix transports, including one-sided paged-KV pull.
 
 ## Configuration
 
-A non-empty `pcp_runahead` object enables the experimental standard-attention
-PCP path. Omit the key or set it to `false` to disable it. Boolean `true` is not
-a valid configuration.
+A non-empty `pcp_runahead` object enables the path. Runahead has a fixed compact
+layout and requires a fresh complete prefill, so those are derived invariants
+rather than independent experiment axes.
 
-### One logical segment per physical rank
+### One segment per rank with arbitrary binding
 
-```bash
---prefill-context-parallel-size 4 \
---additional-config '{
+```json
+{
   "pcp_runahead": {
     "transport": "direct_p2p",
     "partition": {
-      "policy": "weighted_contiguous",
       "segments": [
         {"weight": 4.0, "pcp_rank": 2},
         {"weight": 2.5, "pcp_rank": 0},
         {"weight": 1.9, "pcp_rank": 3},
         {"weight": 1.6, "pcp_rank": 1}
-      ],
-      "page_align": true
+      ]
     },
-    "layout": "compact",
-    "eligibility": {
-      "require_full_prefill": true,
-      "min_tokens": 1024
-    },
-    "runtime": {
-      "max_inflight_sends": 4
-    }
+    "eligibility": {"min_tokens": 1024},
+    "runtime": {"max_inflight_sends": 4}
   }
-}' \
---enforce-eager
+}
 ```
 
-The example above produces logical causal order:
+The configured physical ownership is:
 
 ```text
-segment 0 -> segment 1 -> segment 2 -> segment 3
-rank 2       rank 0       rank 3       rank 1
+logical segment:  0     1     2     3
+physical rank:    2     0     3     1
 ```
 
-The old `partition.weights` form remains supported and implies identity mapping
-`segment_to_rank = [0, 1, ...]`.
+For a permutation, runahead creates a PCP communicator whose member order is
+`[rank2, rank0, rank3, rank1]`. Inside the runahead hot path:
 
-### Repeated physical ownership with page pull
+```text
+logical segment index == communicator rank
+```
 
-`page_pull` additionally allows more logical segments than PCP ranks and lets a
-physical rank own multiple logical segments:
+Tensor collectives and P2P therefore need no per-layer `segment_to_rank`
+translation or rank-major-to-segment-major reorder. The original PCP group is
+left unchanged and remains available for fallback execution.
+
+`partition.weights` is still accepted as a compact compatibility form and
+implies identity binding.
+
+### Repeated ownership
+
+Repeated ownership is supported only by `page_pull`:
 
 ```json
 {
   "pcp_runahead": {
     "transport": "page_pull",
     "partition": {
-      "policy": "weighted_contiguous",
       "segments": [
         {"weight": 1, "pcp_rank": 1},
         {"weight": 1, "pcp_rank": 0},
         {"weight": 1, "pcp_rank": 1}
-      ],
-      "page_align": true
+      ]
     },
-    "layout": "compact",
     "runtime": {
-      "page_pull_backend": "nixl",
       "nixl_backends": ["UCX"],
       "max_inflight_reads": 4
     }
@@ -85,70 +78,75 @@ physical rank own multiple logical segments:
 }
 ```
 
-Every physical PCP rank must own at least one logical segment. Repeated bindings
-are intentionally rejected by tensor transports because they do not have a
-single rank-to-segment inverse.
+A process group cannot contain one process at two logical ranks, so repeated
+ownership remains local to `SegmentLayout` and `PCPPagePlan`. Every physical PCP
+rank must own at least one segment.
+
+## Segment compilation
+
+The manager partitions every scheduled request once and compiles a
+`SegmentLayout` containing:
+
+```text
+segments_by_rank
+rows_per_rank
+rows_per_segment
+logical_segment_slices
+page-boundary validity
+```
+
+This replaces repeated per-rank/per-feature partition passes. The cost is
+`O(batch * logical_segments)` for the layout compiler.
+
+PCPManager now has a generic compact rank-major layout mode. Stock PCP remains
+padded. Runahead uses cumulative actual rank widths directly:
+
+```text
+rank0 rows | rank1 rows | ... | rankN rows
+```
+
+No max-width slab is materialized and sliced afterward. Restore and full-KV
+collectives keep the fixed-size fast path:
+
+```text
+equal rank widths     -> all_gather
+variable rank widths  -> all_gatherv
+```
 
 ## Transport modes
 
-| Transport | Data unit | Route | Repeated rank binding |
+| Transport | Data unit | Route | Repeated ownership |
 | --- | --- | --- | --- |
-| `full_kv_collective` | contiguous K/V rows | all-gatherv | no |
-| `prefix_p2p` | accumulated causal-prefix rows | logical chain | no |
-| `direct_p2p` | one logical segment's rows | owner -> all downstream consumers | no |
-| `page_pull` | physical KV-cache blocks | consumer one-sided READ from owner | yes |
+| `full_kv_collective` | contiguous K/V rows | logical PCP collective | no |
+| `prefix_p2p` | accumulated prefix rows | logical rank chain | no |
+| `direct_p2p` | one logical segment | owner to later logical ranks | no |
+| `page_pull` | physical KV pages | consumer NIXL READ | yes |
 
-All non-stock runahead modes use compact execution. `prefix_p2p`, `direct_p2p`,
-and `page_pull` currently require a fresh complete prefill:
+All runahead transports require:
 
 ```text
 num_computed_tokens == 0
 num_scheduled_tokens == prefill_len
 ```
 
-This intentionally excludes chunked-prefill continuation and decode until a
-persistent sharded-KV consumer path is implemented.
+Continued prefill and decode remain unsupported after a causal-prefix transport
+because persistent KV is intentionally sharded/asymmetric.
 
-## Page-aligned partition
+## Prefix P2P
 
-Internal logical boundaries are aligned to the common kernel-page granularity
-from `BlockTables.kernel_block_sizes`. Alignment uses absolute sequence
-positions. For a fresh prefill this means every segment except the final tail is
-composed of full physical KV pages.
-
-That property is important for `page_pull`: all logical segments that can be
-needed by a downstream consumer end at page boundaries. The final segment may
-contain a partial page, but it has no later consumer, so no remote partial-page
-merge is required.
-
-When a request is too small for page-aligned internal cuts,
-`weighted_partition_lengths()` falls back to exact token allocation. Such a step
-is not eligible for `page_pull`; the manager falls back rather than transferring
-a partial shared block.
-
-## Prefix chain transport
-
-`prefix_p2p` preserves the original experimental relay algorithm. For logical
-segments `0..3`:
+For four logical ranks:
 
 ```text
-S0 owner -> S1 owner -> S2 owner -> S3 owner
-    S0        S0+S1      S0+S1+S2
+rank0 -> rank1 -> rank2 -> rank3
+  S0      S0+S1   S0+S1+S2
 ```
 
-Each receiver allocates one visible-prefix buffer, receives the accumulated
-prefix, appends local K/V, and forwards the enlarged buffer. Logical adjacency
-is translated through `segment_to_rank`, so a physical permutation such as
-`[2, 0, 3, 1]` uses chain `rank2 -> rank0 -> rank3 -> rank1`.
+The communicator already encodes configured physical binding, so neighbor
+selection is simply `rank-1` / `rank+1`.
 
-This mode is useful as a reference but still pays relay latency and repeated
-receive/copy/send work on intermediate ranks.
+## Direct P2P
 
-## Direct logical fanout
-
-`direct_p2p` removes relay dependency without changing the K/V tensor data unit.
-Each logical owner sends only its newly produced segment directly to every later
-logical segment:
+Each logical rank sends only its local segment to every later logical rank:
 
 ```text
 S0 -> S1, S2, S3
@@ -156,108 +154,99 @@ S1 ->     S2, S3
 S2 ->         S3
 ```
 
-A consumer receives preceding segments independently and places them into one
-logical-order cache-write buffer. Network completion order therefore no longer
-has to match causal order.
+This removes relay dependencies. It does not reduce the fresh-prefill
+information volume by itself.
 
-For a fresh prefill, direct fanout does **not** reduce the theoretical payload.
-With four equal segments both chain and direct fanout move `6 * segment_bytes`.
-Its benefit is removing relay dependencies, accumulated-prefix allocations, and
-serial hop latency.
+## Page pull
 
-## Consumer-driven page pull
+`page_pull` moves completed physical KV pages instead of temporary K/V rows.
+Internal segment boundaries are aligned to the common kernel page granularity
+from `BlockTables.kernel_block_sizes`. A step whose required internal cuts are
+not page aligned falls back.
 
-`page_pull` changes the data plane from temporary K/V rows to physical paged-KV
-cache blocks.
+### Stable registration phase
+
+The first layer-cache discovery registers all write-owning attention KV caches.
+NIXL agent metadata and layer memory geometry are exchanged once:
+
+```text
+layer_id -> base address, block bytes, block count, device
+```
+
+Remote transfer descriptor lists are prepared from this stable metadata and
+reused. Cache addresses must remain stable while the transport is alive.
 
 ### Per-layer protocol
 
 ```text
-producer projection K/V
-        |
-        v
-write producer's LOCAL KV pages
-        |
-        v
-CUDA write-completion event
-        |
-        v
-READY(epoch, layer, cache address/geometry)
-        |
-        +-----------------------+
-                                |
-                      consumer local scheduler
-                                |
-                 missing remote segments only
-                                |
-                                v
-                     asynchronous NIXL READ
-                                |
-                                v
-                    destination paged KV cache
-                                |
-                    all required pages READY
-                                |
-                                v
-                         FlashAttention
+projection K/V
+    |
+    v
+prepare local slot mapping
+    |
+    v
+FlashAttention native reshape_and_cache_flash   (single local KV write)
+    |
+    v
+record CUDA event
+    |
+    +-----------------------------> model/progress overlap
+                                      |
+                              progress thread event.query()
+                                      |
+                                      v
+                         NIXL READY(epoch, layer, source)
+                                      |
+                                      v
+                         consumer NIXL one-sided READ
+                                      |
+                                      v
+                         destination paged KV cache
+                                      |
+                              required reads DONE
+                                      |
+                                      v
+                              current attention
 ```
 
-The implementation deliberately keeps the request-level `KVConnector`
-scheduler out of PCP. PCP is a layer-level protocol. It reuses the same NIXL
-ideas and primitives instead:
+The old early manual cache write has been removed. READY is published only after
+the backend's native cache-write event completes.
 
-- registered device KV-cache memory;
-- one descriptor per physical cache block;
-- remote/local block-ID lists;
-- `make_prepped_xfer("READ", ...)`;
-- asynchronous transfer handles and completion polling.
+The model thread does not call `event.synchronize()` for READY. A background
+progress thread queries the event and sends the notification when the write is
+complete.
 
-### Control plane versus data plane
+### NIXL control and data plane
 
-The control plane addresses **logical segments**. The data plane addresses
-**physical KV block IDs**.
+READY uses NIXL notifications rather than a parallel Gloo `isend/irecv` control
+path. The per-layer message contains only changing state:
 
-At `prepare_slot_mappings()` time, every rank already knows the same logical
-segment slices. Its normal vLLM slot mapping converts those token positions into
-local physical block IDs. Each owner publishes the source block IDs of the
-segments it owns. The resulting `PCPPagePlan` contains, for every logical
+```text
+epoch, layer_id, source_rank
+```
+
+Address and page geometry stay in the registration phase.
+
+The data path uses prepared NIXL READ descriptors and polls transfer handles for
+`DONE`.
+
+### Block-plan invariant
+
+All PCP workers execute the same scheduler block allocation for the supported
+configuration. Each rank derives physical block IDs from the same global slot
+mapping. `PCPPagePlan` therefore stores one deterministic page list per logical
 segment:
 
 ```text
-logical segment
-    -> owner physical rank
-    -> source physical block IDs on the owner
-    -> destination physical block IDs on this consumer
+segment -> owner rank -> block IDs
 ```
 
-No second page-address system is introduced; the plan is compiled from existing
-vLLM `BlockTables` / slot mappings.
+Source and destination descriptor IDs are identical. Before installing a plan,
+workers exchange only a fixed-size fingerprint of the derived mapping. A
+mismatch fails fast instead of falling back to the previous Python-object block
+metadata all-gather.
 
-### Completion-driven ordering
-
-Consumers pre-post READY receives for every required source. READY messages are
-queued in arrival order. `progress()` starts reads while the configured
-`max_inflight_reads` budget has room, so a consumer can fetch whichever producer
-has completed first:
-
-```text
-S2 READY first -> pull S2 pages
-S0 READY next  -> pull S0 pages
-S1 READY last  -> pull S1 pages
-```
-
-Causal correctness only requires all pages needed by the current query to be
-local before attention starts. Network transfer order does not have to be
-logical order.
-
-Layer cache registrations persist across scheduler steps. Once the layer set is
-known, the next full-prefill step can pre-post READY receives for future layers;
-progress at earlier layer boundaries can therefore launch already-ready future
-layer reads before the consumer reaches that layer. The first pass lazily learns
-those layer registrations, so same-layer completion ordering works immediately
-while full future-layer prefetch becomes effective after registration is known.
-
-### Repeated-rank local short circuit
+### Repeated-owner short circuit
 
 For:
 
@@ -265,144 +254,69 @@ For:
 segment_to_rank = [1, 0, 1]
 ```
 
-rank 1 owns both `S0` and `S2`. When computing the later `S2` query it requires
-`S0 + S1`, but `S0` is already local. Its page plan therefore issues only:
+rank 1 owns `S0` and `S2`. While executing its latest segment it already has
+`S0`; only `S1` is pulled from rank 0.
+
+## Performance and scaling notes
+
+The refactor removes hot-path work that grows with PCP size:
+
+- repeated segment partition passes;
+- rank/segment reorder for permutation bindings;
+- padded compact staging;
+- duplicate local KV-cache write;
+- per-layer Gloo READY tensors and receives;
+- per-step Python-object block-map exchange.
+
+The long-term page-pull scaling limit is still producer fanout. With `P` logical
+segments, early segments serve more downstream consumers:
 
 ```text
-pull S1 from rank0
+S0: P-1 consumers
+S1: P-2 consumers
+...
 ```
 
-There is no network transfer for `S0`. This is the first case where repeated
-ownership directly reduces payload rather than only shortening the critical
-path.
+At large PCP sizes this can saturate one source GPU/NIC even when aggregate
+fabric bandwidth remains available. Hierarchical relay, replication, or
+resident-page-aware source selection can be added later without changing the
+segment compiler.
 
-### READY ordering and memory safety
-
-A producer must not publish READY merely because the cache-write kernel was
-submitted. `page_pull` records a CUDA event after the early local cache write and
-waits for that event before sending READY. Thus remote NIXL READ starts only
-after source data is visible.
-
-The consumer considers a source ready only after the NIXL handle reports DONE.
-Only then can FlashAttention read those destination blocks. Remote prefix blocks
-and locally owned segment blocks are page-disjoint, allowing local cache writes
-and remote movement to target independent physical pages.
-
-## Cache-write integration
-
-The existing FlashAttention hook calls
-`prepare_standard_pcp_kv_cache_inputs(key, value, slot_mapping, kv_cache)` before
-its normal `reshape_and_cache_flash()` call. `page_pull` uses this hook without a
-large backend rewrite:
-
-1. slice the compact slot mapping to this physical rank;
-2. perform an early local K/V cache write;
-3. publish READY and complete required NIXL reads;
-4. return local K/V and local slot mapping;
-5. let the normal `reshape_and_cache_flash()` write the local rows again.
-
-The duplicated local write is deliberate in this experimental version. It keeps
-the standard backend path intact while making cache pages available to remote
-readers before attention. A later optimization can move the READY hook directly
-after the backend's native cache-write kernel and remove the duplicate write.
-
-## Payload and reuse semantics
-
-For a completely fresh prefill, every downstream rank still needs its causal
-prefix. Page pull therefore cannot beat the information-theoretic payload solely
-by changing the route:
-
-```text
-bytes = sum_i (number_of_downstream_consumers_i * segment_bytes_i)
-```
-
-Actual byte reduction comes from eliminating transfers that are unnecessary:
-
-- an earlier segment is owned by the same physical rank;
-- a future implementation retains a resident page from a previous step;
-- a page has another usable replica;
-- prefix-cache state proves the destination already contains the required page.
-
-The current implementation includes the first optimization (local repeated-rank
-short circuit). Resident/replica-aware source selection is the natural next
-extension of `PCPPagePlan`; the transport API does not require a causal-chain
-rewrite to add it.
+Physical binding should also be topology aware for multi-node runs so adjacent
+causal ranks stay on high-bandwidth links where possible.
 
 ## Current validation constraints
-
-Common runahead constraints:
 
 - standard MHA/GQA/MQA with FlashAttention;
 - PCP > 1;
 - TP = 1, PP = 1, DP = 1, DCP = 1;
-- no EP/MoE collectives;
-- no DBO;
-- no speculative decoding;
-- no async scheduling;
+- no EP/MoE, DBO, speculative decoding, or async scheduling;
 - eager execution (`cudagraph_mode=NONE`);
-- causal-prefix transports are full-fresh-prefill only.
-
-Additional `page_pull` constraints:
-
-- NIXL must be installed and able to register the accelerator's KV memory;
-- `partition.page_align=true`;
-- one standard-attention KV cache group;
-- homogeneous PCP model/cache geometry;
-- unquantized FP16/BF16 cache (`cache_dtype=auto|float16|bfloat16`);
-- no partial internal page transfer;
-- registered layer cache addresses must remain stable while the transport is
-  alive (cache reallocation/wake-up integration is not implemented yet).
-
-If page-aligned full-prefill eligibility is not met, the step falls back instead
-of issuing a partial-page pull.
+- fresh complete prefill only for runahead;
+- `page_pull`: NIXL available, one standard-attention KV-cache group,
+  contiguous block-major FP16/BF16 cache, page-aligned internal cuts, stable KV
+  cache addresses.
 
 ## Persistent KV semantics
 
-`full_kv_collective` reconstructs and writes a replicated current-step cache.
-The three causal-prefix transports intentionally leave asymmetric persistent KV:
+`full_kv_collective` reconstructs a replicated current-step cache. Causal
+transports leave rank-specific prefix state:
 
-- `prefix_p2p`: each rank stores the prefix through its logical segment;
-- `direct_p2p`: same semantic result without relay;
-- `page_pull`: each rank has all pages needed through its latest owned logical
-  segment, while locally repeated earlier segments are reused in place.
+- `prefix_p2p`: prefix through this logical rank;
+- `direct_p2p`: same semantic state without relay;
+- `page_pull`: pages required through the rank's latest owned logical segment.
 
-Sampling the current forward is valid. A later model step requiring decode or
-continued prefill is rejected until the persistent sharded-KV consumer path is
-implemented.
+Sampling the current forward is valid. A later model step is rejected until a
+persistent sharded-KV continuation/decode path is implemented.
 
 ## Profiling
 
-Enable detailed PCP NVTX ranges with:
+Set:
 
 ```bash
-VLLM_PCP_NVTX=1 ...
+VLLM_PCP_NVTX=1
 ```
 
-Relevant ranges include:
-
-```text
-pcp.baseline_kv_allgather
-pcp.full_kv_allgatherv
-pcp.prefix_exchange
-pcp.prefix_recv_wait
-pcp.prefix_send_enqueue
-pcp.direct_exchange
-pcp.direct_recv_enqueue
-pcp.direct_recv_wait
-pcp.direct_send_enqueue
-pcp.page_pull_plan
-pcp.page_pull_local_cache_write
-pcp.page_pull_local_ready_wait
-pcp.page_pull_read_submit
-pcp.page_pull_exchange
-pcp.page_pull_wait
-pcp.compact_slot_mapping
-pcp.restore_hidden_variable_allgather
-pcp.send_wait
-pcp.flush
-```
-
-Nsight should make the distinction clear: `prefix_p2p` exposes serial relay
-hops, `direct_p2p` exposes independent owner-to-consumer transfers, and
-`page_pull` exposes local cache writes followed by one-sided block reads whose
-submission order follows producer readiness rather than logical rank order.
+Profiling helpers are direct call-site ranges/marks only. They do not monkey
+patch FlashAttention or the page-pull progress engine and do not introduce CUDA
+synchronization.
