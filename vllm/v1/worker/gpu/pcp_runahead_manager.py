@@ -261,8 +261,6 @@ class RunaheadPCPManager(PCPManager):
         if config is None:
             raise ValueError("pcp_runahead manager requires an enabled config")
 
-        if model.use_mla:
-            raise NotImplementedError("PCP runahead currently supports standard attention only")
         if model.is_encoder_decoder:
             raise NotImplementedError("PCP runahead does not support encoder-decoder")
         if supports_mm_inputs:
@@ -279,14 +277,26 @@ class RunaheadPCPManager(PCPManager):
             raise NotImplementedError("PCP runahead requires DP=1")
         if parallel.decode_context_parallel_size != 1:
             raise NotImplementedError("PCP runahead requires DCP=1")
-        if parallel.enable_expert_parallel or model.is_moe:
-            raise NotImplementedError("PCP runahead does not support expert/MoE parallelism")
+        if parallel.enable_expert_parallel:
+            raise NotImplementedError("PCP runahead does not support expert parallelism")
         if parallel.enable_dbo:
             raise NotImplementedError("PCP runahead does not support DBO")
         if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             raise NotImplementedError("PCP runahead requires --enforce-eager")
         if vllm_config.scheduler_config.async_scheduling:
             raise NotImplementedError("PCP runahead does not support async scheduling")
+
+        if model.use_mla:
+            if hasattr(model.hf_text_config, "index_topk"):
+                raise NotImplementedError(
+                    "PCP runahead does not support sparse MLA/indexer yet"
+                )
+            if config.transport == "page_pull":
+                raise NotImplementedError(
+                    "PCP runahead MLA does not support page_pull yet; use "
+                    "full_kv_collective, prefix_p2p, or direct_p2p"
+                )
+
         if config.transport == "page_pull":
             cache_dtype = str(vllm_config.cache_config.cache_dtype)
             if cache_dtype not in ("auto", "float16", "bfloat16"):
@@ -393,7 +403,7 @@ class RunaheadPCPManager(PCPManager):
                 "continued/decode execution is not implemented"
             )
 
-        eligible = self._standard_attention_pcp and runahead_batch_eligible(
+        eligible = runahead_batch_eligible(
             num_reqs=input_batch.num_reqs,
             is_prefilling=input_batch.is_prefilling_np,
             num_scheduled_tokens=input_batch.num_scheduled_tokens,

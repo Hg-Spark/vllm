@@ -170,6 +170,43 @@ class PCPRunaheadRuntime:
         stop = self.rank_offsets[self.rank + 1]
         return slot_mapping[start:stop]
 
+    def exchange_full(
+        self,
+        tensors: tuple[torch.Tensor, ...],
+        slot_mapping: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Gather all rank-local rows, preserving compact rank-major order."""
+        if not self.active or self.transport != "full_kv_collective":
+            raise RuntimeError(
+                "exchange_full requires full_kv_collective, "
+                f"got {self.transport!r}"
+            )
+        self._validate_group()
+        if not tensors or any(t.shape[0] != self.local_rows for t in tensors):
+            raise ValueError(
+                "full collective PCP expects configured local rows: "
+                f"rank={self.rank}, expected={self.local_rows}, "
+                f"shapes={[tuple(t.shape) for t in tensors]}"
+            )
+        if slot_mapping.shape[0] < self.total_rows:
+            raise ValueError(
+                "rank-major slot mapping is shorter than configured PCP rows: "
+                f"slots={slot_mapping.shape[0]}, rows={self.total_rows}"
+            )
+
+        group = self._group()
+        sizes = list(self.rows_per_rank)
+        if len(set(sizes)) == 1:
+            gathered = tuple(
+                group.all_gather(tensor.contiguous(), dim=0) for tensor in tensors
+            )
+        else:
+            gathered = tuple(
+                group.all_gatherv(tensor.contiguous(), dim=0, sizes=sizes)
+                for tensor in tensors
+            )
+        return gathered, slot_mapping[: self.total_rows]
+
     def _validate_group(self) -> None:
         group = self._group()
         if group.world_size != self.world_size or group.rank_in_group != self.rank:

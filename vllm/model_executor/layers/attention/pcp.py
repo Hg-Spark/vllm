@@ -6,6 +6,7 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_tp_group,
 )
+from vllm.v1.attention.ops.pcp_runahead import get_pcp_runahead_runtime
 
 
 def _gather_prefill_cache_inputs(
@@ -45,6 +46,25 @@ def _gather_prefill_cache_inputs(
     return cache_inputs, cache_slot_mapping
 
 
+def _exchange_runahead_cache_inputs(
+    tensors: tuple[torch.Tensor, ...],
+    slot_mapping: torch.Tensor,
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor] | None:
+    """Exchange rank-local cache rows according to the active runahead policy."""
+    runtime = get_pcp_runahead_runtime()
+    if runtime is None:
+        return None
+    if runtime.transport == "full_kv_collective":
+        return runtime.exchange_full(tensors, slot_mapping)
+    if runtime.transport == "prefix_p2p":
+        return runtime.exchange_prefix(tensors, slot_mapping)
+    if runtime.transport == "direct_p2p":
+        return runtime.exchange_direct(tensors, slot_mapping)
+    if runtime.transport == "page_pull":
+        raise NotImplementedError("MLA PCP runahead does not support page_pull yet")
+    raise RuntimeError(f"unexpected PCP runahead transport: {runtime.transport!r}")
+
+
 def maybe_gather_mla_latent_cache_inputs(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
@@ -57,11 +77,25 @@ def maybe_gather_mla_latent_cache_inputs(
     assert slot_mapping is not None
     num_tokens = kv_c_normed.shape[0]
     k_pe_flat = k_pe.reshape(num_tokens, -1)
-    (cache_kv_c, cache_k_pe_flat), cache_slot_mapping = _gather_prefill_cache_inputs(
-        (kv_c_normed, k_pe_flat),
-        slot_mapping,
-        num_decode_tokens,
+
+    runahead_result = _exchange_runahead_cache_inputs(
+        (kv_c_normed, k_pe_flat), slot_mapping
     )
+    if runahead_result is not None:
+        if num_decode_tokens != 0:
+            raise RuntimeError(
+                "PCP runahead MLA cache exchange requires a fresh prefill batch"
+            )
+        (cache_kv_c, cache_k_pe_flat), cache_slot_mapping = runahead_result
+    else:
+        (cache_kv_c, cache_k_pe_flat), cache_slot_mapping = (
+            _gather_prefill_cache_inputs(
+                (kv_c_normed, k_pe_flat),
+                slot_mapping,
+                num_decode_tokens,
+            )
+        )
+
     cache_k_pe = cache_k_pe_flat.view(-1, *k_pe.shape[1:])
     return cache_kv_c, cache_k_pe, cache_slot_mapping
 
