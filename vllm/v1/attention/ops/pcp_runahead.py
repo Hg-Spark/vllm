@@ -174,6 +174,24 @@ class PCPRunaheadRuntime:
         stop = self.rank_offsets[self.rank + 1]
         return slot_mapping[start:stop]
 
+    def exchange_cache_inputs(
+        self,
+        tensors: tuple[torch.Tensor, ...],
+        slot_mapping: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Exchange rank-local cache rows using the active tensor transport."""
+        if self.transport == "full_kv_collective":
+            return self.exchange_full(tensors, slot_mapping)
+        if self.transport == "prefix_p2p":
+            return self.exchange_prefix(tensors, slot_mapping)
+        if self.transport == "direct_p2p":
+            return self.exchange_direct(tensors, slot_mapping)
+        if self.transport == "page_pull":
+            raise RuntimeError(
+                "page_pull uses KV-cache page transport, not tensor exchange"
+            )
+        raise RuntimeError(f"unsupported active PCP transport: {self.transport!r}")
+
     def exchange_full(
         self,
         tensors: tuple[torch.Tensor, ...],
@@ -199,16 +217,14 @@ class PCPRunaheadRuntime:
             )
 
         group = self._group()
+        contiguous = tuple(tensor.contiguous() for tensor in tensors)
         sizes = list(self.rows_per_rank)
         if len(set(sizes)) == 1:
-            gathered = tuple(
-                group.all_gather(tensor.contiguous(), dim=0) for tensor in tensors
-            )
+            gathered = tuple(group.all_gather(tensor, dim=0) for tensor in contiguous)
+        elif len(contiguous) == 1:
+            gathered = (group.all_gatherv(contiguous[0], dim=0, sizes=sizes),)
         else:
-            gathered = tuple(
-                group.all_gatherv(tensor.contiguous(), dim=0, sizes=sizes)
-                for tensor in tensors
-            )
+            gathered = tuple(group.all_gatherv(list(contiguous), dim=0, sizes=sizes))
         return gathered, slot_mapping[: self.total_rows]
 
     def _validate_group(self) -> None:
