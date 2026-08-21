@@ -34,9 +34,10 @@ class _PendingSend:
 class PCPRunaheadRuntime:
     """Per-process state for one logical PCP communicator.
 
-    One-segment-per-rank bindings are compiled into communicator member order,
-    so ``rank`` is the logical causal segment index for tensor transports.
-    Repeated logical ownership is page-pull-only and lives in ``PCPPagePlan``.
+    One-segment-per-rank bindings are compiled into the primary PCP communicator
+    member order, so ``rank`` is the logical causal segment index for tensor
+    transports. Repeated logical ownership is page-pull-only and lives in
+    ``PCPPagePlan``.
     """
 
     def __init__(
@@ -168,17 +169,6 @@ class PCPRunaheadRuntime:
         start = self.rank_offsets[self.rank]
         stop = self.rank_offsets[self.rank + 1]
         return slot_mapping[start:stop]
-
-    def rank_major_to_segment_major(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Compatibility identity: communicator rank is already logical rank."""
-        if not self.rows_per_rank:
-            return tensor
-        if tensor.shape[0] < self.total_rows:
-            raise ValueError(
-                "rank-major tensor is shorter than configured PCP rows: "
-                f"rows={tensor.shape[0]}, expected={self.total_rows}"
-            )
-        return tensor[: self.total_rows]
 
     def _validate_group(self) -> None:
         group = self._group()
