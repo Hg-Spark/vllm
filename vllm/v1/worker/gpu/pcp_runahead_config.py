@@ -14,9 +14,6 @@ TransportPolicy = Literal[
     "direct_p2p",
     "page_pull",
 ]
-PartitionPolicy = Literal["stock", "equal_contiguous", "weighted_contiguous"]
-LayoutPolicy = Literal["padded", "compact"]
-PagePullBackend = Literal["nixl"]
 
 RUNAHEAD_CONFIG_KEY = "pcp_runahead"
 RUNAHEAD_WEIGHTS_KEY = "pcp_runahead_weights"
@@ -25,33 +22,49 @@ RUNAHEAD_MIN_PREFILL_TOKENS = 1024
 
 @dataclass(frozen=True)
 class PCPRunaheadConfig:
+    """Canonical runahead configuration.
+
+    Runahead always uses a compact contiguous partition of a fresh full
+    prefill. One-segment-per-rank permutations are compiled into PCP process
+    group ordering; repeated ownership is retained only for ``page_pull``.
+    """
+
+    pcp_world_size: int = 0
     transport: TransportPolicy = "prefix_p2p"
-    partition_policy: PartitionPolicy = "equal_contiguous"
-    weights: tuple[float, ...] | None = None
+    weights: tuple[float, ...] = ()
     segment_to_rank: tuple[int, ...] = ()
-    page_align: bool = True
-    layout: LayoutPolicy = "compact"
-    require_full_prefill: bool = True
     min_tokens: int = RUNAHEAD_MIN_PREFILL_TOKENS
     max_inflight_sends: int = 4
     max_inflight_reads: int = 4
-    page_pull_backend: PagePullBackend = "nixl"
     nixl_backends: tuple[str, ...] = ("UCX",)
 
     @property
     def num_segments(self) -> int:
-        if self.segment_to_rank:
-            return len(self.segment_to_rank)
-        if self.weights is not None:
-            return len(self.weights)
-        return 0
+        return len(self.segment_to_rank)
+
+    @property
+    def mapping_is_permutation(self) -> bool:
+        return is_rank_permutation(self.segment_to_rank, self.pcp_world_size)
+
+    @property
+    def process_group_order(self) -> tuple[int, ...]:
+        """Logical PCP rank -> original physical PCP rank for PG creation."""
+        if self.mapping_is_permutation:
+            return self.segment_to_rank
+        return tuple(range(self.pcp_world_size))
+
+    @property
+    def runtime_segment_to_rank(self) -> tuple[int, ...]:
+        """Mapping visible after process-group ordering has been applied."""
+        if self.mapping_is_permutation:
+            return tuple(range(self.pcp_world_size))
+        return self.segment_to_rank
 
 
 def parse_runahead_weights(
     raw: object,
     pcp_world_size: int,
 ) -> tuple[float, ...] | None:
-    """Parse legacy one-segment-per-rank positive load weights."""
     if raw is None:
         return None
     if not isinstance(raw, (list, tuple)):
@@ -75,13 +88,6 @@ def parse_runahead_segments(
     raw: object,
     pcp_world_size: int,
 ) -> tuple[tuple[float, ...], tuple[int, ...]] | None:
-    """Parse logical segments and physical PCP-rank bindings.
-
-    ``segments`` may contain more entries than physical PCP ranks. Repeated
-    ``pcp_rank`` values are therefore allowed, but every physical rank must own
-    at least one logical segment. Transports that still require a one-to-one
-    mapping reject repetitions later in ``parse_pcp_runahead_config``.
-    """
     if raw is None:
         return None
     if not isinstance(raw, (list, tuple)):
@@ -128,17 +134,15 @@ def parse_runahead_segments(
                 f"segments[{segment_idx}].pcp_rank must be in "
                 f"[0, {pcp_world_size}): {pcp_rank}"
             )
-
         weights.append(weight)
         segment_to_rank.append(pcp_rank)
 
-    present = set(segment_to_rank)
     expected = set(range(pcp_world_size))
+    present = set(segment_to_rank)
     if present != expected:
-        missing = sorted(expected - present)
         raise ValueError(
             "segments[].pcp_rank must cover every PCP rank at least once; "
-            f"missing={missing}, mapping={segment_to_rank}"
+            f"missing={sorted(expected - present)}, mapping={segment_to_rank}"
         )
     return tuple(weights), tuple(segment_to_rank)
 
@@ -152,11 +156,6 @@ def is_rank_permutation(
 
 
 def invert_segment_to_rank(segment_to_rank: tuple[int, ...]) -> tuple[int, ...]:
-    """Return physical-rank -> logical-segment mapping for a permutation.
-
-    Repeated bindings intentionally have no single inverse. Callers supporting
-    repeated ownership should build ``segments_by_rank`` instead.
-    """
     if len(set(segment_to_rank)) != len(segment_to_rank):
         raise ValueError("segment_to_rank is not invertible because ranks repeat")
     rank_to_segment = [0] * len(segment_to_rank)
@@ -186,10 +185,8 @@ def parse_pcp_runahead_config(
     additional_config: object,
     pcp_world_size: int,
 ) -> PCPRunaheadConfig | None:
-    """Parse the nested ``pcp_runahead`` experiment configuration."""
     if not isinstance(additional_config, dict):
         return None
-
     if RUNAHEAD_WEIGHTS_KEY in additional_config:
         raise ValueError(
             f"{RUNAHEAD_WEIGHTS_KEY} is not supported; use "
@@ -205,45 +202,12 @@ def parse_pcp_runahead_config(
         raise ValueError(
             f"{RUNAHEAD_CONFIG_KEY} must be non-empty when used as an object"
         )
-    if "enabled" in raw:
-        raise ValueError(
-            f"{RUNAHEAD_CONFIG_KEY}.enabled is not used; omit the object to disable"
-        )
 
-    partition = _mapping(raw.get("partition"), f"{RUNAHEAD_CONFIG_KEY}.partition")
-    eligibility = _mapping(
-        raw.get("eligibility"), f"{RUNAHEAD_CONFIG_KEY}.eligibility"
-    )
-    runtime = _mapping(raw.get("runtime"), f"{RUNAHEAD_CONFIG_KEY}.runtime")
+    unknown = set(raw) - {"transport", "partition", "eligibility", "runtime", "layout"}
+    if unknown:
+        raise ValueError(f"unsupported {RUNAHEAD_CONFIG_KEY} keys: {sorted(unknown)}")
 
     transport = raw.get("transport", "prefix_p2p")
-    layout = raw.get("layout", "compact")
-
-    raw_weights = partition.get("weights")
-    parsed_segments = parse_runahead_segments(
-        partition.get("segments"), pcp_world_size
-    )
-    if raw_weights is not None and parsed_segments is not None:
-        raise ValueError("partition.weights and partition.segments are mutually exclusive")
-
-    if parsed_segments is not None:
-        weights, segment_to_rank = parsed_segments
-    else:
-        weights = parse_runahead_weights(raw_weights, pcp_world_size)
-        segment_to_rank = tuple(range(pcp_world_size))
-
-    partition_policy = partition.get(
-        "policy",
-        "weighted_contiguous" if weights is not None else "equal_contiguous",
-    )
-    page_align = partition.get("page_align", True)
-    require_full_prefill = eligibility.get("require_full_prefill", True)
-    min_tokens = eligibility.get("min_tokens", RUNAHEAD_MIN_PREFILL_TOKENS)
-    max_inflight_sends = runtime.get("max_inflight_sends", 4)
-    max_inflight_reads = runtime.get("max_inflight_reads", 4)
-    page_pull_backend = runtime.get("page_pull_backend", "nixl")
-    nixl_backends = _string_tuple(runtime.get("nixl_backends", ["UCX"]), "runtime.nixl_backends")
-
     if transport not in (
         "full_kv_collective",
         "prefix_p2p",
@@ -251,85 +215,104 @@ def parse_pcp_runahead_config(
         "page_pull",
     ):
         raise ValueError(f"unsupported PCP runahead transport: {transport!r}")
-    if partition_policy not in (
-        "stock",
-        "equal_contiguous",
-        "weighted_contiguous",
-    ):
-        raise ValueError(f"unsupported PCP partition policy: {partition_policy!r}")
-    if layout not in ("padded", "compact"):
-        raise ValueError(f"unsupported PCP layout: {layout!r}")
-    if page_pull_backend != "nixl":
-        raise ValueError(f"unsupported PCP page-pull backend: {page_pull_backend!r}")
+
+    partition = _mapping(raw.get("partition"), f"{RUNAHEAD_CONFIG_KEY}.partition")
+    unknown_partition = set(partition) - {"segments", "weights", "policy", "page_align"}
+    if unknown_partition:
+        raise ValueError(
+            f"unsupported {RUNAHEAD_CONFIG_KEY}.partition keys: "
+            f"{sorted(unknown_partition)}"
+        )
+
+    raw_weights = partition.get("weights")
+    parsed_segments = parse_runahead_segments(partition.get("segments"), pcp_world_size)
+    if raw_weights is not None and parsed_segments is not None:
+        raise ValueError("partition.weights and partition.segments are mutually exclusive")
+    if parsed_segments is not None:
+        weights, segment_to_rank = parsed_segments
+    else:
+        parsed_weights = parse_runahead_weights(raw_weights, pcp_world_size)
+        weights = parsed_weights or (1.0,) * pcp_world_size
+        segment_to_rank = tuple(range(pcp_world_size))
+
+    # Compatibility validation for knobs that are now derived invariants.
+    policy = partition.get("policy")
+    if policy is not None and policy not in ("equal_contiguous", "weighted_contiguous"):
+        raise ValueError(
+            "runahead uses a compact contiguous partition; "
+            f"unsupported partition.policy={policy!r}"
+        )
+    if policy == "equal_contiguous" and len(set(weights)) != 1:
+        raise ValueError("equal_contiguous is incompatible with non-uniform weights")
+    page_align = partition.get("page_align", True)
     if not isinstance(page_align, bool):
         raise ValueError("partition.page_align must be boolean")
-    if not isinstance(require_full_prefill, bool):
-        raise ValueError("eligibility.require_full_prefill must be boolean")
+    if transport == "page_pull" and not page_align:
+        raise ValueError("page_pull requires partition.page_align=true")
+
+    layout = raw.get("layout", "compact")
+    if layout != "compact":
+        raise ValueError("runahead always uses layout=compact")
+
+    eligibility = _mapping(
+        raw.get("eligibility"), f"{RUNAHEAD_CONFIG_KEY}.eligibility"
+    )
+    unknown_eligibility = set(eligibility) - {"require_full_prefill", "min_tokens"}
+    if unknown_eligibility:
+        raise ValueError(
+            f"unsupported {RUNAHEAD_CONFIG_KEY}.eligibility keys: "
+            f"{sorted(unknown_eligibility)}"
+        )
+    if eligibility.get("require_full_prefill", True) is not True:
+        raise ValueError("runahead requires eligibility.require_full_prefill=true")
+    min_tokens = eligibility.get("min_tokens", RUNAHEAD_MIN_PREFILL_TOKENS)
     if (
         not isinstance(min_tokens, int)
         or isinstance(min_tokens, bool)
         or min_tokens < 0
     ):
         raise ValueError("eligibility.min_tokens must be a non-negative integer")
-    if (
-        not isinstance(max_inflight_sends, int)
-        or isinstance(max_inflight_sends, bool)
-        or max_inflight_sends <= 0
-    ):
-        raise ValueError("runtime.max_inflight_sends must be a positive integer")
-    if (
-        not isinstance(max_inflight_reads, int)
-        or isinstance(max_inflight_reads, bool)
-        or max_inflight_reads <= 0
-    ):
-        raise ValueError("runtime.max_inflight_reads must be a positive integer")
 
-    if partition_policy == "weighted_contiguous" and weights is None:
-        raise ValueError("weighted_contiguous partition requires weights or segments")
-    if partition_policy != "weighted_contiguous" and weights is not None:
+    runtime = _mapping(raw.get("runtime"), f"{RUNAHEAD_CONFIG_KEY}.runtime")
+    unknown_runtime = set(runtime) - {
+        "max_inflight_sends",
+        "max_inflight_reads",
+        "nixl_backends",
+        "page_pull_backend",
+    }
+    if unknown_runtime:
         raise ValueError(
-            "weights/segments are only valid with weighted_contiguous, got "
-            f"{partition_policy}"
+            f"unsupported {RUNAHEAD_CONFIG_KEY}.runtime keys: {sorted(unknown_runtime)}"
         )
-    if partition_policy == "stock":
-        if transport != "full_kv_collective" or layout != "padded":
-            raise ValueError(
-                "stock partition is only supported with "
-                "transport=full_kv_collective and layout=padded"
-            )
+    if runtime.get("page_pull_backend", "nixl") != "nixl":
+        raise ValueError("page_pull uses the NIXL backend")
+    max_inflight_sends = runtime.get("max_inflight_sends", 4)
+    max_inflight_reads = runtime.get("max_inflight_reads", 4)
+    for name, value in (
+        ("runtime.max_inflight_sends", max_inflight_sends),
+        ("runtime.max_inflight_reads", max_inflight_reads),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    nixl_backends = _string_tuple(
+        runtime.get("nixl_backends", ["UCX"]), "runtime.nixl_backends"
+    )
 
-    permutation = is_rank_permutation(segment_to_rank, pcp_world_size)
-    if transport != "page_pull" and not permutation:
+    if transport != "page_pull" and not is_rank_permutation(
+        segment_to_rank, pcp_world_size
+    ):
         raise ValueError(
-            f"transport={transport} currently requires one logical segment per "
-            "PCP rank; repeated segment bindings require transport=page_pull"
+            f"transport={transport} requires one logical segment per PCP rank; "
+            "repeated segment bindings require transport=page_pull"
         )
-
-    if transport in ("prefix_p2p", "direct_p2p", "page_pull"):
-        if partition_policy == "stock":
-            raise ValueError(f"{transport} requires a contiguous partition")
-        if layout != "compact":
-            raise ValueError(f"{transport} requires layout=compact")
-        if not require_full_prefill:
-            raise ValueError(
-                f"{transport} currently requires "
-                "eligibility.require_full_prefill=true"
-            )
-
-    if transport == "page_pull" and not page_align:
-        raise ValueError("page_pull requires partition.page_align=true")
 
     return PCPRunaheadConfig(
+        pcp_world_size=pcp_world_size,
         transport=transport,
-        partition_policy=partition_policy,
         weights=weights,
         segment_to_rank=segment_to_rank,
-        page_align=page_align,
-        layout=layout,
-        require_full_prefill=require_full_prefill,
         min_tokens=min_tokens,
         max_inflight_sends=max_inflight_sends,
         max_inflight_reads=max_inflight_reads,
-        page_pull_backend=page_pull_backend,
         nixl_backends=nixl_backends,
     )
