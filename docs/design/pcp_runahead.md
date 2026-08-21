@@ -254,6 +254,14 @@ segment_to_rank = [1, 0, 1]
 rank 1 owns `S0` and `S2`. While executing `S2`, `S0` is already local and only
 `S1` is pulled from rank 0.
 
+## MoE execution
+
+Runahead does not use PCP ranks as a MoE tensor/expert parallel group. With the
+supported `TP=1`, `DP=1`, and `EP=off` configuration, every PCP rank loads the
+complete routed-expert set and executes routing plus expert kernels locally.
+This avoids MoE PCP `all_gather`/`reduce_scatter` collectives, which are unsafe
+when runahead ranks are executing different layers concurrently.
+
 ## Performance and scaling notes
 
 The refactor removes several PCP-size-sensitive costs:
@@ -282,8 +290,9 @@ Physical rank binding should also consider multi-node topology.
 - standard MHA/GQA/MQA with FlashAttention;
 - PCP > 1;
 - TP = 1, PP = 1, DP = 1, DCP = 1;
-- no EP/MoE, DBO, speculative decoding, async scheduling, or request-level KV
-  transfer connector;
+- no EP; MoE uses full expert replication on every PCP rank;
+- no DBO, speculative decoding, async scheduling, or request-level KV transfer
+  connector;
 - eager execution (`cudagraph_mode=NONE`);
 - fresh complete prefill only;
 - `page_pull`: NIXL available, one standard-attention KV-cache group,

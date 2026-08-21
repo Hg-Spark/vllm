@@ -9,6 +9,7 @@ import torch
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import ParallelConfig, get_current_vllm_config
+from vllm.config.pcp_runahead import parse_pcp_runahead_config
 from vllm.distributed import (
     get_dp_group,
     get_pcp_group,
@@ -47,12 +48,18 @@ def make_parallel_config(
     pcp_size: int | None,
     is_sequence_parallel: bool,
     parallel_config: ParallelConfig,
+    replicate_across_pcp: bool = False,
 ) -> FusedMoEParallelConfig:
     tp_size_ = (
         tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
     )
     dp_size_ = dp_size if dp_size is not None else get_dp_group().world_size
     pcp_size_ = pcp_size if pcp_size is not None else get_pcp_group().world_size
+    if replicate_across_pcp:
+        # PCP runahead ranks may execute different layers concurrently. Keep MoE
+        # token-local by replicating expert weights instead of flattening PCP into
+        # the MoE TP/dispatch topology, which would require PCP collectives.
+        pcp_size_ = 1
     sp_size = tp_size_ if is_sequence_parallel else 1
 
     moe_parallel_config = FusedMoEParallelConfig.make(
@@ -219,6 +226,10 @@ def FusedMoEFactory(
 
     moe_activation = MoEActivation.from_str(activation)
     is_act_and_mul = moe_activation.is_gated
+    runahead_config = parse_pcp_runahead_config(
+        getattr(vllm_config, "additional_config", None),
+        getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1),
+    )
 
     moe_parallel_config = make_parallel_config(
         tp_size=tp_size,
@@ -226,6 +237,7 @@ def FusedMoEFactory(
         pcp_size=pcp_size,
         is_sequence_parallel=is_sequence_parallel,
         parallel_config=vllm_config.parallel_config,
+        replicate_across_pcp=runahead_config is not None,
     )
 
     # Resolve the deferred all-reduce request against the parallel config.
