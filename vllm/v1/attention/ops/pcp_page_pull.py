@@ -10,20 +10,15 @@ the device merely to publish READY.
 
 from __future__ import annotations
 
-import math
 import threading
 import time
-import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import torch
-import torch.distributed as dist
 
-from vllm.distributed.parallel_state import get_pcp_group
-from vllm.platforms import current_platform
+from vllm.v1.attention.ops.pcp_nixl import NixlMemoryRegion, PCPNixlPeerTransport
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_mark, pcp_nvtx_range
 
 
@@ -105,16 +100,6 @@ class PCPPagePlan:
 
 
 @dataclass
-class _MemoryRegistration:
-    base_addr: int
-    block_bytes: int
-    num_blocks: int
-    device_id: int
-    reg_descs: Any
-    local_xfer_handle: int
-
-
-@dataclass
 class _InflightRead:
     layer_id: int
     source_rank: int
@@ -148,20 +133,17 @@ class PCPPagePullTransport:
         self.rank = rank
         self.device = device
         self.max_inflight_reads = max_inflight_reads
-        self.nixl_backends = nixl_backends
-        self.group = pcp_group
+        self._peer = PCPNixlPeerTransport(
+            world_size=world_size,
+            rank=rank,
+            device=device,
+            nixl_backends=nixl_backends,
+            pcp_group=pcp_group,
+        )
 
-        self._wrapper: Any | None = None
-        self._memory_type: str | None = None
-        self._remote_agents: dict[int, str] = {}
-        self._registered_descs: list[Any] = []
-        self._memory_by_ptr: dict[int, _MemoryRegistration] = {}
         self._layer_names: tuple[str, ...] = ()
-        self._layer_memory: list[_MemoryRegistration] = []
+        self._layer_memory: list[NixlMemoryRegion] = []
         self._layer_id_by_ptr: dict[int, int] = {}
-        self._remote_layer_handles: dict[tuple[int, int], int] = {}
-        self._remote_num_blocks: dict[tuple[int, int], int] = {}
-        self._metadata_exchanged = False
 
         self._epoch = 0
         self._plan: PCPPagePlan | None = None
@@ -174,9 +156,6 @@ class PCPPagePullTransport:
         self._progress_stop = threading.Event()
         self._progress_thread: threading.Thread | None = None
         self._progress_error: BaseException | None = None
-
-    def _group(self):
-        return self.group if self.group is not None else get_pcp_group()
 
     @property
     def enabled(self) -> bool:
@@ -191,47 +170,11 @@ class PCPPagePullTransport:
             return self._layer_names[layer_id]
         return layer_id
 
-    def _ensure_wrapper(self) -> None:
-        if self._wrapper is not None:
-            return
-        from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
-
-        if NixlWrapper is None:
-            raise RuntimeError(
-                "PCP transport=page_pull requires NIXL, but NIXL is unavailable"
-            )
-        non_ucx = [backend for backend in self.nixl_backends if backend != "UCX"]
-        if nixl_agent_config is None:
-            config = None
-        elif non_ucx:
-            config = nixl_agent_config(
-                backends=list(self.nixl_backends), capture_telemetry=True
-            )
-        else:
-            config = nixl_agent_config(num_threads=4, capture_telemetry=True)
-        self._wrapper = NixlWrapper(
-            f"pcp-page-pull-r{self.rank}-{uuid.uuid4()}", config
-        )
-        memory_type = current_platform.get_nixl_memory_type()
-        if memory_type is None:
-            memory_type = "VRAM" if self.device.type in ("cuda", "xpu") else "DRAM"
-        self._memory_type = memory_type
-
-    def _ensure_remote_agents(self) -> None:
-        if self._remote_agents or self.world_size <= 1:
-            return
-        self._ensure_wrapper()
-        assert self._wrapper is not None
-        group = self._group()
-        gathered: list[Any] = [None] * self.world_size
-        dist.all_gather_object(
-            gathered,
-            self._wrapper.get_agent_metadata(),
-            group=group.cpu_group,
-        )
-        for source_rank, metadata in enumerate(gathered):
-            if source_rank != self.rank:
-                self._remote_agents[source_rank] = self._wrapper.add_remote_agent(metadata)
+    @staticmethod
+    def _physical_page_geometry(kv_cache: torch.Tensor) -> tuple[int, int]:
+        # Keep the PCP-facing helper for tests and validation callers while the
+        # generic geometry/registration implementation lives in pcp_nixl.
+        return PCPNixlPeerTransport.physical_page_geometry(kv_cache)
 
     def configure_step(self, *, epoch: int, plan: PCPPagePlan) -> None:
         self.finish_step()
@@ -249,81 +192,13 @@ class PCPPagePullTransport:
         self._done_pairs.clear()
         self._progress_error = None
         if self._layer_memory:
-            self._ensure_remote_agents()
+            self._peer.ensure_peers()
             self._start_progress_thread()
         pcp_nvtx_mark("pcp.page_pull_step_begin", e=self._epoch, rank=self.rank)
 
     def disable_step(self) -> None:
         self.finish_step()
         self._plan = None
-
-    @staticmethod
-    def _block_descriptors(
-        *, base_addr: int, block_bytes: int, num_blocks: int, device_id: int
-    ) -> np.ndarray:
-        blocks = np.arange(num_blocks, dtype=np.uint64)
-        result = np.empty((num_blocks, 3), dtype=np.uint64)
-        result[:, 0] = np.uint64(base_addr) + blocks * np.uint64(block_bytes)
-        result[:, 1] = np.uint64(block_bytes)
-        result[:, 2] = np.uint64(device_id)
-        return result
-
-    @staticmethod
-    def _physical_page_geometry(kv_cache: torch.Tensor) -> tuple[int, int]:
-        if kv_cache.ndim < 2:
-            raise RuntimeError(
-                f"PCP page-pull expects block-major KV cache, got {kv_cache.shape}"
-            )
-        num_blocks = int(kv_cache.shape[0])
-        page_elements = math.prod(kv_cache.shape[1:])
-        # NHD and HND are different logical views of the same dense physical
-        # page. Inner logical contiguity is irrelevant for whole-page NIXL I/O.
-        if kv_cache.stride(0) != page_elements:
-            raise NotImplementedError(
-                "PCP page_pull requires dense block-major KV pages; "
-                f"shape={tuple(kv_cache.shape)}, stride={tuple(kv_cache.stride())}"
-            )
-        return num_blocks, int(page_elements * kv_cache.element_size())
-
-    def _register_memory(self, kv_cache: torch.Tensor) -> _MemoryRegistration:
-        self._ensure_wrapper()
-        assert self._wrapper is not None and self._memory_type is not None
-        ptr = kv_cache.data_ptr()
-        existing = self._memory_by_ptr.get(ptr)
-        if existing is not None:
-            return existing
-        if kv_cache.device.type != self.device.type:
-            raise RuntimeError(
-                "PCP page-pull KV cache device changed unexpectedly: "
-                f"runtime={self.device}, cache={kv_cache.device}"
-            )
-        num_blocks, block_bytes = self._physical_page_geometry(kv_cache)
-        if num_blocks <= 0 or block_bytes <= 0:
-            raise RuntimeError("PCP page-pull cannot register an empty KV cache")
-        device_id = max(kv_cache.get_device(), 0)
-        reg_descs = self._wrapper.get_reg_descs(
-            [(ptr, num_blocks * block_bytes, device_id, "")], self._memory_type
-        )
-        self._wrapper.register_memory(reg_descs, backends=list(self.nixl_backends))
-        block_data = self._block_descriptors(
-            base_addr=ptr,
-            block_bytes=block_bytes,
-            num_blocks=num_blocks,
-            device_id=device_id,
-        )
-        xfer_descs = self._wrapper.get_xfer_descs(block_data, self._memory_type)
-        local_handle = self._wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", xfer_descs)
-        registration = _MemoryRegistration(
-            base_addr=ptr,
-            block_bytes=block_bytes,
-            num_blocks=num_blocks,
-            device_id=device_id,
-            reg_descs=reg_descs,
-            local_xfer_handle=local_handle,
-        )
-        self._registered_descs.append(reg_descs)
-        self._memory_by_ptr[ptr] = registration
-        return registration
 
     @staticmethod
     def _discover_bound_layer_caches() -> dict[str, torch.Tensor]:
@@ -340,62 +215,11 @@ class PCPPagePullTransport:
             result[layer_name] = kv_cache
         return result
 
-    @staticmethod
-    def _wire_meta(registration: _MemoryRegistration) -> tuple[int, int, int, int]:
-        return (
-            registration.base_addr,
-            registration.block_bytes,
-            registration.num_blocks,
-            registration.device_id,
-        )
-
-    def _exchange_layer_metadata(self) -> None:
-        if self._metadata_exchanged or not self._layer_memory:
-            return
-        self._ensure_remote_agents()
-        assert self._wrapper is not None and self._memory_type is not None
-        group = self._group()
-        local_meta = tuple(self._wire_meta(item) for item in self._layer_memory)
-        gathered: list[Any] = [None] * self.world_size
-        dist.all_gather_object(gathered, local_meta, group=group.cpu_group)
-        for source_rank, remote_layers in enumerate(gathered):
-            if len(remote_layers) != len(self._layer_memory):
-                raise RuntimeError(
-                    "PCP page-pull layer registration differs across ranks: "
-                    f"rank={source_rank}, layers={len(remote_layers)}, "
-                    f"local={len(self._layer_memory)}"
-                )
-            if source_rank == self.rank:
-                continue
-            for layer_id, meta in enumerate(remote_layers):
-                base_addr, block_bytes, num_blocks, device_id = map(int, meta)
-                local = self._layer_memory[layer_id]
-                if block_bytes != local.block_bytes:
-                    raise RuntimeError(
-                        "PCP page-pull requires homogeneous KV page bytes: "
-                        f"local={local.block_bytes}, remote={block_bytes}, "
-                        f"source_rank={source_rank}, layer_id={layer_id}"
-                    )
-                block_data = self._block_descriptors(
-                    base_addr=base_addr,
-                    block_bytes=block_bytes,
-                    num_blocks=num_blocks,
-                    device_id=device_id,
-                )
-                descs = self._wrapper.get_xfer_descs(block_data, self._memory_type)
-                self._remote_layer_handles[(source_rank, layer_id)] = (
-                    self._wrapper.prep_xfer_dlist(
-                        self._remote_agents[source_rank], descs
-                    )
-                )
-                self._remote_num_blocks[(source_rank, layer_id)] = num_blocks
-        self._metadata_exchanged = True
-
     def register_layer_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if not kv_caches:
             raise RuntimeError("PCP page_pull received no tensor KV caches to register")
         layer_names = tuple(sorted(kv_caches))
-        registrations = [self._register_memory(kv_caches[name]) for name in layer_names]
+        registrations = [self._peer.register_tensor(kv_caches[name]) for name in layer_names]
         if self._layer_names:
             if layer_names != self._layer_names:
                 raise RuntimeError(
@@ -415,7 +239,7 @@ class PCPPagePullTransport:
                 registration.base_addr: layer_id
                 for layer_id, registration in enumerate(registrations)
             }
-        self._exchange_layer_metadata()
+        self._peer.exchange_regions(self._layer_memory)
         if self._plan is not None:
             self._start_progress_thread()
 
@@ -450,12 +274,11 @@ class PCPPagePullTransport:
         self._check_progress_error()
 
     def _send_ready(self, layer_id: int) -> None:
-        assert self._wrapper is not None and self._plan is not None
+        assert self._plan is not None
+        destinations = self._plan.consumer_ranks(self.rank)
         msg = f"{self._NOTIF_PREFIX}:{self._epoch}:{layer_id}:{self.rank}".encode()
-        for destination_rank in self._plan.consumer_ranks(self.rank):
-            self._wrapper.send_notif(
-                self._remote_agents[destination_rank], notif_msg=msg
-            )
+        self._peer.send_notification(destinations, msg)
+        for destination_rank in destinations:
             pcp_nvtx_mark(
                 "pcp.page_pull_ready_send",
                 e=self._epoch,
@@ -479,44 +302,42 @@ class PCPPagePullTransport:
             self._send_ready(pending.layer_id)
 
     def _poll_ready_notifications(self) -> None:
-        assert self._wrapper is not None
-        for notifications in self._wrapper.get_new_notifs().values():
-            for raw in notifications:
-                try:
-                    prefix, epoch, layer_id, source_rank = raw.decode().split(":")
-                    epoch_i = int(epoch)
-                    layer_i = int(layer_id)
-                    source_i = int(source_rank)
-                except (ValueError, UnicodeDecodeError) as exc:
-                    raise RuntimeError(
-                        f"invalid PCP page-pull NIXL notification: {raw!r}"
-                    ) from exc
-                if prefix != self._NOTIF_PREFIX:
-                    continue
-                if epoch_i != self._epoch:
-                    raise RuntimeError(
-                        "PCP page-pull READY epoch mismatch: "
-                        f"got={epoch_i}, expected={self._epoch}"
-                    )
-                if self._plan is None or source_i not in self._plan.required_source_ranks(
-                    self.rank
-                ):
-                    raise RuntimeError(
-                        f"unexpected PCP READY source rank {source_i} for rank {self.rank}"
-                    )
-                key = (layer_i, source_i)
-                if key not in self._done_pairs and key not in self._inflight:
-                    self._ready_waiting.append(key)
-                    pcp_nvtx_mark(
-                        "pcp.page_pull_ready_recv",
-                        e=self._epoch,
-                        l=self._layer_label(layer_i),
-                        src=source_i,
-                        dst=self.rank,
-                    )
+        for raw in self._peer.get_notifications():
+            try:
+                prefix, epoch, layer_id, source_rank = raw.decode().split(":")
+                epoch_i = int(epoch)
+                layer_i = int(layer_id)
+                source_i = int(source_rank)
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise RuntimeError(
+                    f"invalid PCP page-pull NIXL notification: {raw!r}"
+                ) from exc
+            if prefix != self._NOTIF_PREFIX:
+                continue
+            if epoch_i != self._epoch:
+                raise RuntimeError(
+                    "PCP page-pull READY epoch mismatch: "
+                    f"got={epoch_i}, expected={self._epoch}"
+                )
+            if self._plan is None or source_i not in self._plan.required_source_ranks(
+                self.rank
+            ):
+                raise RuntimeError(
+                    f"unexpected PCP READY source rank {source_i} for rank {self.rank}"
+                )
+            key = (layer_i, source_i)
+            if key not in self._done_pairs and key not in self._inflight:
+                self._ready_waiting.append(key)
+                pcp_nvtx_mark(
+                    "pcp.page_pull_ready_recv",
+                    e=self._epoch,
+                    l=self._layer_label(layer_i),
+                    src=source_i,
+                    dst=self.rank,
+                )
 
     def _start_read(self, layer_id: int, source_rank: int) -> None:
-        assert self._wrapper is not None and self._plan is not None
+        assert self._plan is not None
         local = self._layer_memory[layer_id]
         destination_ids, source_ids = self._plan.transfer_block_ids(
             self.rank, source_rank
@@ -534,17 +355,6 @@ class PCPPagePullTransport:
                 pages=0,
             )
             return
-        if max(destination_ids) >= local.num_blocks:
-            raise RuntimeError(
-                "PCP page-pull destination block id exceeds local cache: "
-                f"max={max(destination_ids)}, num_blocks={local.num_blocks}"
-            )
-        remote_num_blocks = self._remote_num_blocks[(source_rank, layer_id)]
-        if max(source_ids) >= remote_num_blocks:
-            raise RuntimeError(
-                "PCP page-pull source block id exceeds remote cache: "
-                f"max={max(source_ids)}, num_blocks={remote_num_blocks}"
-            )
         with pcp_nvtx_range(
             "pcp.page_pull_read_submit",
             e=self._epoch,
@@ -553,14 +363,13 @@ class PCPPagePullTransport:
             dst=self.rank,
             pages=num_pages,
         ):
-            handle = self._wrapper.make_prepped_xfer(
-                "READ",
-                local.local_xfer_handle,
-                np.asarray(destination_ids, dtype=np.int64),
-                self._remote_layer_handles[(source_rank, layer_id)],
-                np.asarray(source_ids, dtype=np.int64),
+            handle = self._peer.submit_read(
+                local_region=local,
+                local_block_ids=destination_ids,
+                source_rank=source_rank,
+                remote_region_id=layer_id,
+                remote_block_ids=source_ids,
             )
-            self._wrapper.transfer(handle)
         self._inflight[key] = _InflightRead(
             layer_id, source_rank, handle, num_pages
         )
@@ -568,7 +377,6 @@ class PCPPagePullTransport:
     def _progress_once(self) -> None:
         if self._plan is None:
             return
-        assert self._wrapper is not None
         self._publish_completed_ready()
         self._poll_ready_notifications()
         while self._ready_waiting and len(self._inflight) < self.max_inflight_reads:
@@ -576,10 +384,9 @@ class PCPPagePullTransport:
             self._start_read(layer_id, source_rank)
 
         for key, transfer in list(self._inflight.items()):
-            state = self._wrapper.check_xfer_state(transfer.handle)
+            state = self._peer.check_read(transfer.handle)
             if state == "PROC":
                 continue
-            self._wrapper.release_xfer_handle(transfer.handle)
             del self._inflight[key]
             if state != "DONE":
                 raise RuntimeError(
@@ -612,7 +419,7 @@ class PCPPagePullTransport:
     def _start_progress_thread(self) -> None:
         if self._plan is None or self._progress_thread is not None:
             return
-        self._ensure_remote_agents()
+        self._peer.ensure_peers()
         self._progress_stop.clear()
         self._progress_error = None
         self._progress_thread = threading.Thread(
