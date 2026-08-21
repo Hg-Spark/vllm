@@ -165,6 +165,7 @@ class PCPPagePullTransport:
 
         self._epoch = 0
         self._plan: PCPPagePlan | None = None
+        self._step_finished = True
         self._pending_ready: deque[_PendingReady] = deque()
         self._ready_waiting: deque[tuple[int, int]] = deque()
         self._inflight: dict[tuple[int, int], _InflightRead] = {}
@@ -236,6 +237,7 @@ class PCPPagePullTransport:
             )
         self._epoch = epoch
         self._plan = plan
+        self._step_finished = False
         self._fallback_layer_cursor = 0
         self._pending_ready.clear()
         self._ready_waiting.clear()
@@ -608,6 +610,8 @@ class PCPPagePullTransport:
         }
 
     def finish_step(self) -> None:
+        if self._step_finished:
+            return
         if self._plan is not None and self._layer_memory:
             expected = self._expected_pairs()
             while self._pending_ready or not expected.issubset(self._done_pairs):
@@ -625,6 +629,7 @@ class PCPPagePullTransport:
         self._ready_waiting.clear()
         self._inflight.clear()
         self._done_pairs.clear()
+        self._step_finished = True
 
 
 __all__ = ["PCPPagePlan", "PCPPagePullTransport"]
