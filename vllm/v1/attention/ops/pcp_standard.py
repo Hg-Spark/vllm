@@ -97,14 +97,4 @@ def prepare_standard_pcp_kv_cache_inputs(
     return key, value, slot_mapping
 
 
-def finish_standard_pcp_kv_cache_update(kv_cache: torch.Tensor) -> None:
-    """Publish page-pull READY after FlashAttention's native cache write."""
-    runtime = get_pcp_runahead_runtime()
-    if runtime is not None and runtime.transport == "page_pull":
-        runtime.page_pull_after_cache_write(kv_cache)
-
-
-__all__ = [
-    "finish_standard_pcp_kv_cache_update",
-    "prepare_standard_pcp_kv_cache_inputs",
-]
+__all__ = ["prepare_standard_pcp_kv_cache_inputs"]
