@@ -12,6 +12,8 @@ import typing
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
 import vllm.env_override  # noqa: F401
+# Register PCP-only environment flags before validation in entrypoints/workers.
+import vllm.pcp_env  # noqa: F401
 
 MODULE_ATTRS = {
     "AsyncEngineArgs": ".engine.arg_utils:AsyncEngineArgs",
