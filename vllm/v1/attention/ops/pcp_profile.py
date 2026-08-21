@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from typing import ContextManager
 
 import torch
 
@@ -21,6 +22,7 @@ _PCP_NVTX_ENABLED = os.environ.get("VLLM_PCP_NVTX", "0").lower() in {
     "yes",
     "on",
 }
+_PCP_NOOP_RANGE: ContextManager[None] = nullcontext()
 
 
 def pcp_nvtx_enabled() -> bool:
@@ -36,15 +38,19 @@ def pcp_nvtx_name(event: str, **fields: object) -> str:
 
 
 @contextmanager
-def pcp_nvtx_range(name: str) -> Iterator[None]:
-    if not _PCP_NVTX_ENABLED:
-        yield
-        return
+def _enabled_pcp_nvtx_range(name: str) -> Iterator[None]:
     torch.cuda.nvtx.range_push(name)
     try:
         yield
     finally:
         torch.cuda.nvtx.range_pop()
+
+
+def pcp_nvtx_range(name: str) -> ContextManager[None]:
+    """Return a profiling range with a shared zero-allocation disabled path."""
+    if not _PCP_NVTX_ENABLED:
+        return _PCP_NOOP_RANGE
+    return _enabled_pcp_nvtx_range(name)
 
 
 def pcp_nvtx_mark(name: str) -> None:
