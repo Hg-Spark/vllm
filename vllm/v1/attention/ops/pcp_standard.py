@@ -11,6 +11,13 @@ from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 from vllm.v1.attention.ops.pcp_runahead import get_pcp_runahead_runtime
 
 
+_TENSOR_TRANSPORT_RANGES = {
+    "full_kv_collective": "pcp.full_kv_exchange",
+    "prefix_p2p": "pcp.prefix_exchange",
+    "direct_p2p": "pcp.direct_exchange",
+}
+
+
 def prepare_standard_pcp_kv_cache_inputs(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -20,30 +27,6 @@ def prepare_standard_pcp_kv_cache_inputs(
     """Prepare FlashAttention cache-write inputs using PCP's active policy."""
     runtime = get_pcp_runahead_runtime()
     if runtime is not None:
-        if runtime.transport == "prefix_p2p":
-            with pcp_nvtx_range(
-                "pcp.prefix_exchange",
-                e=runtime.epoch,
-                rank=runtime.rank,
-                rows=runtime.local_rows,
-            ):
-                (key, value), slot_mapping = runtime.exchange_prefix(
-                    (key, value), slot_mapping
-                )
-            return key, value, slot_mapping
-
-        if runtime.transport == "direct_p2p":
-            with pcp_nvtx_range(
-                "pcp.direct_exchange",
-                e=runtime.epoch,
-                rank=runtime.rank,
-                rows=runtime.local_rows,
-            ):
-                (key, value), slot_mapping = runtime.exchange_direct(
-                    (key, value), slot_mapping
-                )
-            return key, value, slot_mapping
-
         if runtime.transport == "page_pull":
             if key.shape[0] != runtime.local_rows or value.shape[0] != runtime.local_rows:
                 raise RuntimeError(
@@ -55,46 +38,19 @@ def prepare_standard_pcp_kv_cache_inputs(
             runtime.page_pull_prepare_layer(kv_cache)
             return key, value, local_slot_mapping
 
-        if runtime.transport == "full_kv_collective":
-            if key.shape[0] != runtime.local_rows or value.shape[0] != runtime.local_rows:
-                raise RuntimeError(
-                    "PCP compact full-KV collective expects configured local rows: "
-                    f"key={key.shape[0]}, value={value.shape[0]}, "
-                    f"expected={runtime.local_rows}"
-                )
-            if slot_mapping.shape[0] < runtime.total_rows:
-                raise RuntimeError(
-                    "PCP compact slot mapping is shorter than full gathered rows: "
-                    f"slots={slot_mapping.shape[0]}, rows={runtime.total_rows}"
-                )
-            group = runtime._group()
-            sizes = list(runtime.rows_per_rank)
-            if len(set(sizes)) == 1:
-                with pcp_nvtx_range(
-                    "pcp.full_kv_allgather",
-                    e=runtime.epoch,
-                    rank=runtime.rank,
-                    rows=runtime.local_rows,
-                    total=runtime.total_rows,
-                ):
-                    key = group.all_gather(key.contiguous(), dim=0)
-                    value = group.all_gather(value.contiguous(), dim=0)
-            else:
-                with pcp_nvtx_range(
-                    "pcp.full_kv_allgatherv",
-                    e=runtime.epoch,
-                    rank=runtime.rank,
-                    rows=runtime.local_rows,
-                    total=runtime.total_rows,
-                ):
-                    key, value = group.all_gatherv(
-                        [key.contiguous(), value.contiguous()],
-                        dim=0,
-                        sizes=sizes,
-                    )
-            return key, value, slot_mapping[: runtime.total_rows]
-
-        raise RuntimeError(f"unsupported active PCP transport: {runtime.transport!r}")
+        range_name = _TENSOR_TRANSPORT_RANGES.get(runtime.transport)
+        if range_name is None:
+            raise RuntimeError(f"unsupported active PCP transport: {runtime.transport!r}")
+        with pcp_nvtx_range(
+            range_name,
+            e=runtime.epoch,
+            rank=runtime.rank,
+            rows=runtime.local_rows,
+        ):
+            (key, value), slot_mapping = runtime.exchange_cache_inputs(
+                (key, value), slot_mapping
+            )
+        return key, value, slot_mapping
 
     pcp_group = get_pcp_group()
     if pcp_group.world_size <= 1 or slot_mapping.shape[0] <= key.shape[0]:
