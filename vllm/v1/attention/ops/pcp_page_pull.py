@@ -305,6 +305,12 @@ class PCPPagePullTransport:
             if source_rank != self.rank:
                 self._remote_agents[source_rank] = self._wrapper.add_remote_agent(metadata)
 
+    def _clear_step_state_locked(self) -> None:
+        self._pending_ready.clear()
+        self._ready_waiting.clear()
+        self._inflight.clear()
+        self._done_pairs.clear()
+
     def configure_step(self, *, epoch: int, plan: PCPPagePlan) -> None:
         self.finish_step()
         self._check_progress_error()
@@ -313,13 +319,11 @@ class PCPPagePullTransport:
                 "page plan PCP world size mismatch: "
                 f"plan={plan.world_size}, runtime={self.world_size}"
             )
-        self._epoch = epoch
-        self._plan = plan
-        self._step_finished = False
-        self._pending_ready.clear()
-        self._ready_waiting.clear()
-        self._inflight.clear()
-        self._done_pairs.clear()
+        with self._progress_lock:
+            self._epoch = epoch
+            self._plan = plan
+            self._step_finished = False
+            self._clear_step_state_locked()
         if self._layer_memory:
             self._ensure_remote_agents()
             self._start_progress_thread()
@@ -690,26 +694,32 @@ class PCPPagePullTransport:
             for source_rank in required_sources
         }
 
+    def _finish_step_if_ready(self) -> bool:
+        with self._progress_lock:
+            if self._step_finished:
+                return True
+            if self._plan is not None and self._layer_memory:
+                expected = self._expected_pairs()
+                if self._pending_ready or not expected.issubset(self._done_pairs):
+                    return False
+            self._plan = None
+            self._clear_step_state_locked()
+            self._step_finished = True
+            return True
+
     def finish_step(self) -> None:
         if self._step_finished:
             return
-        if self._plan is not None and self._layer_memory:
-            expected = self._expected_pairs()
-            while self._pending_ready or not expected.issubset(self._done_pairs):
-                self._check_progress_error()
-                if self._progress_thread is None:
-                    self._progress_once()
+        while not self._finish_step_if_ready():
+            self._check_progress_error()
+            if self._progress_thread is None:
+                self._progress_once()
+            else:
+                self._progress_wakeup.set()
                 time.sleep(self._POLL_INTERVAL_S)
 
         self._check_progress_error()
-        self._plan = None
         self._progress_wakeup.set()
-        with self._progress_lock:
-            self._pending_ready.clear()
-            self._ready_waiting.clear()
-            self._inflight.clear()
-            self._done_pairs.clear()
-            self._step_finished = True
 
 
 __all__ = ["PCPPagePlan", "PCPPagePullTransport"]
