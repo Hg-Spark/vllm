@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -65,7 +66,7 @@ class PCPNixlPeerTransport:
         self._memory_by_ptr: dict[int, NixlMemoryRegion] = {}
         self._remote_region_handles: dict[tuple[int, int], int] = {}
         self._remote_num_blocks: dict[tuple[int, int], int] = {}
-        self._registered_region_signature: tuple[tuple[int, int], ...] = ()
+        self._registered_region_signature: tuple[tuple[int, int, int, int], ...] = ()
         self._metadata_exchanged = False
 
     def _group(self):
@@ -191,7 +192,7 @@ class PCPNixlPeerTransport:
 
     def exchange_regions(self, regions: Sequence[NixlMemoryRegion]) -> None:
         """Exchange stable peer geometry once and prepare remote descriptor lists."""
-        signature = tuple((region.base_addr, region.block_bytes) for region in regions)
+        signature = tuple(self._wire_meta(region) for region in regions)
         if self._metadata_exchanged:
             if signature != self._registered_region_signature:
                 raise RuntimeError("PCP page-pull registered region geometry changed")
