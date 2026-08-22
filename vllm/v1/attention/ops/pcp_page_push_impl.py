@@ -6,8 +6,8 @@ The data path is owner-driven NIXL WRITE:
 
 * CURRENT pushes satisfy same-step causal dependencies.
 * REPLICA pushes materialize finalized full pages for later chunks.
-* Historical replicas are owned by PCPPageStateTracker; this transport has no
-  cross-step state and rejects historical transfer routes.
+* Historical replicas are owned by PCPPageStateTracker; this transport carries
+  no cross-step state.
 
 Writes are drained before the restore/scheduler boundary, so NIXL DMA never
 outlives vLLM's physical KV-block lifetime fence.
@@ -146,19 +146,6 @@ class PCPPagePushTransport:
         self._incoming_done.clear()
         self._deferred_notifications.clear()
 
-    def _reject_historical_routes(self, plan: PCPPagePlan) -> None:
-        historical = {
-            rank: plan.historical_source_ranks(rank)
-            for rank in range(self.world_size)
-            if plan.historical_source_ranks(rank)
-        }
-        if historical:
-            raise RuntimeError(
-                "PCP producer-push received a historical transfer route; "
-                "historical replicas must already be present in page state and "
-                f"fallback is disabled: {historical}"
-            )
-
     def configure_step(self, *, epoch: int, plan: PCPPagePlan) -> None:
         self.finish_step()
         self._check_progress_error()
@@ -167,7 +154,6 @@ class PCPPagePushTransport:
                 "page plan PCP world size mismatch: "
                 f"plan={plan.world_size}, runtime={self.world_size}"
             )
-        self._reject_historical_routes(plan)
         if not self._layer_memory:
             caches = self._discover_bound_layer_caches()
             if caches:
@@ -203,7 +189,6 @@ class PCPPagePushTransport:
         if not kv_caches:
             raise RuntimeError("PCP page-push received no tensor KV caches to register")
 
-        # static_forward_context insertion order is model execution order.
         layer_names = tuple(kv_caches)
         registrations = [
             self._peer.register_tensor(kv_caches[name]) for name in layer_names
