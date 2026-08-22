@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from vllm.v1.attention.ops.pcp_page_pull import PCPPagePlan, PCPPagePullTransport
+from vllm.v1.attention.ops.pcp_page_plan import PCPPageRoute
 
 
 def _transport() -> PCPPagePullTransport:
@@ -20,19 +21,65 @@ def _transport() -> PCPPagePullTransport:
 
 def test_ready_scheduler_prioritizes_demanded_layer() -> None:
     transport = _transport()
-    transport._ready_waiting.extend(((9, 0), (4, 0), (5, 0)))
+    transport._ready_waiting.extend(
+        ((9, 0, "history"), (4, 0, "current"), (5, 0, "history"))
+    )
     transport._demand_layer = 4
 
-    assert transport._pop_ready_locked() == (4, 0)
-    assert tuple(transport._ready_waiting) == ((9, 0), (5, 0))
+    assert transport._pop_ready_locked() == (4, 0, "current")
+    assert tuple(transport._ready_waiting) == (
+        (9, 0, "history"),
+        (5, 0, "history"),
+    )
+
+
+def test_ready_scheduler_prefers_demanded_history_before_current() -> None:
+    transport = _transport()
+    transport._ready_waiting.extend(
+        ((4, 0, "current"), (4, 0, "history"), (5, 0, "history"))
+    )
+    transport._demand_layer = 4
+
+    assert transport._pop_ready_locked() == (4, 0, "history")
 
 
 def test_ready_scheduler_keeps_fifo_without_demand() -> None:
     transport = _transport()
-    transport._ready_waiting.extend(((9, 0), (4, 0)))
+    transport._ready_waiting.extend(((9, 0, "history"), (4, 0, "current")))
 
-    assert transport._pop_ready_locked() == (9, 0)
-    assert transport._pop_ready_locked() == (4, 0)
+    assert transport._pop_ready_locked() == (9, 0, "history")
+    assert transport._pop_ready_locked() == (4, 0, "current")
+
+
+def test_explicit_plan_only_sends_ready_for_current_routes() -> None:
+    history = (
+        (None, None),
+        (
+            PCPPageRoute(
+                destination_rank=1,
+                source_rank=0,
+                destination_block_ids=(3,),
+                source_block_ids=(3,),
+            ),
+            None,
+        ),
+    )
+    current = (
+        (None, None),
+        (None, None),
+    )
+    plan = PCPPagePlan(
+        segment_to_rank=(),
+        blocks_by_segment=(),
+        block_size=16,
+        history_routes_by_rank=history,
+        current_routes_by_rank=current,
+        explicit_world_size=2,
+    )
+
+    assert plan.historical_source_ranks(1) == (0,)
+    assert plan.current_source_ranks(1) == ()
+    assert plan.consumer_ranks(0) == ()
 
 
 def test_configure_step_pre_registers_bound_caches() -> None:
