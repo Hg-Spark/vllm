@@ -6,6 +6,7 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_tp_group,
 )
+from vllm.forward_context import get_forward_context
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 from vllm.v1.attention.ops.pcp_runahead import get_pcp_runahead_runtime
 
@@ -59,6 +60,58 @@ def _gather_prefill_cache_inputs(
     return cache_inputs, cache_slot_mapping
 
 
+def _ensure_mla_page_pull_cache_write_hooks() -> None:
+    """Wrap MLA native cache writes with the page-pull layer lifecycle.
+
+    MLA has both a direct eager path and an opaque custom-op path. Both paths
+    ultimately call ``impl.do_kv_cache_update``. Wrapping that single native
+    write boundary keeps page readiness ordered after the latent cache write
+    without duplicating transport logic in each MLA execution path.
+    """
+    forward_context = get_forward_context()
+    for layer in forward_context.no_compile_layers.values():
+        impl = getattr(layer, "impl", None)
+        if (
+            impl is None
+            or not hasattr(layer, "kv_lora_rank")
+            or not hasattr(layer, "kv_cache_dtype")
+            or not hasattr(impl, "do_kv_cache_update")
+            or getattr(impl, "_pcp_mla_page_pull_wrapped", False)
+        ):
+            continue
+
+        cache_dtype = str(layer.kv_cache_dtype)
+        if cache_dtype not in ("auto", "float16", "bfloat16"):
+            raise NotImplementedError(
+                "MLA PCP page_pull currently supports unquantized FP16/BF16 "
+                f"KV cache only, got cache_dtype={cache_dtype}"
+            )
+
+        original_cache_update = impl.do_kv_cache_update
+
+        def page_pull_cache_update(*args, _original=original_cache_update, **kwargs):
+            runtime = get_pcp_runahead_runtime()
+            if runtime is None or runtime.transport != "page_pull":
+                return _original(*args, **kwargs)
+
+            if len(args) >= 3:
+                kv_cache = args[2]
+            else:
+                kv_cache = kwargs.get("kv_cache")
+            if not isinstance(kv_cache, torch.Tensor):
+                raise RuntimeError(
+                    "MLA PCP page_pull could not identify the native KV cache tensor"
+                )
+
+            runtime.page_pull_prepare_layer(kv_cache)
+            result = _original(*args, **kwargs)
+            runtime.page_pull_after_cache_write(kv_cache)
+            return result
+
+        impl.do_kv_cache_update = page_pull_cache_update
+        impl._pcp_mla_page_pull_wrapped = True
+
+
 def _exchange_runahead_cache_inputs(
     tensors: tuple[torch.Tensor, ...],
     slot_mapping: torch.Tensor,
@@ -68,7 +121,14 @@ def _exchange_runahead_cache_inputs(
     if runtime is None:
         return None
     if runtime.transport == "page_pull":
-        raise NotImplementedError("MLA PCP runahead does not support page_pull yet")
+        if any(tensor.shape[0] != runtime.local_rows for tensor in tensors):
+            raise RuntimeError(
+                "MLA PCP page_pull expects configured rank-local latent rows: "
+                f"rows={[tensor.shape[0] for tensor in tensors]}, "
+                f"expected={runtime.local_rows}"
+            )
+        _ensure_mla_page_pull_cache_write_hooks()
+        return tensors, runtime.rank_local_slot_mapping(slot_mapping)
     range_name = _MLA_RUNAHEAD_RANGES.get(runtime.transport)
     if range_name is None:
         raise RuntimeError(f"unexpected PCP runahead transport: {runtime.transport!r}")
