@@ -63,8 +63,10 @@ def test_chunked_eligibility_allows_nonzero_computed_tokens() -> None:
 
 def test_chunked_layout_keeps_mutable_tail_on_existing_owner() -> None:
     manager = _chunk_manager()
-    state = manager._page_state.prepare_request(0, "req", 5)
-    manager._page_state.assign_owner(state, 0, 1)
+    tracker = manager._page_state
+    assert tracker is not None
+    state = tracker.prepare_request(0, "req", 5)
+    tracker.assign_owner(state, 0, 1)
 
     layout = manager._compile_segment_layout(_batch(scheduled=64, computed=5))
 
@@ -91,11 +93,13 @@ def test_chunked_layout_rejects_unknown_nonzero_prefix() -> None:
 
 def test_chunked_plan_separates_history_from_current_dependencies() -> None:
     manager = _chunk_manager()
-    state = manager._page_state.prepare_request(0, "req", 32)
-    manager._page_state.assign_owner(state, 0, 0)
-    manager._page_state.assign_owner(state, 1, 1)
-    manager._page_state.mark_local_valid(state, 0, 10)
-    manager._page_state.advance(state, 32)
+    tracker = manager._page_state
+    assert tracker is not None
+    state = tracker.prepare_request(0, "req", 32)
+    tracker.assign_owner(state, 0, 0)
+    tracker.assign_owner(state, 1, 1)
+    tracker.mark_local_valid(state, 0, 10)
+    tracker.advance(state, 32)
 
     batch = _batch(scheduled=32, computed=32)
     layout = manager._compile_segment_layout(batch)
