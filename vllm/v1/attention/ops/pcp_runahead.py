@@ -133,6 +133,14 @@ class PCPRunaheadRuntime:
         self.transport = transport
         self.active = True
         self._epoch += 1
+        pcp_nvtx_mark(
+            "pcp.runahead_step_begin",
+            e=self._epoch,
+            rank=self.rank,
+            transport=transport,
+            local_rows=self.local_rows,
+            total_rows=self.total_rows,
+        )
 
     def configure_page_plan(self, plan: PCPPagePlan) -> None:
         if not self.active or self.transport != "page_pull":
@@ -156,6 +164,13 @@ class PCPRunaheadRuntime:
         self.flush()
         if self._page_pull is not None:
             self._page_pull.disable_step()
+        if self.active:
+            pcp_nvtx_mark(
+                "pcp.runahead_step_end",
+                e=self._epoch,
+                rank=self.rank,
+                transport=self.transport,
+            )
         self.active = False
         self.transport = None
         self.rows_per_rank = ()
@@ -399,7 +414,13 @@ class PCPRunaheadRuntime:
         if layer_id is None:
             raise RuntimeError("page-pull native cache write has no prepared layer")
         self._page_pull.publish_ready(layer_id)
-        self._page_pull.wait_layer(layer_id)
+        with pcp_nvtx_range(
+            "pcp.page_pull_wait",
+            e=self._epoch,
+            rank=self.rank,
+            layer_id=layer_id,
+        ):
+            self._page_pull.wait_layer(layer_id)
 
     def flush(self) -> None:
         with pcp_nvtx_range("pcp.flush", e=self._epoch, rank=self.rank):

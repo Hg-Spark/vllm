@@ -65,6 +65,7 @@ from vllm.model_executor.models.glm4_moe import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_layer_forward
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
@@ -176,6 +177,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
+    @pcp_nvtx_layer_forward
     def forward(
         self,
         positions: torch.Tensor,
