@@ -28,7 +28,6 @@ from vllm.v1.attention.ops.pcp_runahead import PCPRunaheadRuntime
 from vllm.v1.worker.gpu.pcp_runahead_manager import (
     RunaheadPCPManager,
     parse_runahead_weights,
-    runahead_batch_eligible,
     weighted_partition_lengths,
 )
 
@@ -102,7 +101,6 @@ def test_config_parses_only_runtime_axes() -> None:
             "pcp_runahead": {
                 "transport": "full_kv_collective",
                 "partition": {"weights": [4, 2.5, 1.9, 1.6]},
-                "eligibility": {"min_tokens": 2048},
                 "runtime": {"max_inflight_sends": 3},
             }
         },
@@ -114,7 +112,6 @@ def test_config_parses_only_runtime_axes() -> None:
     assert config.segment_to_physical_rank == (0, 1, 2, 3)
     assert config.segment_to_group_rank == (0, 1, 2, 3)
     assert config.pcp_group_order == (0, 1, 2, 3)
-    assert config.min_tokens == 2048
     assert config.max_inflight_sends == 3
 
 
@@ -202,9 +199,9 @@ def test_tensor_transport_rejects_repeated_rank_binding() -> None:
         (
             {
                 "transport": "prefix_p2p",
-                "eligibility": {"require_full_prefill": False},
+                "eligibility": {"min_tokens": 1024},
             },
-            "unsupported eligibility keys",
+            "unsupported pcp_runahead keys",
         ),
         (
             {
@@ -248,7 +245,6 @@ def test_boolean_config_is_rejected() -> None:
 def test_segment_layout_is_compiled_once_for_all_ranks() -> None:
     manager = _manager(4)
     layout = manager._compile_segment_layout(_batch([10]))
-    assert layout is not None
     assert layout.rows_per_rank == (3, 3, 2, 2)
     assert [
         (segments[0].global_batch_slice.start, segments[0].global_batch_slice.stop)
@@ -269,7 +265,6 @@ def test_permutation_layout_uses_primary_group_rank() -> None:
         binding=compile_pcp_binding((1, 0), 2),
     )
     layout = manager._compile_segment_layout(_batch([100]))
-    assert layout is not None
     rank0 = layout.segments_by_rank[0]
     rank1 = layout.segments_by_rank[1]
     assert [(s.global_batch_slice.start, s.global_batch_slice.stop) for s in rank0] == [
@@ -337,28 +332,6 @@ def test_weighted_partition_aligns_absolute_positions() -> None:
     cuts = np.cumsum(lengths)[:-1]
     assert all((start_pos + int(cut)) % 16 == 0 for cut in cuts)
     assert sum(lengths) == 10000
-
-
-def test_runahead_requires_full_prefill_and_threshold() -> None:
-    common = dict(
-        num_reqs=1,
-        is_prefilling=np.asarray([True]),
-        pcp_world_size=2,
-        require_full_prefill=True,
-        min_prefill_tokens=8,
-    )
-    assert runahead_batch_eligible(
-        **common,
-        num_scheduled_tokens=np.asarray([8]),
-        num_computed_tokens=np.asarray([0]),
-        prefill_len=np.asarray([8]),
-    )
-    assert not runahead_batch_eligible(
-        **common,
-        num_scheduled_tokens=np.asarray([4]),
-        num_computed_tokens=np.asarray([0]),
-        prefill_len=np.asarray([8]),
-    )
 
 
 def test_variable_width_runtime_uses_logical_rank_offsets() -> None:
