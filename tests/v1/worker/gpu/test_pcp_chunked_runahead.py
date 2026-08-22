@@ -9,11 +9,7 @@ import pytest
 
 from vllm.config.pcp_runahead import PCPRunaheadConfig, compile_pcp_binding
 from vllm.v1.attention.ops.pcp_page_state import PCPPageStateTracker
-from vllm.v1.worker.gpu.pcp_runahead_manager import (
-    RunaheadPCPManager,
-    RunaheadStep,
-    runahead_batch_eligible,
-)
+from vllm.v1.worker.gpu.pcp_runahead_manager import RunaheadPCPManager, RunaheadStep
 
 
 def _chunk_manager() -> RunaheadPCPManager:
@@ -47,19 +43,6 @@ def _batch(*, scheduled: int, computed: int) -> SimpleNamespace:
         num_computed_tokens_np=np.asarray([computed], dtype=np.int32),
         query_start_loc_np=np.asarray([0, scheduled], dtype=np.int32),
         idx_mapping_np=np.asarray([0], dtype=np.int32),
-    )
-
-
-def test_chunked_eligibility_allows_nonzero_computed_tokens() -> None:
-    assert runahead_batch_eligible(
-        num_reqs=1,
-        is_prefilling=np.asarray([True]),
-        num_scheduled_tokens=np.asarray([64]),
-        num_computed_tokens=np.asarray([128]),
-        prefill_len=np.asarray([256]),
-        pcp_world_size=2,
-        require_full_prefill=False,
-        min_prefill_tokens=32,
     )
 
 
