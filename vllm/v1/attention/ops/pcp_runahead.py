@@ -198,6 +198,8 @@ class PCPRunaheadRuntime:
                 "rank-major slot mapping is shorter than configured PCP rows: "
                 f"slots={slot_mapping.shape[0]}, rows={self.total_rows}"
             )
+        if self.transport == "page_pull" and self._page_pull is not None:
+            self._page_pull.configure_slot_mapping(slot_mapping, self.rank_offsets)
         start = self.rank_offsets[self.rank]
         stop = self.rank_offsets[self.rank + 1]
         return slot_mapping[start:stop]
@@ -427,13 +429,14 @@ class PCPRunaheadRuntime:
         if layer_id is None:
             raise RuntimeError("page-pull native cache write has no prepared layer")
         self._page_pull.publish_ready(layer_id)
-        with pcp_nvtx_range(
-            "pcp.page_pull_wait",
-            e=self._epoch,
-            rank=self.rank,
-            layer_id=layer_id,
-        ):
-            self._page_pull.wait_layer(layer_id)
+        if not self._page_pull.layer_visible(layer_id):
+            with pcp_nvtx_range(
+                "pcp.page_push_stall",
+                e=self._epoch,
+                rank=self.rank,
+                layer_id=layer_id,
+            ):
+                self._page_pull.wait_layer(layer_id)
 
     def flush(self) -> None:
         with pcp_nvtx_range("pcp.flush", e=self._epoch, rank=self.rank):
