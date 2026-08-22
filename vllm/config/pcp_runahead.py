@@ -129,11 +129,6 @@ class PCPRunaheadConfig:
     def pcp_group_order(self) -> tuple[int, ...]:
         return self.binding.group_rank_to_physical_rank
 
-    @property
-    def max_inflight_reads(self) -> int:
-        """Legacy runtime accessor retained until the manager call site is renamed."""
-        return self.max_inflight_writes
-
 
 def parse_runahead_weights(
     raw: object,
