@@ -22,6 +22,7 @@ from vllm.v1.attention.ops.pcp_page_pull import (
     PCPPagePlan,
     PCPPagePullTransport,
 )
+from vllm.v1.attention.ops.pcp_page_state import PCPPageStateTracker
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_name
 from vllm.v1.attention.ops.pcp_runahead import PCPRunaheadRuntime
 from vllm.v1.worker.gpu.pcp_runahead_manager import (
@@ -287,14 +288,22 @@ def test_repeated_binding_builds_multiple_local_segments() -> None:
         weights=(1.0, 1.0, 1.0),
         binding=compile_pcp_binding((1, 0, 1), 2),
     )
-    layout = manager._compile_segment_layout(_batch([12]))
-    assert layout is not None
+    manager._req_states = SimpleNamespace(index_to_req_id={0: "req"})
+    manager._page_state = PCPPageStateTracker(
+        rank=0,
+        block_size=16,
+        max_model_len=128,
+    )
+    batch = _batch([48])
+    batch.idx_mapping_np = np.asarray([0], dtype=np.int32)
+
+    layout = manager._compile_segment_layout(batch)
     rank1 = layout.segments_by_rank[1]
     assert [(s.global_batch_slice.start, s.global_batch_slice.stop) for s in rank1] == [
-        (0, 4),
-        (8, 12),
+        (0, 16),
+        (32, 48),
     ]
-    assert layout.rows_per_rank == (4, 8)
+    assert layout.rows_per_rank == (16, 32)
 
 
 def test_manual_weights_parse_and_validate() -> None:
