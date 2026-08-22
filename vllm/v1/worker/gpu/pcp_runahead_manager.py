@@ -18,7 +18,6 @@ from vllm.config.pcp_runahead import (
     parse_runahead_weights,
 )
 from vllm.distributed.parallel_state import get_pcp_group
-from vllm.logger import init_logger
 from vllm.v1.attention.ops.pcp_page_pull import PCPPagePlan
 from vllm.v1.attention.ops.pcp_page_plan import PCPPageRoute
 from vllm.v1.attention.ops.pcp_page_state import PCPPageStateTracker
@@ -31,8 +30,6 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
 from vllm.v1.worker.gpu.states import RequestState
-
-logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -137,6 +134,12 @@ def runahead_batch_eligible(
     require_full_prefill: bool = True,
     min_prefill_tokens: int = RUNAHEAD_MIN_PREFILL_TOKENS,
 ) -> bool:
+    """Compatibility helper for callers/tests that need an admission predicate.
+
+    The runahead manager itself is fail-closed and never uses this predicate to
+    fall back to baseline PCP. Once the manager is selected, unsupported steps
+    raise explicitly.
+    """
     if num_reqs <= 0 or not bool(is_prefilling[:num_reqs].all()):
         return False
     if require_full_prefill:
@@ -193,15 +196,18 @@ class RunaheadPCPManager(PCPManager):
             and block_tables.kernel_block_sizes
             else 1
         )
-        if (
-            config.transport == "page_pull"
-            and block_tables is not None
-            and block_tables.num_kv_cache_groups != 1
-        ):
-            raise NotImplementedError(
-                "PCP page_pull currently supports one KV cache group, "
-                f"got {block_tables.num_kv_cache_groups}"
-            )
+        if config.transport == "page_pull":
+            if block_tables is None or req_states is None:
+                raise RuntimeError(
+                    "PCP page_pull runahead requires RequestState and BlockTables"
+                )
+            if block_tables.num_kv_cache_groups != 1:
+                raise NotImplementedError(
+                    "PCP page_pull currently supports one KV cache group, "
+                    f"got {block_tables.num_kv_cache_groups}"
+                )
+            if not block_tables.kernel_block_sizes:
+                raise RuntimeError("PCP page_pull requires a kernel block size")
 
         self._tensor_sharded_kv_history = False
         self._page_state = (
@@ -212,12 +218,12 @@ class RunaheadPCPManager(PCPManager):
             )
             if config.transport == "page_pull"
             and block_tables is not None
-            and block_tables.kernel_block_sizes
             and req_states is not None
             else None
         )
         self._pending_page_valid_updates: list[tuple[int, str, int, int]] = []
         self._pending_page_advances: list[tuple[int, str, int]] = []
+        self._pending_tail_invalidations: list[tuple[int, str, int]] = []
 
         self._runahead_runtime = PCPRunaheadRuntime(
             pcp_world_size=pcp_world_size,
@@ -346,19 +352,20 @@ class RunaheadPCPManager(PCPManager):
 
     def _request_identity(
         self, input_batch: InputBatch, global_req_idx: int
-    ) -> tuple[int, str] | None:
-        req_states = getattr(self, "_req_states", None)
+    ) -> tuple[int, str]:
+        req_states = self._req_states
         if req_states is None or not hasattr(input_batch, "idx_mapping_np"):
-            return None
+            raise RuntimeError("PCP runahead request identity state is unavailable")
         req_state_idx = int(input_batch.idx_mapping_np[global_req_idx])
         request_id = req_states.index_to_req_id.get(req_state_idx)
         if request_id is None:
-            return None
+            raise RuntimeError(
+                "PCP runahead request slot has no live request id: "
+                f"slot={req_state_idx}"
+            )
         return req_state_idx, request_id
 
-    def _compile_legacy_segment_layout(
-        self, input_batch: InputBatch
-    ) -> SegmentLayout | None:
+    def _compile_legacy_segment_layout(self, input_batch: InputBatch) -> SegmentLayout:
         mapping = self._config.segment_to_group_rank
         num_segments = len(mapping)
         segments_by_rank: list[list[RankSegment]] = [
@@ -415,7 +422,11 @@ class RunaheadPCPManager(PCPManager):
                     and self._page_alignment > 1
                     and end_pos % self._page_alignment != 0
                 ):
-                    return None
+                    raise RuntimeError(
+                        "PCP runahead partition produced an unaligned internal cut: "
+                        f"request={req_idx}, end_pos={end_pos}, "
+                        f"alignment={self._page_alignment}"
+                    )
                 offset = next_offset
                 absolute = end_pos
 
@@ -428,12 +439,10 @@ class RunaheadPCPManager(PCPManager):
             ),
         )
 
-    def _compile_page_pull_segment_layout(
-        self, input_batch: InputBatch
-    ) -> SegmentLayout | None:
+    def _compile_page_pull_segment_layout(self, input_batch: InputBatch) -> SegmentLayout:
         tracker = self._page_state
         if tracker is None:
-            return self._compile_legacy_segment_layout(input_batch)
+            raise RuntimeError("PCP page_pull requires persistent page state")
 
         mapping = self._config.segment_to_group_rank
         num_segments = len(mapping)
@@ -455,17 +464,18 @@ class RunaheadPCPManager(PCPManager):
         ):
             query_len = int(num_tokens)
             if query_len <= 0:
-                continue
-            identity = self._request_identity(input_batch, req_idx)
-            if identity is None:
-                return None
-            req_state_idx, request_id = identity
+                raise RuntimeError(
+                    "PCP runahead does not accept zero-token scheduled requests: "
+                    f"request={req_idx}"
+                )
+            req_state_idx, request_id = self._request_identity(input_batch, req_idx)
             start_pos = int(input_batch.num_computed_tokens_np[req_idx])
             state = tracker.prepare_request(req_state_idx, request_id, start_pos)
             if start_pos > 0 and not tracker.has_known_prefix(state, start_pos):
-                # A nonzero prefix without PCP page state is typically a new
-                # request with an APC/prefix-cache hit. Leave it on baseline PCP.
-                return None
+                raise RuntimeError(
+                    "PCP page-state ownership is incomplete for committed prefix: "
+                    f"request={request_id!r}, computed_tokens={start_pos}"
+                )
 
             global_start = int(input_batch.query_start_loc_np[req_idx])
             offset = 0
@@ -477,10 +487,10 @@ class RunaheadPCPManager(PCPManager):
                 owner_rank: int,
                 legacy_segment_idx: int | None,
                 global_batch_req_idx: int = req_idx,
-            ) -> bool:
+            ) -> None:
                 nonlocal offset, absolute
                 if length <= 0:
-                    return True
+                    return
                 next_offset = offset + length
                 end_pos = absolute + length
                 local_start = rank_rows[owner_rank]
@@ -513,9 +523,17 @@ class RunaheadPCPManager(PCPManager):
                     pending = owner_updates.get((req_state_idx, page_idx))
                     pending_owner = pending.owner_rank if pending is not None else -1
                     if known_owner >= 0 and known_owner != owner_rank:
-                        return False
+                        raise RuntimeError(
+                            "PCP chunk attempted to change an existing page owner: "
+                            f"request={request_id!r}, page={page_idx}, "
+                            f"old={known_owner}, new={owner_rank}"
+                        )
                     if pending_owner >= 0 and pending_owner != owner_rank:
-                        return False
+                        raise RuntimeError(
+                            "PCP chunk assigned one page to multiple owners: "
+                            f"request={request_id!r}, page={page_idx}, "
+                            f"first={pending_owner}, second={owner_rank}"
+                        )
                     if known_owner < 0 and pending is None:
                         owner_updates[(req_state_idx, page_idx)] = PageOwnerUpdate(
                             req_state_idx=req_state_idx,
@@ -525,7 +543,6 @@ class RunaheadPCPManager(PCPManager):
                         )
                 offset = next_offset
                 absolute = end_pos
-                return True
 
             # A partial page already contains historical KV. Keep its existing
             # authoritative owner so native whole-page writes never require an
@@ -534,10 +551,12 @@ class RunaheadPCPManager(PCPManager):
                 tail_page = absolute // block_size
                 tail_owner = tracker.owner(state, tail_page)
                 if tail_owner < 0:
-                    return None
+                    raise RuntimeError(
+                        "PCP mutable tail has no authoritative owner: "
+                        f"request={request_id!r}, page={tail_page}"
+                    )
                 tail_len = min(query_len, block_size - (absolute % block_size))
-                if not append_piece(tail_len, tail_owner, None):
-                    return None
+                append_piece(tail_len, tail_owner, None)
 
             remaining = end_of_query - absolute
             if remaining > 0:
@@ -552,11 +571,13 @@ class RunaheadPCPManager(PCPManager):
                         continue
                     end_pos = absolute + length
                     if end_pos < end_of_query and end_pos % block_size != 0:
-                        return None
-                    if not append_piece(
-                        length, mapping[segment_idx], segment_idx
-                    ):
-                        return None
+                        raise RuntimeError(
+                            "PCP page_pull cannot represent an unaligned internal "
+                            "chunk boundary without shared page ownership: "
+                            f"request={request_id!r}, end_pos={end_pos}, "
+                            f"block_size={block_size}"
+                        )
+                    append_piece(length, mapping[segment_idx], segment_idx)
 
             if absolute != end_of_query:
                 raise AssertionError("PCP chunk segment compilation lost tokens")
@@ -571,12 +592,8 @@ class RunaheadPCPManager(PCPManager):
             page_owner_updates=tuple(owner_updates.values()),
         )
 
-    def _compile_segment_layout(
-        self, input_batch: InputBatch
-    ) -> SegmentLayout | None:
-        if self._config.transport == "page_pull" and getattr(
-            self, "_page_state", None
-        ) is not None:
+    def _compile_segment_layout(self, input_batch: InputBatch) -> SegmentLayout:
+        if self._config.transport == "page_pull":
             return self._compile_page_pull_segment_layout(input_batch)
         return self._compile_legacy_segment_layout(input_batch)
 
@@ -599,124 +616,62 @@ class RunaheadPCPManager(PCPManager):
             query_start_loc_np,
         )
 
-    def _batch_has_known_page_history(self, input_batch: InputBatch) -> bool:
-        tracker = getattr(self, "_page_state", None)
-        if tracker is None:
-            return False
-        for req_idx in range(input_batch.num_reqs):
-            computed = int(input_batch.num_computed_tokens_np[req_idx])
-            if computed <= 0:
-                continue
-            identity = self._request_identity(input_batch, req_idx)
-            if identity is None:
-                continue
-            req_state_idx, request_id = identity
-            state = tracker.existing_request(req_state_idx, request_id)
-            if state is not None and tracker.has_known_prefix(state, computed):
-                return True
-        return False
+    def _validate_step_semantics(self, input_batch: InputBatch) -> None:
+        if input_batch.num_reqs <= 0:
+            raise RuntimeError("PCP runahead requires a non-empty batch")
+        if not bool(input_batch.is_prefilling_np[: input_batch.num_reqs].all()):
+            if self._config.transport == "page_pull":
+                raise RuntimeError(
+                    "PCP page_pull decode/mixed decode-prefill execution is not "
+                    "implemented after rank-sharded KV prefill"
+                )
+            raise RuntimeError("PCP runahead tensor transports support prefill only")
 
-    def _commit_page_owner_updates(
-        self, layout: SegmentLayout, input_batch: InputBatch
-    ) -> None:
-        tracker = self._page_state
-        if tracker is None:
+        if self._config.transport == "page_pull":
+            # Per-request continuity is validated by PCPPageStateTracker during
+            # segment compilation. No size threshold can redirect this manager
+            # to baseline PCP.
             return
-        for update in layout.page_owner_updates:
-            state = tracker.existing_request(update.req_state_idx, update.request_id)
-            if state is None:
-                raise RuntimeError("PCP page-state request disappeared during planning")
-            tracker.assign_owner(state, update.page_idx, update.owner_rank)
-        for req_idx in range(input_batch.num_reqs):
-            identity = self._request_identity(input_batch, req_idx)
-            if identity is None:
-                continue
-            req_state_idx, request_id = identity
-            state = tracker.existing_request(req_state_idx, request_id)
-            if state is None:
-                continue
-            tracker.invalidate_mutable_tail(
-                state, int(input_batch.num_computed_tokens_np[req_idx])
+
+        computed = input_batch.num_computed_tokens_np[: input_batch.num_reqs]
+        scheduled = input_batch.num_scheduled_tokens[: input_batch.num_reqs]
+        prefill_len = input_batch.prefill_len_np[: input_batch.num_reqs]
+        if not bool((computed == 0).all()) or not bool((scheduled == prefill_len).all()):
+            raise RuntimeError(
+                "PCP tensor runahead requires a fresh complete prefill; "
+                f"transport={self._config.transport!r}"
             )
 
+    def _clear_pending_page_updates(self) -> None:
+        self._pending_page_valid_updates.clear()
+        self._pending_page_advances.clear()
+        self._pending_tail_invalidations.clear()
+
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
-        if getattr(self, "_tensor_sharded_kv_history", False):
+        if self._tensor_sharded_kv_history:
             raise RuntimeError(
                 "PCP tensor runahead left persistent causal-prefix KV sharded across "
                 "ranks; continued/decode execution is not implemented"
             )
 
-        page_pull = self._config.transport == "page_pull"
-        known_page_history = page_pull and self._batch_has_known_page_history(input_batch)
-        all_prefilling = bool(
-            input_batch.is_prefilling_np[: input_batch.num_reqs].all()
-        )
-        if known_page_history and not all_prefilling:
+        self._clear_pending_page_updates()
+        self._validate_step_semantics(input_batch)
+        layout = self._compile_segment_layout(input_batch)
+        if any(rows <= 0 for rows in layout.rows_per_rank):
             raise RuntimeError(
-                "PCP page_pull chunk history is sharded across ranks; decode after "
-                "runahead prefill is not implemented"
+                "PCP runahead requires every physical rank to receive at least one "
+                "token in the current step; inactive-rank execution is not yet "
+                f"implemented: rows={layout.rows_per_rank}"
             )
 
-        eligible = runahead_batch_eligible(
-            num_reqs=input_batch.num_reqs,
-            is_prefilling=input_batch.is_prefilling_np,
-            num_scheduled_tokens=input_batch.num_scheduled_tokens,
-            num_computed_tokens=input_batch.num_computed_tokens_np,
-            prefill_len=input_batch.prefill_len_np,
-            pcp_world_size=self.pcp_world_size,
-            require_full_prefill=not page_pull,
-            # Once a request has PCP-sharded history it must remain on page-pull
-            # for subsequent chunks. The fresh-step threshold is only a policy gate.
-            min_prefill_tokens=0 if known_page_history else self._config.min_tokens,
-        )
-        if known_page_history and not eligible:
-            raise RuntimeError(
-                "PCP page_pull continuation cannot safely fall back to baseline; "
-                "the scheduled chunk is too small for the active PCP world size"
-            )
-
-        layout = self._compile_segment_layout(input_batch) if eligible else None
-        if eligible and layout is None:
-            if known_page_history:
-                raise RuntimeError(
-                    "PCP page_pull continuation could not compile a safe chunk plan; "
-                    "refusing baseline fallback with sharded history"
-                )
-            logger.debug(
-                "PCP page_pull falling back because the chunk/page state is unsupported"
-            )
-            eligible = False
-        if layout is not None and any(rows <= 0 for rows in layout.rows_per_rank):
-            if known_page_history:
-                raise RuntimeError(
-                    "PCP page_pull continuation produced an empty physical rank; "
-                    "inactive-rank execution is not implemented"
-                )
-            logger.debug(
-                "PCP runahead partition produced an empty rank; falling back: rows=%s",
-                layout.rows_per_rank,
-            )
-            eligible = False
-            layout = None
-
-        self._active_step = (
-            RunaheadStep(layout=layout, transport=self._config.transport)
-            if eligible and layout is not None
-            else None
+        self._active_step = RunaheadStep(
+            layout=layout,
+            transport=self._config.transport,
         )
         local_batch = super().partition_batch(input_batch)
-        step = self._active_step
-        if step is None:
-            self._pending_page_valid_updates.clear()
-            self._pending_page_advances.clear()
-            self._runahead_runtime.disable_step()
-            return local_batch
-
-        if step.transport == "page_pull":
-            self._commit_page_owner_updates(step.layout, input_batch)
         self._runahead_runtime.begin_step(
-            step.layout.rows_per_rank,
-            transport=step.transport,
+            layout.rows_per_rank,
+            transport=self._config.transport,
         )
         return local_batch
 
@@ -763,21 +718,30 @@ class RunaheadPCPManager(PCPManager):
         current_pages = [
             [[] for _ in range(world_size)] for _ in range(world_size)
         ]
-        self._pending_page_valid_updates.clear()
-        self._pending_page_advances.clear()
+        self._clear_pending_page_updates()
 
         for req_idx, segments in enumerate(step.layout.causal_segments_by_request):
             if not segments:
-                continue
-            identity = self._request_identity(global_batch, req_idx)
-            if identity is None:
-                raise RuntimeError("PCP page_pull request identity is unavailable")
-            req_state_idx, request_id = identity
+                raise RuntimeError(
+                    "PCP page_pull compiled a request without a causal segment: "
+                    f"request={req_idx}"
+                )
+            req_state_idx, request_id = self._request_identity(global_batch, req_idx)
             start_pos = int(global_batch.num_computed_tokens_np[req_idx])
             end_pos = start_pos + int(global_batch.num_scheduled_tokens[req_idx])
             state = tracker.existing_request(req_state_idx, request_id)
-            if state is None or not tracker.has_known_prefix(state, start_pos):
+            if state is None:
                 raise RuntimeError("PCP page_pull lost persistent request page state")
+            if tracker.committed_tokens(state) != start_pos:
+                raise RuntimeError(
+                    "PCP page-state changed after chunk compilation: "
+                    f"request={request_id!r}, scheduler={start_pos}, "
+                    f"committed={tracker.committed_tokens(state)}"
+                )
+            if start_pos > 0 and not tracker.has_known_prefix(state, start_pos):
+                raise RuntimeError(
+                    "PCP page_pull lost ownership for a committed historical page"
+                )
 
             end_page = (end_pos + block_size - 1) // block_size
             request_blocks = block_tables.get_block_ids_cpu(
@@ -810,8 +774,8 @@ class RunaheadPCPManager(PCPManager):
                             "PCP history page has no authoritative owner"
                         )
                     if owner_rank == self.pcp_rank:
-                        # Local allocation/COW is managed by vLLM. Treat the
-                        # authoritative owner's current physical block as valid.
+                        # vLLM owns allocation/COW. The authoritative owner's
+                        # current physical block is valid after vLLM's copy path.
                         self._pending_page_valid_updates.append(
                             (req_state_idx, request_id, page_idx, block_id)
                         )
@@ -823,9 +787,7 @@ class RunaheadPCPManager(PCPManager):
 
             # Current-chunk routes are deterministic across ranks and therefore
             # compiled for every destination. READY fanout uses these rows.
-            for destination_rank, owned_indices in enumerate(
-                owned_indices_by_rank
-            ):
+            for destination_rank, owned_indices in enumerate(owned_indices_by_rank):
                 if not owned_indices:
                     continue
                 max_owned_index = owned_indices[-1]
@@ -840,9 +802,9 @@ class RunaheadPCPManager(PCPManager):
                         for page_idx in range(first_page, last_page)
                     )
 
-            # After a successful forward, this rank owns a valid copy of every
-            # current page up to its last causal segment: locally produced pages
-            # plus predecessor pages pulled before attention.
+            # After a successful forward, this rank has a valid copy of every
+            # current page through its last causal segment: locally produced
+            # pages plus predecessor pages pulled before attention.
             if local_owned_indices:
                 max_local_index = local_owned_indices[-1]
                 seen_pages: set[int] = set()
@@ -861,6 +823,10 @@ class RunaheadPCPManager(PCPManager):
                                 int(request_blocks[page_idx]),
                             )
                         )
+
+            self._pending_tail_invalidations.append(
+                (req_state_idx, request_id, start_pos)
+            )
             self._pending_page_advances.append(
                 (req_state_idx, request_id, end_pos)
             )
@@ -880,49 +846,16 @@ class RunaheadPCPManager(PCPManager):
             )
         )
 
-    def _configure_legacy_page_pull_plan(self) -> None:
-        step = self._active_step
-        global_batch = self._global_batch
-        block_tables = self._block_tables
-        if step is None or global_batch is None or block_tables is None:
-            raise RuntimeError("PCP page_pull has no active planner state")
-        block_size = int(block_tables.kernel_block_sizes[0])
-        blocks_by_segment: list[tuple[int, ...]] = []
-        for pieces in step.layout.logical_segments:
-            blocks: list[int] = []
-            for piece in pieces:
-                req_state_idx = int(
-                    global_batch.idx_mapping_np[piece.global_batch_req_idx]
-                )
-                start_block = piece.start_pos // block_size
-                end_block = (piece.end_pos + block_size - 1) // block_size
-                blocks.extend(
-                    block_tables.get_block_ids_cpu(
-                        0, req_state_idx, start_block, end_block
-                    )
-                )
-            blocks_by_segment.append(tuple(blocks))
-        self._runahead_runtime.configure_page_plan(
-            PCPPagePlan(
-                segment_to_rank=self._config.segment_to_group_rank,
-                blocks_by_segment=tuple(blocks_by_segment),
-                block_size=block_size,
-            )
-        )
-
     def _configure_page_pull_plan(self) -> None:
         step = self._active_step
         block_tables = self._block_tables
         if step is None or step.transport != "page_pull":
             raise RuntimeError("PCP page_pull has no active page-pull step")
-        if block_tables is None:
-            raise RuntimeError("PCP page_pull requires block tables")
+        if block_tables is None or self._page_state is None:
+            raise RuntimeError("PCP page_pull requires block tables and page state")
         if block_tables.num_kv_cache_groups != 1:
             raise RuntimeError("PCP page_pull currently requires one KV cache group")
-        if self._page_state is not None and step.layout.causal_segments_by_request:
-            self._configure_chunked_page_pull_plan()
-        else:
-            self._configure_legacy_page_pull_plan()
+        self._configure_chunked_page_pull_plan()
 
     def prepare_slot_mappings(self) -> torch.Tensor:
         slot_mappings = super().prepare_slot_mappings()
@@ -932,10 +865,28 @@ class RunaheadPCPManager(PCPManager):
                 self._configure_page_pull_plan()
         return slot_mappings
 
-    def _commit_page_step_completion(self) -> None:
+    def _commit_page_step_completion(self, step: RunaheadStep) -> None:
         tracker = self._page_state
         if tracker is None:
-            return
+            raise RuntimeError("PCP page_pull completion requires page state")
+
+        # Commit ownership only after the model forward and all required READs
+        # completed. A failed step therefore cannot publish owners for KV pages
+        # that were never successfully produced.
+        for update in step.layout.page_owner_updates:
+            state = tracker.existing_request(update.req_state_idx, update.request_id)
+            if state is None:
+                raise RuntimeError("PCP page-state request disappeared after forward")
+            tracker.assign_owner(state, update.page_idx, update.owner_rank)
+
+        # Appending into a historical partial page invalidates old non-owner
+        # replicas. Apply this before marking copies produced by this step valid.
+        for req_state_idx, request_id, start_pos in self._pending_tail_invalidations:
+            state = tracker.existing_request(req_state_idx, request_id)
+            if state is None:
+                raise RuntimeError("PCP page-state request disappeared after forward")
+            tracker.invalidate_mutable_tail(state, start_pos)
+
         for req_state_idx, request_id, page_idx, block_id in (
             self._pending_page_valid_updates
         ):
@@ -943,24 +894,26 @@ class RunaheadPCPManager(PCPManager):
             if state is None:
                 raise RuntimeError("PCP page-state request disappeared after forward")
             tracker.mark_local_valid(state, page_idx, block_id)
+
         for req_state_idx, request_id, computed_tokens in self._pending_page_advances:
             state = tracker.existing_request(req_state_idx, request_id)
             if state is None:
                 raise RuntimeError("PCP page-state request disappeared after forward")
             tracker.advance(state, computed_tokens)
-        self._pending_page_valid_updates.clear()
-        self._pending_page_advances.clear()
+        self._clear_pending_page_updates()
 
     def restore_for_sampling(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, InputBatch]:
         step = self._active_step
+        if step is None:
+            raise RuntimeError("PCP runahead restore requires an active step")
         self._runahead_runtime.flush()
         result = super().restore_for_sampling(hidden_states)
-        if step is not None and step.transport == "page_pull":
-            self._commit_page_step_completion()
-        elif step is not None and step.transport in ("prefix_p2p", "direct_p2p"):
+        if step.transport == "page_pull":
+            self._commit_page_step_completion(step)
+        elif step.transport in ("prefix_p2p", "direct_p2p"):
             self._tensor_sharded_kv_history = True
         self._runahead_runtime.disable_step()
         self._active_step = None
