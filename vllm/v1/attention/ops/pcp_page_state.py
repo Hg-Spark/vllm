@@ -109,6 +109,19 @@ class PCPPageStateTracker:
     def owner(self, state: _RequestPageState, page_idx: int) -> int:
         return int(state.owners[page_idx])
 
+    def causal_owner(self, state: _RequestPageState) -> int:
+        """Return the owner of the last committed logical KV page."""
+        if state.computed_tokens <= 0:
+            raise RuntimeError("PCP decode placement requires a committed prefix")
+        page_idx = (state.computed_tokens - 1) // self.block_size
+        owner_rank = self.owner(state, page_idx)
+        if owner_rank < 0:
+            raise RuntimeError(
+                "PCP committed causal tail has no authoritative page owner: "
+                f"page={page_idx}, computed_tokens={state.computed_tokens}"
+            )
+        return owner_rank
+
     def assign_owner(
         self,
         state: _RequestPageState,

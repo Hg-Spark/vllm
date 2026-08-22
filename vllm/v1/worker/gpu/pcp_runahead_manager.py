@@ -66,6 +66,26 @@ class RunaheadStep:
     transport: TransportPolicy
 
 
+@dataclass(frozen=True)
+class DecodeRequestPlacement:
+    """Authoritative decode placement for one request in a decode step."""
+
+    global_batch_req_idx: int
+    req_state_idx: int
+    request_id: str
+    start_pos: int
+    end_pos: int
+    rank: int
+
+
+@dataclass(frozen=True)
+class DecodeStep:
+    """Decode placements kept outside the prefill runahead runtime."""
+
+    requests: tuple[DecodeRequestPlacement, ...]
+    rank_by_global_req_idx: tuple[int, ...]
+
+
 def weighted_partition_lengths(
     num_tokens: int,
     weights: tuple[float, ...],
@@ -187,6 +207,7 @@ class RunaheadPCPManager(PCPManager):
         )
         self._standard_attention_pcp = False
         self._active_step: RunaheadStep | None = None
+        self._decode_step: DecodeStep | None = None
         self._page_alignment = (
             math.lcm(*block_tables.kernel_block_sizes)
             if config.transport == "page_pull"
@@ -299,6 +320,22 @@ class RunaheadPCPManager(PCPManager):
     def set_standard_attention(self, enabled: bool) -> None:
         self._standard_attention_pcp = enabled
 
+    def _decode_rank(self, global_batch_req_idx: int) -> int:
+        step = self._decode_step
+        if step is None:
+            return super()._decode_rank(global_batch_req_idx)
+        if not 0 <= global_batch_req_idx < len(step.rank_by_global_req_idx):
+            raise RuntimeError(
+                "PCP decode placement lookup is outside the active global batch: "
+                f"request={global_batch_req_idx}"
+            )
+        return step.rank_by_global_req_idx[global_batch_req_idx]
+
+    def _decode_kv_write_enabled(self, global_batch_req_idx: int) -> bool:
+        if self._decode_step is None:
+            return super()._decode_kv_write_enabled(global_batch_req_idx)
+        return self.pcp_rank == self._decode_rank(global_batch_req_idx)
+
     @classmethod
     def validate_config(
         cls,
@@ -377,6 +414,117 @@ class RunaheadPCPManager(PCPManager):
                 f"slot={req_state_idx}"
             )
         return req_state_idx, request_id
+
+    def _select_decode_rank(self, req_state_idx: int, request_id: str) -> int:
+        """Select the authoritative decode rank for a tracked request.
+
+        The current policy chooses the final causal page owner, which already has
+        a complete prefix after page-pull prefill. Future placement policies may
+        select another rank and materialize its missing prefix in
+        ``_ensure_decode_ready`` without changing the decode execution path.
+        """
+        tracker = self._page_state
+        if tracker is None:
+            raise RuntimeError("PCP page_pull decode placement requires page state")
+        state = tracker.existing_request(req_state_idx, request_id)
+        if state is None:
+            raise RuntimeError("PCP decode placement lost persistent request state")
+        return tracker.causal_owner(state)
+
+    def _ensure_decode_ready(
+        self,
+        req_state_idx: int,
+        request_id: str,
+        start_pos: int,
+        decode_rank: int,
+    ) -> None:
+        """Ensure the selected rank has a complete usable prefix.
+
+        Today the selected rank is the final causal owner, so readiness is a
+        strict validation. This is the extension point for a future explicit
+        prefill-to-decode KV materialization/handoff to an arbitrary selected rank.
+        """
+        if self.pcp_rank != decode_rank:
+            return
+        tracker = self._page_state
+        block_tables = self._block_tables
+        if tracker is None or block_tables is None:
+            raise RuntimeError("PCP page_pull decode readiness requires page state")
+        state = tracker.existing_request(req_state_idx, request_id)
+        if state is None:
+            raise RuntimeError("PCP decode readiness lost persistent request state")
+        num_pages = (start_pos + tracker.block_size - 1) // tracker.block_size
+        request_blocks = block_tables.get_block_ids_cpu(
+            0, req_state_idx, 0, num_pages
+        )
+        if len(request_blocks) < num_pages:
+            raise RuntimeError("PCP decode block table is shorter than its prefix")
+        for page_idx in range(num_pages):
+            block_id = int(request_blocks[page_idx])
+            if not tracker.local_is_valid(state, page_idx, block_id):
+                raise RuntimeError(
+                    "PCP selected decode rank does not have a complete valid prefix: "
+                    f"request={request_id!r}, rank={decode_rank}, page={page_idx}"
+                )
+
+    def _build_decode_step(self, input_batch: InputBatch) -> DecodeStep:
+        tracker = self._page_state
+        if self._config.transport != "page_pull" or tracker is None:
+            raise RuntimeError("owner decode requires PCP page_pull page state")
+        requests: list[DecodeRequestPlacement] = []
+        rank_by_global_req_idx = [0] * input_batch.num_reqs
+        for req_idx, num_tokens in enumerate(
+            input_batch.num_scheduled_tokens[: input_batch.num_reqs]
+        ):
+            query_len = int(num_tokens)
+            if query_len <= 0:
+                raise RuntimeError(
+                    "PCP owner decode does not accept zero-token scheduled requests: "
+                    f"request={req_idx}"
+                )
+            req_state_idx, request_id = self._request_identity(input_batch, req_idx)
+            start_pos = int(input_batch.num_computed_tokens_np[req_idx])
+            state = tracker.existing_request(req_state_idx, request_id)
+            if state is None:
+                raise RuntimeError(
+                    "PCP page_pull decode requires a prefix produced by runahead: "
+                    f"request={request_id!r}"
+                )
+            if tracker.committed_tokens(state) != start_pos:
+                raise RuntimeError(
+                    "PCP decode scheduler/page-state progress mismatch: "
+                    f"request={request_id!r}, scheduler={start_pos}, "
+                    f"committed={tracker.committed_tokens(state)}"
+                )
+            if not tracker.has_known_prefix(state, start_pos):
+                raise RuntimeError(
+                    "PCP decode prefix ownership is incomplete: "
+                    f"request={request_id!r}, computed_tokens={start_pos}"
+                )
+            decode_rank = self._select_decode_rank(req_state_idx, request_id)
+            if not 0 <= decode_rank < self.pcp_world_size:
+                raise RuntimeError(
+                    "PCP decode placement selected an invalid physical rank: "
+                    f"request={request_id!r}, rank={decode_rank}, "
+                    f"world_size={self.pcp_world_size}"
+                )
+            self._ensure_decode_ready(
+                req_state_idx, request_id, start_pos, decode_rank
+            )
+            placement = DecodeRequestPlacement(
+                global_batch_req_idx=req_idx,
+                req_state_idx=req_state_idx,
+                request_id=request_id,
+                start_pos=start_pos,
+                end_pos=start_pos + query_len,
+                rank=decode_rank,
+            )
+            requests.append(placement)
+            rank_by_global_req_idx[req_idx] = decode_rank
+        return DecodeStep(
+            requests=tuple(requests),
+            rank_by_global_req_idx=tuple(rank_by_global_req_idx),
+        )
 
     def _compile_legacy_segment_layout(self, input_batch: InputBatch) -> SegmentLayout:
         mapping = self._config.segment_to_group_rank
@@ -618,6 +766,15 @@ class RunaheadPCPManager(PCPManager):
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
     ) -> list[RankSegment]:
+        if self._decode_step is not None:
+            return PCPManager._get_rank_segments(
+                self,
+                rank,
+                num_scheduled_tokens,
+                num_computed_tokens,
+                is_prefilling,
+                query_start_loc_np,
+            )
         step = self._active_step
         if step is None:
             raise RuntimeError(
@@ -625,21 +782,13 @@ class RunaheadPCPManager(PCPManager):
             )
         return list(step.layout.segments_by_rank[rank])
 
-    @staticmethod
-    def _is_warmup_batch(input_batch: InputBatch) -> bool:
-        req_ids = input_batch.req_ids[: input_batch.num_reqs]
-        return bool(req_ids) and all(req_id.startswith("_warmup_") for req_id in req_ids)
-
     def _validate_step_semantics(self, input_batch: InputBatch) -> None:
         if input_batch.num_reqs <= 0:
             raise RuntimeError("PCP runahead requires a non-empty batch")
         if not bool(input_batch.is_prefilling_np[: input_batch.num_reqs].all()):
             if self._config.transport == "page_pull":
-                if self._is_warmup_batch(input_batch):
-                    return
                 raise RuntimeError(
-                    "PCP page_pull decode/mixed decode-prefill execution is not "
-                    "implemented after rank-sharded KV prefill"
+                    "PCP page_pull mixed decode-prefill execution is not implemented"
                 )
             raise RuntimeError("PCP runahead tensor transports support prefill only")
 
@@ -663,11 +812,37 @@ class RunaheadPCPManager(PCPManager):
         self._pending_tail_invalidations.clear()
 
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
+        if self._active_step is not None or self._decode_step is not None:
+            raise RuntimeError("PCP runahead previous execution step was not restored")
         if self._tensor_sharded_kv_history:
             raise RuntimeError(
                 "PCP tensor runahead left persistent causal-prefix KV sharded across "
                 "ranks; continued/decode execution is not implemented"
             )
+        if input_batch.num_reqs <= 0:
+            raise RuntimeError("PCP runahead requires a non-empty batch")
+
+        is_prefilling = input_batch.is_prefilling_np[: input_batch.num_reqs]
+        if self._config.transport == "page_pull":
+            any_prefill = bool(is_prefilling.any())
+            all_prefill = bool(is_prefilling.all())
+            if not any_prefill:
+                self._clear_pending_page_updates()
+                if self._runahead_runtime.active:
+                    raise RuntimeError(
+                        "PCP owner decode cannot start with an active runahead runtime"
+                    )
+                decode_step = self._build_decode_step(input_batch)
+                self._decode_step = decode_step
+                try:
+                    return PCPManager.partition_batch(self, input_batch)
+                except BaseException:
+                    self._decode_step = None
+                    raise
+            if not all_prefill:
+                raise RuntimeError(
+                    "PCP page_pull mixed decode-prefill execution is not implemented"
+                )
 
         self._clear_pending_page_updates()
         self._validate_step_semantics(input_batch)
@@ -923,10 +1098,70 @@ class RunaheadPCPManager(PCPManager):
             tracker.advance(state, computed_tokens)
         self._clear_pending_page_updates()
 
+    def _commit_decode_step_completion(self, step: DecodeStep) -> None:
+        tracker = self._page_state
+        block_tables = self._block_tables
+        if tracker is None or block_tables is None:
+            raise RuntimeError("PCP decode completion requires page state")
+
+        for placement in step.requests:
+            state = tracker.existing_request(
+                placement.req_state_idx, placement.request_id
+            )
+            if state is None:
+                raise RuntimeError("PCP decode request disappeared after forward")
+            if tracker.committed_tokens(state) != placement.start_pos:
+                raise RuntimeError(
+                    "PCP decode page-state changed during forward: "
+                    f"request={placement.request_id!r}"
+                )
+
+            tracker.invalidate_mutable_tail(state, placement.start_pos)
+            end_page = (
+                placement.end_pos + tracker.block_size - 1
+            ) // tracker.block_size
+            request_blocks = block_tables.get_block_ids_cpu(
+                0, placement.req_state_idx, 0, end_page
+            )
+            if len(request_blocks) < end_page:
+                raise RuntimeError("PCP decode block table is shorter than decode state")
+
+            first_touched_page = placement.start_pos // tracker.block_size
+            for page_idx in range(first_touched_page, end_page):
+                owner_rank = tracker.owner(state, page_idx)
+                if owner_rank < 0:
+                    tracker.assign_owner(state, page_idx, placement.rank)
+                elif owner_rank != placement.rank:
+                    raise RuntimeError(
+                        "PCP decode attempted to append on a page owned by another rank: "
+                        f"request={placement.request_id!r}, page={page_idx}, "
+                        f"owner={owner_rank}, decode_rank={placement.rank}"
+                    )
+
+                if self.pcp_rank == placement.rank:
+                    tracker.mark_local_valid(
+                        state, page_idx, int(request_blocks[page_idx])
+                    )
+                else:
+                    tracker.invalidate_local(state, page_idx)
+
+            tracker.advance(state, placement.end_pos)
+
     def restore_for_sampling(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, InputBatch]:
+        decode_step = self._decode_step
+        if decode_step is not None:
+            if self._runahead_runtime.active:
+                raise RuntimeError(
+                    "PCP owner decode reached restore with active runahead runtime"
+                )
+            result = PCPManager.restore_for_sampling(self, hidden_states)
+            self._commit_decode_step_completion(decode_step)
+            self._decode_step = None
+            return result
+
         step = self._active_step
         if step is None:
             raise RuntimeError("PCP runahead restore requires an active step")
@@ -942,6 +1177,8 @@ class RunaheadPCPManager(PCPManager):
 
 
 __all__ = [
+    "DecodeRequestPlacement",
+    "DecodeStep",
     "LogicalSegment",
     "PageOwnerUpdate",
     "RunaheadPCPManager",

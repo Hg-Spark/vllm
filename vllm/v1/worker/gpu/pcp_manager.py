@@ -169,6 +169,16 @@ class PCPManager:
     def _get_batch_pcp_group(self):
         return get_pcp_group()
 
+    def _decode_rank(self, global_batch_req_idx: int) -> int:
+        """Return the PCP rank whose decode hidden state is authoritative."""
+        del global_batch_req_idx
+        return 0
+
+    def _decode_kv_write_enabled(self, global_batch_req_idx: int) -> bool:
+        """Whether this process should commit the replicated decode KV row."""
+        del global_batch_req_idx
+        return True
+
     @staticmethod
     def _reorder_segments(
         segments: list[RankSegment],
@@ -307,8 +317,27 @@ class PCPManager:
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
-                # Cache insertion pairs one slot entry with each rank's local decode.
-                if not bool(is_prefilling[segment.global_batch_req_idx]) and rank != 0:
+                if not bool(is_prefilling[segment.global_batch_req_idx]):
+                    request_idx = segment.global_batch_req_idx
+                    decode_rank = self._decode_rank(request_idx)
+                    if not 0 <= decode_rank < self.pcp_world_size:
+                        raise RuntimeError(
+                            "PCP decode rank is outside the physical PCP group: "
+                            f"request={request_idx}, rank={decode_rank}, "
+                            f"world_size={self.pcp_world_size}"
+                        )
+                    # MLA's pure-decode cache path consumes the first rank slab.
+                    # Keep that ABI stable while allowing the physical writer to
+                    # vary by process. Hidden-state authority is independent and
+                    # may come from any rank slab.
+                    if rank == 0 and self._decode_kv_write_enabled(request_idx):
+                        gathered_kv_write_mask[gathered_slice] = True
+                    if rank == decode_rank:
+                        hidden_restore_idx[segment.global_batch_slice] = np.arange(
+                            gathered_slice.start,
+                            gathered_slice.stop,
+                            dtype=np.int64,
+                        )
                     continue
                 gathered_kv_write_mask[gathered_slice] = True
                 hidden_restore_idx[segment.global_batch_slice] = np.arange(

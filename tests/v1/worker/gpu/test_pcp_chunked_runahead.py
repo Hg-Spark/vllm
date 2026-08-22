@@ -2,14 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.config.pcp_runahead import PCPRunaheadConfig, compile_pcp_binding
 from vllm.v1.attention.ops.pcp_page_state import PCPPageStateTracker
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.pcp_runahead_manager import (
+    DecodeRequestPlacement,
+    DecodeStep,
     RunaheadPCPManager,
     RunaheadStep,
     weighted_partition_lengths,
@@ -22,6 +26,8 @@ def _chunk_manager() -> RunaheadPCPManager:
     manager.pcp_rank = 0
     manager._standard_attention_pcp = True
     manager._active_step = None
+    manager._decode_step = None
+    manager._tensor_sharded_kv_history = False
     manager._config = PCPRunaheadConfig(
         transport="page_pull",
         weights=(1.0, 1.0),
@@ -137,22 +143,143 @@ def test_page_pull_keeps_compact_layout_when_all_ranks_are_active() -> None:
     assert manager._compact_layout_enabled()
 
 
-def test_warmup_decode_semantics_are_allowed_only_for_synthetic_requests() -> None:
+@pytest.mark.parametrize("req_id", ["_warmup_0_", "req"])
+def test_prefill_validator_does_not_special_case_decode(req_id: str) -> None:
     manager = _chunk_manager()
 
-    manager._validate_step_semantics(
-        _batch(
-            scheduled=1,
-            computed=1,
-            req_id="_warmup_0_",
-            prefilling=False,
+    with pytest.raises(RuntimeError, match="mixed decode-prefill"):
+        manager._validate_step_semantics(
+            _batch(
+                scheduled=1,
+                computed=1,
+                req_id=req_id,
+                prefilling=False,
+            )
         )
+
+
+def test_page_pull_decode_dispatch_does_not_activate_runahead_runtime() -> None:
+    manager = _chunk_manager()
+    manager._runahead_runtime = MagicMock(active=False)
+    decode_step = MagicMock()
+    manager._build_decode_step = MagicMock(return_value=decode_step)
+    batch = _batch(scheduled=1, computed=1, prefilling=False)
+    local_batch = object()
+
+    with patch.object(PCPManager, "partition_batch", return_value=local_batch) as base:
+        result = manager.partition_batch(batch)
+
+    assert result is local_batch
+    assert manager._decode_step is decode_step
+    base.assert_called_once_with(manager, batch)
+    manager._runahead_runtime.begin_step.assert_not_called()
+
+
+def _build_decode_layout(
+    *, decode_rank: int, writer_enabled: bool
+) -> tuple[list[bool], list[int]]:
+    manager = object.__new__(PCPManager)
+    manager.pcp_world_size = 2
+    manager.device = torch.device("cpu")
+    manager._decode_rank = lambda _: decode_rank  # type: ignore[method-assign]
+    manager._decode_kv_write_enabled = (  # type: ignore[method-assign]
+        lambda _: writer_enabled
     )
 
-    with pytest.raises(RuntimeError, match="decode/mixed"):
-        manager._validate_step_semantics(
-            _batch(scheduled=1, computed=1, req_id="req", prefilling=False)
+    def copy_to_cpu(value, **kwargs):
+        del kwargs
+        return torch.as_tensor(value)
+
+    with patch(
+        "vllm.v1.worker.gpu.pcp_manager.async_copy_to_gpu",
+        side_effect=copy_to_cpu,
+    ):
+        manager._build_batch_layout(
+            np.asarray([1], dtype=np.int32),
+            np.asarray([16], dtype=np.int32),
+            np.asarray([False], dtype=np.bool_),
+            np.asarray([0, 1], dtype=np.int32),
         )
+    return (
+        manager._gathered_kv_write_mask.tolist(),
+        manager._hidden_restore_idx.tolist(),
+    )
+
+
+def test_decode_rank_keeps_mla_writer_in_first_slab() -> None:
+    write_mask, restore_idx = _build_decode_layout(
+        decode_rank=1, writer_enabled=True
+    )
+    assert write_mask == [True, False]
+    assert restore_idx == [1]
+
+
+def test_nonselected_process_disables_decode_kv_write() -> None:
+    write_mask, restore_idx = _build_decode_layout(
+        decode_rank=1, writer_enabled=False
+    )
+    assert write_mask == [False, False]
+    assert restore_idx == [1]
+
+
+def test_page_state_causal_owner_tracks_last_committed_page() -> None:
+    tracker = PCPPageStateTracker(rank=0, block_size=16, max_model_len=128)
+    state = tracker.prepare_request(0, "req", 0)
+    tracker.assign_owner(state, 0, 1)
+    tracker.advance(state, 5)
+    assert tracker.causal_owner(state) == 1
+
+    tracker.assign_owner(state, 1, 0)
+    tracker.advance(state, 17)
+    assert tracker.causal_owner(state) == 0
+
+
+def test_decode_step_selects_final_causal_owner() -> None:
+    manager = _chunk_manager()
+    tracker = manager._page_state
+    assert tracker is not None
+    state = tracker.prepare_request(0, "req", 0)
+    tracker.assign_owner(state, 0, 0)
+    tracker.assign_owner(state, 1, 1)
+    tracker.advance(state, 32)
+
+    step = manager._build_decode_step(
+        _batch(scheduled=1, computed=32, prefilling=False)
+    )
+
+    assert step.rank_by_global_req_idx == (1,)
+    assert step.requests[0].rank == 1
+
+
+def test_decode_completion_assigns_new_page_to_decode_rank() -> None:
+    manager = _chunk_manager()
+    tracker = manager._page_state
+    assert tracker is not None
+    state = tracker.prepare_request(0, "req", 0)
+    tracker.assign_owner(state, 0, 1)
+    tracker.advance(state, 16)
+
+    block_tables = MagicMock()
+    block_tables.get_block_ids_cpu.return_value = [10, 11]
+    manager._block_tables = block_tables
+    step = DecodeStep(
+        requests=(
+            DecodeRequestPlacement(
+                global_batch_req_idx=0,
+                req_state_idx=0,
+                request_id="req",
+                start_pos=16,
+                end_pos=17,
+                rank=1,
+            ),
+        ),
+        rank_by_global_req_idx=(1,),
+    )
+
+    manager._commit_decode_step_completion(step)
+
+    assert tracker.owner(state, 1) == 1
+    assert tracker.committed_tokens(state) == 17
 
 
 def test_chunked_layout_keeps_mutable_tail_on_existing_owner() -> None:
