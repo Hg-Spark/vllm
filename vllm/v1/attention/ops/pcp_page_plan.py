@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Immutable causal page-routing plans for PCP runahead."""
+"""Immutable current-step causal page-routing plans for PCP runahead."""
 
 from __future__ import annotations
 
@@ -54,32 +54,22 @@ _RouteMatrix = tuple[tuple[PCPPageRoute | None, ...], ...]
 
 @dataclass(frozen=True)
 class PCPPagePlan:
-    """Per-step page demand plan.
+    """Per-step CURRENT page demand plan.
 
-    The legacy segment constructor compiles fresh-prefill causal CURRENT routes.
-    Chunked-prefill planning supplies explicit history and current matrices.
-    History entries describe replicas that must already be local at step start;
-    CURRENT entries describe predecessor pages delivered by producer WRITE.
+    The legacy segment constructor compiles fresh-prefill causal routes. Chunked
+    prefill supplies an explicit current-route matrix. Historical full-page
+    availability is owned by ``PCPPageStateTracker`` and never represented as a
+    transport route.
     """
 
     segment_to_rank: tuple[int, ...]
     blocks_by_segment: tuple[tuple[int, ...], ...]
     block_size: int
     destination_blocks_by_segment: tuple[tuple[int, ...], ...] | None = None
-    history_routes_by_rank: _RouteMatrix | None = None
     current_routes_by_rank: _RouteMatrix | None = None
     explicit_world_size: int | None = None
     _world_size: int = field(init=False, repr=False, compare=False)
-    _history_sources_by_rank: tuple[tuple[int, ...], ...] = field(
-        init=False, repr=False, compare=False
-    )
     _current_sources_by_rank: tuple[tuple[int, ...], ...] = field(
-        init=False, repr=False, compare=False
-    )
-    _required_sources_by_rank: tuple[tuple[int, ...], ...] = field(
-        init=False, repr=False, compare=False
-    )
-    _required_source_sets_by_rank: tuple[frozenset[int], ...] = field(
         init=False, repr=False, compare=False
     )
     _current_source_sets_by_rank: tuple[frozenset[int], ...] = field(
@@ -88,16 +78,12 @@ class PCPPagePlan:
     _consumers_by_rank: tuple[tuple[int, ...], ...] = field(
         init=False, repr=False, compare=False
     )
-    _history_routes: _RouteMatrix = field(init=False, repr=False, compare=False)
     _current_routes: _RouteMatrix = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.block_size <= 0:
             raise ValueError("PCP page block_size must be positive")
-        if (
-            self.history_routes_by_rank is not None
-            or self.current_routes_by_rank is not None
-        ):
+        if self.current_routes_by_rank is not None:
             self._init_explicit_routes()
         else:
             self._init_legacy_segments()
@@ -121,20 +107,11 @@ class PCPPagePlan:
         self,
         *,
         world_size: int,
-        history_routes: _RouteMatrix,
         current_routes: _RouteMatrix,
     ) -> None:
-        history_sources = tuple(
-            tuple(source for source, route in enumerate(row) if route is not None)
-            for row in history_routes
-        )
         current_sources = tuple(
             tuple(source for source, route in enumerate(row) if route is not None)
             for row in current_routes
-        )
-        required_sources = tuple(
-            tuple(dict.fromkeys((*history_sources[rank], *current_sources[rank])))
-            for rank in range(world_size)
         )
         current_sets = tuple(frozenset(items) for items in current_sources)
         consumers = tuple(
@@ -146,38 +123,19 @@ class PCPPagePlan:
             for source_rank in range(world_size)
         )
         object.__setattr__(self, "_world_size", world_size)
-        object.__setattr__(self, "_history_routes", history_routes)
         object.__setattr__(self, "_current_routes", current_routes)
-        object.__setattr__(self, "_history_sources_by_rank", history_sources)
         object.__setattr__(self, "_current_sources_by_rank", current_sources)
-        object.__setattr__(self, "_required_sources_by_rank", required_sources)
-        object.__setattr__(
-            self,
-            "_required_source_sets_by_rank",
-            tuple(frozenset(items) for items in required_sources),
-        )
         object.__setattr__(self, "_current_source_sets_by_rank", current_sets)
         object.__setattr__(self, "_consumers_by_rank", consumers)
 
     def _init_explicit_routes(self) -> None:
-        history = self.history_routes_by_rank
         current = self.current_routes_by_rank
-        inferred = len(history) if history is not None else len(current or ())
-        world_size = self.explicit_world_size or inferred
+        assert current is not None
+        world_size = self.explicit_world_size or len(current)
         if world_size <= 0:
             raise ValueError("explicit page plan requires a positive PCP world size")
-        empty: _RouteMatrix = tuple(
-            tuple(None for _ in range(world_size)) for _ in range(world_size)
-        )
-        history = history if history is not None else empty
-        current = current if current is not None else empty
-        self._validate_route_matrix(history, world_size)
         self._validate_route_matrix(current, world_size)
-        self._set_route_state(
-            world_size=world_size,
-            history_routes=history,
-            current_routes=current,
-        )
+        self._set_route_state(world_size=world_size, current_routes=current)
 
     def _init_legacy_segments(self) -> None:
         if not self.segment_to_rank:
@@ -209,7 +167,7 @@ class PCPPagePlan:
                 f"missing={sorted(missing)}"
             )
 
-        current_rows: list[tuple[PCPPageRoute | None, ...]] = []
+        rows: list[tuple[PCPPageRoute | None, ...]] = []
         for destination_rank in range(world_size):
             owned = [
                 segment_idx
@@ -227,7 +185,7 @@ class PCPPagePlan:
                 destination_blocks[source_rank].extend(
                     destination_by_segment[segment_idx]
                 )
-            current_rows.append(
+            rows.append(
                 tuple(
                     PCPPageRoute(
                         destination_rank=destination_rank,
@@ -240,15 +198,7 @@ class PCPPagePlan:
                     for source_rank in range(world_size)
                 )
             )
-
-        empty_history: _RouteMatrix = tuple(
-            tuple(None for _ in range(world_size)) for _ in range(world_size)
-        )
-        self._set_route_state(
-            world_size=world_size,
-            history_routes=empty_history,
-            current_routes=tuple(current_rows),
-        )
+        self._set_route_state(world_size=world_size, current_routes=tuple(rows))
 
     @property
     def num_segments(self) -> int:
@@ -279,53 +229,25 @@ class PCPPagePlan:
             if self.segment_to_rank[segment_idx] != rank
         )
 
-    def historical_source_ranks(self, rank: int) -> tuple[int, ...]:
-        return self._history_sources_by_rank[rank]
-
     def current_source_ranks(self, rank: int) -> tuple[int, ...]:
         return self._current_sources_by_rank[rank]
-
-    def required_source_ranks(self, rank: int) -> tuple[int, ...]:
-        return self._required_sources_by_rank[rank]
-
-    def requires_source(self, rank: int, source_rank: int) -> bool:
-        return source_rank in self._required_source_sets_by_rank[rank]
 
     def requires_current_source(self, rank: int, source_rank: int) -> bool:
         return source_rank in self._current_source_sets_by_rank[rank]
 
     def consumer_ranks(self, source_rank: int) -> tuple[int, ...]:
-        """Ranks that consume this source's current-step pages."""
         return self._consumers_by_rank[source_rank]
-
-    @staticmethod
-    def _route(
-        matrix: _RouteMatrix,
-        destination_rank: int,
-        source_rank: int,
-        kind: str,
-    ) -> PCPPageRoute:
-        route = matrix[destination_rank][source_rank]
-        if route is None:
-            raise ValueError(
-                f"no {kind} page route for "
-                f"source={source_rank}, destination={destination_rank}"
-            )
-        return route
-
-    def history_transfer_route(
-        self, destination_rank: int, source_rank: int
-    ) -> PCPPageRoute:
-        return self._route(
-            self._history_routes, destination_rank, source_rank, "historical"
-        )
 
     def current_transfer_route(
         self, destination_rank: int, source_rank: int
     ) -> PCPPageRoute:
-        return self._route(
-            self._current_routes, destination_rank, source_rank, "current"
-        )
+        route = self._current_routes[destination_rank][source_rank]
+        if route is None:
+            raise ValueError(
+                "no current page route for "
+                f"source={source_rank}, destination={destination_rank}"
+            )
+        return route
 
 
 __all__ = ["PCPPagePlan", "PCPPageRoute"]
