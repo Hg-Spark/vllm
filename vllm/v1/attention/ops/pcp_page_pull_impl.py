@@ -173,7 +173,9 @@ class PCPPagePullTransport:
         if not kv_caches:
             raise RuntimeError("PCP page_pull received no tensor KV caches to register")
         layer_names = tuple(sorted(kv_caches))
-        registrations = [self._peer.register_tensor(kv_caches[name]) for name in layer_names]
+        registrations = [
+            self._peer.register_tensor(kv_caches[name]) for name in layer_names
+        ]
         if self._layer_names:
             if layer_names != self._layer_names:
                 raise RuntimeError(
@@ -215,7 +217,9 @@ class PCPPagePullTransport:
         if not self._layer_names:
             discovered = self._discover_bound_layer_caches()
             if not discovered:
-                raise RuntimeError("PCP page-pull requires stable bound layer KV caches")
+                raise RuntimeError(
+                    "PCP page-pull requires stable bound layer KV caches"
+                )
             self.register_layer_caches(discovered)
         layer_id = self._layer_id_by_ptr.get(kv_cache.data_ptr())
         if layer_id is None:
@@ -434,7 +438,9 @@ class PCPPagePullTransport:
 
     def _check_progress_error(self) -> None:
         if self._progress_error is not None:
-            raise RuntimeError("PCP page-pull progress engine failed") from self._progress_error
+            raise RuntimeError(
+                "PCP page-pull progress engine failed"
+            ) from self._progress_error
 
     def progress(self) -> None:
         self._check_progress_error()
