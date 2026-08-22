@@ -56,12 +56,10 @@ _RouteMatrix = tuple[tuple[PCPPageRoute | None, ...], ...]
 class PCPPagePlan:
     """Per-step page demand plan.
 
-    The legacy constructor (``segment_to_rank`` + ``blocks_by_segment``)
-    compiles fresh-prefill causal routes exactly as before. Chunked-prefill
-    planning can instead provide explicit ``history_routes_by_rank`` and
-    ``current_routes_by_rank`` matrices. Historical routes are immediately
-    readable at step start; current routes wait for the producer's same-layer
-    READY notification.
+    The legacy segment constructor compiles fresh-prefill causal CURRENT routes.
+    Chunked-prefill planning supplies explicit history and current matrices.
+    History entries describe replicas that must already be local at step start;
+    CURRENT entries describe predecessor pages delivered by producer WRITE.
     """
 
     segment_to_rank: tuple[int, ...]
@@ -95,14 +93,14 @@ class PCPPagePlan:
 
     def __post_init__(self) -> None:
         if self.block_size <= 0:
-            raise ValueError("page-pull block_size must be positive")
+            raise ValueError("PCP page block_size must be positive")
         if (
             self.history_routes_by_rank is not None
             or self.current_routes_by_rank is not None
         ):
             self._init_explicit_routes()
-            return
-        self._init_legacy_segments()
+        else:
+            self._init_legacy_segments()
 
     @staticmethod
     def _validate_route_matrix(matrix: _RouteMatrix, world_size: int) -> None:
@@ -138,7 +136,6 @@ class PCPPagePlan:
             tuple(dict.fromkeys((*history_sources[rank], *current_sources[rank])))
             for rank in range(world_size)
         )
-        required_sets = tuple(frozenset(items) for items in required_sources)
         current_sets = tuple(frozenset(items) for items in current_sources)
         consumers = tuple(
             tuple(
@@ -154,15 +151,17 @@ class PCPPagePlan:
         object.__setattr__(self, "_history_sources_by_rank", history_sources)
         object.__setattr__(self, "_current_sources_by_rank", current_sources)
         object.__setattr__(self, "_required_sources_by_rank", required_sources)
-        object.__setattr__(self, "_required_source_sets_by_rank", required_sets)
+        object.__setattr__(
+            self,
+            "_required_source_sets_by_rank",
+            tuple(frozenset(items) for items in required_sources),
+        )
         object.__setattr__(self, "_current_source_sets_by_rank", current_sets)
         object.__setattr__(self, "_consumers_by_rank", consumers)
 
     def _init_explicit_routes(self) -> None:
         history = self.history_routes_by_rank
         current = self.current_routes_by_rank
-        if history is None and current is None:
-            raise AssertionError("unreachable")
         inferred = len(history) if history is not None else len(current or ())
         world_size = self.explicit_world_size or inferred
         if world_size <= 0:
@@ -182,7 +181,7 @@ class PCPPagePlan:
 
     def _init_legacy_segments(self) -> None:
         if not self.segment_to_rank:
-            raise ValueError("page-pull plan requires at least one logical segment")
+            raise ValueError("page plan requires at least one logical segment")
         if len(self.blocks_by_segment) != len(self.segment_to_rank):
             raise ValueError("page map must match logical segment count")
         destination_by_segment = self.destination_blocks_by_segment
@@ -200,13 +199,13 @@ class PCPPagePlan:
                     f"destination={len(destination_ids)}"
                 )
         if min(self.segment_to_rank) < 0:
-            raise ValueError("page-pull physical ranks must be non-negative")
+            raise ValueError("PCP physical ranks must be non-negative")
 
         world_size = max(self.segment_to_rank) + 1
         missing = set(range(world_size)) - set(self.segment_to_rank)
         if missing:
             raise ValueError(
-                "page-pull segment map must cover every PCP rank; "
+                "page segment map must cover every PCP rank; "
                 f"missing={sorted(missing)}"
             )
 
@@ -296,11 +295,11 @@ class PCPPagePlan:
         return source_rank in self._current_source_sets_by_rank[rank]
 
     def consumer_ranks(self, source_rank: int) -> tuple[int, ...]:
-        """Ranks that need this source's current-chunk pages after READY."""
+        """Ranks that consume this source's current-step pages."""
         return self._consumers_by_rank[source_rank]
 
+    @staticmethod
     def _route(
-        self,
         matrix: _RouteMatrix,
         destination_rank: int,
         source_rank: int,
@@ -309,7 +308,7 @@ class PCPPagePlan:
         route = matrix[destination_rank][source_rank]
         if route is None:
             raise ValueError(
-                f"no {kind} page-pull route for "
+                f"no {kind} page route for "
                 f"source={source_rank}, destination={destination_rank}"
             )
         return route
@@ -326,31 +325,6 @@ class PCPPagePlan:
     ) -> PCPPageRoute:
         return self._route(
             self._current_routes, destination_rank, source_rank, "current"
-        )
-
-    def transfer_route(self, destination_rank: int, source_rank: int) -> PCPPageRoute:
-        """Compatibility accessor for fresh-prefill/current routes."""
-        return self.current_transfer_route(destination_rank, source_rank)
-
-    def transfer_block_ids(
-        self, destination_rank: int, source_rank: int
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        route = self.transfer_route(destination_rank, source_rank)
-        return route.destination_block_ids, route.source_block_ids
-
-    def transfer_block_arrays(
-        self, destination_rank: int, source_rank: int
-    ) -> tuple[np.ndarray, np.ndarray, int]:
-        """Compatibility accessor for identical source/destination mappings."""
-        route = self.transfer_route(destination_rank, source_rank)
-        if route.destination_max_block_id != route.source_max_block_id:
-            raise RuntimeError(
-                "independent source/destination mappings require transfer_route()"
-            )
-        return (
-            route.destination_block_array,
-            route.source_block_array,
-            route.source_max_block_id,
         )
 
 
