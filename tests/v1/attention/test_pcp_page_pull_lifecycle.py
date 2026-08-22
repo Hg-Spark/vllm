@@ -43,9 +43,9 @@ def test_configure_step_switches_state_under_progress_lock() -> None:
         device=torch.device("cpu"),
     )
     transport._pending_ready.append(object())  # type: ignore[arg-type]
-    transport._ready_waiting.append((9, 9))
-    transport._inflight[(9, 9)] = object()  # type: ignore[assignment]
-    transport._done_pairs.add((9, 9))
+    transport._ready_waiting.append((9, 1, "current"))
+    transport._inflight[(9, 1, "current")] = object()  # type: ignore[assignment]
+    transport._done_routes.add((9, 1, "current"))
 
     lock = _ObservedLock()
     lock.acquire()
@@ -66,7 +66,7 @@ def test_configure_step_switches_state_under_progress_lock() -> None:
     assert transport._plan is None
     assert transport._ready_waiting
     assert transport._inflight
-    assert transport._done_pairs
+    assert transport._done_routes
 
     lock.release()
     thread.join(timeout=1.0)
@@ -79,7 +79,7 @@ def test_configure_step_switches_state_under_progress_lock() -> None:
     assert not transport._pending_ready
     assert not transport._ready_waiting
     assert not transport._inflight
-    assert not transport._done_pairs
+    assert not transport._done_routes
 
 
 def test_finish_step_clears_plan_under_progress_lock() -> None:
