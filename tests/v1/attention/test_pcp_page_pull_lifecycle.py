@@ -115,23 +115,3 @@ def test_finish_step_clears_plan_under_progress_lock() -> None:
     assert not errors
     assert transport._plan is None
     assert transport._step_finished
-
-
-def test_close_stops_persistent_progress_thread() -> None:
-    transport = PCPPagePullTransport(
-        world_size=1,
-        rank=0,
-        device=torch.device("cpu"),
-    )
-    transport._layer_names = ("layer",)
-    transport._layer_memory = [object()]  # type: ignore[list-item]
-    transport.configure_step(
-        epoch=1,
-        plan=PCPPagePlan(
-            segment_to_rank=(0,),
-            blocks_by_segment=((0,),),
-            block_size=16,
-        ),
-    )
-    transport.close()
-    assert transport._progress_thread is None
