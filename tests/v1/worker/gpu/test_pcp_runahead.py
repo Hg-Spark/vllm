@@ -425,11 +425,10 @@ def test_dense_mla_moe_is_allowed_for_tensor_runahead() -> None:
     RunaheadPCPManager.validate_config(_runahead_vllm_config(), False)
 
 
-def test_mla_page_pull_remains_explicitly_unsupported() -> None:
-    with pytest.raises(NotImplementedError, match="MLA does not support page_pull"):
-        RunaheadPCPManager.validate_config(
-            _runahead_vllm_config(transport="page_pull"), False
-        )
+def test_mla_page_pull_is_allowed_for_unquantized_dense_mla() -> None:
+    RunaheadPCPManager.validate_config(
+        _runahead_vllm_config(transport="page_pull"), False
+    )
 
 
 def test_sparse_mla_runahead_remains_explicitly_unsupported() -> None:
