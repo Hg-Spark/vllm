@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.v1.attention.ops.pcp_nixl import NixlMemoryRegion, PCPNixlPeerTransport
 from vllm.v1.attention.ops.pcp_page_plan import PCPPagePlan
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_mark, pcp_nvtx_range
@@ -71,6 +72,7 @@ class PCPPagePullTransport:
         self._ready_waiting: deque[tuple[int, int]] = deque()
         self._inflight: dict[tuple[int, int], _InflightRead] = {}
         self._done_pairs: set[tuple[int, int]] = set()
+        self._demand_layer: int | None = None
 
         self._progress_stop = threading.Event()
         self._progress_wakeup = threading.Event()
@@ -101,10 +103,15 @@ class PCPPagePullTransport:
         self._ready_waiting.clear()
         self._inflight.clear()
         self._done_pairs.clear()
+        self._demand_layer = None
 
     def configure_step(self, *, epoch: int, plan: PCPPagePlan) -> None:
         self.finish_step()
         self._check_progress_error()
+        if not self._layer_memory:
+            discovered = self._discover_bound_layer_caches()
+            if discovered:
+                self.register_layer_caches(discovered)
         if plan.world_size != self.world_size:
             raise ValueError(
                 "page plan PCP world size mismatch: "
@@ -126,11 +133,14 @@ class PCPPagePullTransport:
 
     @staticmethod
     def _discover_bound_layer_caches() -> dict[str, torch.Tensor]:
-        from vllm.forward_context import get_forward_context
-
-        forward_context = get_forward_context()
+        try:
+            forward_context = (
+                get_current_vllm_config().compilation_config.static_forward_context
+            )
+        except (AttributeError, RuntimeError):
+            return {}
         result: dict[str, torch.Tensor] = {}
-        for layer_name, layer in forward_context.no_compile_layers.items():
+        for layer_name, layer in forward_context.items():
             kv_cache = getattr(layer, "kv_cache", None)
             if not isinstance(kv_cache, torch.Tensor):
                 continue
@@ -276,6 +286,21 @@ class PCPPagePullTransport:
                     dst=self.rank,
                 )
 
+    def _pop_ready_locked(self) -> tuple[int, int] | None:
+        if not self._ready_waiting:
+            return None
+        demand_layer = self._demand_layer
+        if demand_layer is None:
+            return self._ready_waiting.popleft()
+        for index, key in enumerate(self._ready_waiting):
+            if key[0] != demand_layer:
+                continue
+            self._ready_waiting.rotate(-index)
+            selected = self._ready_waiting.popleft()
+            self._ready_waiting.rotate(index)
+            return selected
+        return self._ready_waiting.popleft()
+
     def _start_read_locked(self, layer_id: int, source_rank: int) -> None:
         assert self._plan is not None
         local = self._layer_memory[layer_id]
@@ -317,9 +342,6 @@ class PCPPagePullTransport:
                 return
             self._publish_completed_ready_locked()
             self._poll_ready_notifications_locked()
-            while self._ready_waiting and len(self._inflight) < self.max_inflight_reads:
-                layer_id, source_rank = self._ready_waiting.popleft()
-                self._start_read_locked(layer_id, source_rank)
             for key, transfer in list(self._inflight.items()):
                 state = self._peer.check_read(transfer.handle)
                 if state == "PROC":
@@ -340,6 +362,12 @@ class PCPPagePullTransport:
                     dst=self.rank,
                     pages=transfer.num_pages,
                 )
+            while len(self._inflight) < self.max_inflight_reads:
+                ready = self._pop_ready_locked()
+                if ready is None:
+                    break
+                layer_id, source_rank = ready
+                self._start_read_locked(layer_id, source_rank)
 
     def _progress_loop(self) -> None:
         try:
@@ -382,24 +410,34 @@ class PCPPagePullTransport:
             self._progress_once()
 
     def wait_layer(self, layer_id: int) -> None:
-        while True:
-            self._check_progress_error()
-            with self._progress_lock:
-                plan = self._plan
-                if plan is None:
-                    return
-                required = plan.required_source_ranks(self.rank)
-                complete = all(
-                    (layer_id, source_rank) in self._done_pairs
-                    for source_rank in required
-                )
-            if complete:
+        with self._progress_lock:
+            if self._plan is None:
                 return
-            if self._progress_thread is None:
-                self._progress_once()
-            else:
-                self._progress_wakeup.set()
-            time.sleep(self._POLL_INTERVAL_S)
+            self._demand_layer = layer_id
+        self._progress_wakeup.set()
+        try:
+            while True:
+                self._check_progress_error()
+                with self._progress_lock:
+                    plan = self._plan
+                    if plan is None:
+                        return
+                    required = plan.required_source_ranks(self.rank)
+                    complete = all(
+                        (layer_id, source_rank) in self._done_pairs
+                        for source_rank in required
+                    )
+                if complete:
+                    return
+                if self._progress_thread is None:
+                    self._progress_once()
+                else:
+                    self._progress_wakeup.set()
+                time.sleep(self._POLL_INTERVAL_S)
+        finally:
+            with self._progress_lock:
+                if self._demand_layer == layer_id:
+                    self._demand_layer = None
 
     def _expected_pairs_locked(self) -> set[tuple[int, int]]:
         assert self._plan is not None
