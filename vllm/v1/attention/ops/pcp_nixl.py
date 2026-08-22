@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""PCP-local NIXL peer transport primitives.
+"""PCP-local NIXL peer-memory transport primitives.
 
-This module deliberately stays below PCP scheduling semantics. It owns NIXL
-agent setup, stable memory registration, peer-region metadata, notifications,
-and asynchronous READ submission while callers own causal dependencies and
-step/layer scheduling.
+This module stays below PCP scheduling semantics. It owns NIXL agent setup,
+stable memory registration, aggregate per-peer descriptor lists, notifications,
+and asynchronous producer-driven WRITE submission.
 """
 
 from __future__ import annotations
@@ -32,16 +31,25 @@ class NixlMemoryRegion:
     block_bytes: int
     num_blocks: int
     device_id: int
-    local_xfer_handle: int
+
+
+@dataclass(frozen=True)
+class NixlWrite:
+    """One region-local page mapping in an aggregate WRITE."""
+
+    local_region_id: int
+    remote_region_id: int
+    local_block_ids: np.ndarray
+    remote_block_ids: np.ndarray
 
 
 class PCPNixlPeerTransport:
-    """Minimal same-engine peer-memory transport for PCP.
+    """Minimal same-engine peer-memory WRITE transport for PCP.
 
-    The abstraction intentionally does not depend on KVConnector request,
-    scheduler, lease, or producer/consumer state. PCP page-pull only needs
-    stable peer regions, notifications, and one-sided READs between ranks in
-    the existing PCP process group.
+    All registered layer caches are flattened into one prepared descriptor list
+    per process. A single NIXL handle can therefore cover pages from multiple
+    layers while scheduling and causal dependency tracking remain above this
+    transport boundary.
     """
 
     def __init__(
@@ -64,10 +72,15 @@ class PCPNixlPeerTransport:
         self._remote_agents: dict[int, str] = {}
         self._registered_descs: list[Any] = []
         self._memory_by_ptr: dict[int, NixlMemoryRegion] = {}
-        self._remote_region_handles: dict[tuple[int, int], int] = {}
-        self._remote_num_blocks: dict[tuple[int, int], int] = {}
+
         self._registered_region_signature: tuple[tuple[int, int, int, int], ...] = ()
         self._metadata_exchanged = False
+        self._local_xfer_handle: int | None = None
+        self._local_region_offsets: tuple[int, ...] = ()
+        self._local_num_blocks: tuple[int, ...] = ()
+        self._remote_xfer_handles: dict[int, int] = {}
+        self._remote_region_offsets: dict[int, tuple[int, ...]] = {}
+        self._remote_num_blocks: dict[tuple[int, int], int] = {}
 
     def _group(self):
         return self.group if self.group is not None else get_pcp_group()
@@ -91,7 +104,7 @@ class PCPNixlPeerTransport:
         else:
             config = nixl_agent_config(num_threads=4, capture_telemetry=True)
         self._wrapper = NixlWrapper(
-            f"pcp-page-pull-r{self.rank}-{uuid.uuid4()}", config
+            f"pcp-page-push-r{self.rank}-{uuid.uuid4()}", config
         )
         memory_type = current_platform.get_nixl_memory_type()
         if memory_type is None:
@@ -110,21 +123,21 @@ class PCPNixlPeerTransport:
             self._wrapper.get_agent_metadata(),
             group=group.cpu_group,
         )
-        for source_rank, metadata in enumerate(gathered):
-            if source_rank != self.rank:
-                self._remote_agents[source_rank] = self._wrapper.add_remote_agent(metadata)
+        for peer_rank, metadata in enumerate(gathered):
+            if peer_rank != self.rank:
+                self._remote_agents[peer_rank] = self._wrapper.add_remote_agent(metadata)
 
     @staticmethod
     def physical_page_geometry(kv_cache: torch.Tensor) -> tuple[int, int]:
         if kv_cache.ndim < 2:
             raise RuntimeError(
-                f"PCP page-pull expects block-major KV cache, got {kv_cache.shape}"
+                f"PCP page-push expects block-major KV cache, got {kv_cache.shape}"
             )
         num_blocks = int(kv_cache.shape[0])
         page_elements = math.prod(kv_cache.shape[1:])
         if kv_cache.stride(0) != page_elements:
             raise NotImplementedError(
-                "PCP page_pull requires dense block-major KV pages; "
+                "PCP page-push requires dense block-major KV pages; "
                 f"shape={tuple(kv_cache.shape)}, stride={tuple(kv_cache.stride())}"
             )
         return num_blocks, int(page_elements * kv_cache.element_size())
@@ -140,6 +153,34 @@ class PCPNixlPeerTransport:
         result[:, 2] = np.uint64(device_id)
         return result
 
+    @staticmethod
+    def _region_offsets(num_blocks: Sequence[int]) -> tuple[int, ...]:
+        offsets: list[int] = []
+        total = 0
+        for count in num_blocks:
+            offsets.append(total)
+            total += int(count)
+        return tuple(offsets)
+
+    @classmethod
+    def _aggregate_block_descriptors(
+        cls, metadata: Sequence[tuple[int, int, int, int]]
+    ) -> tuple[np.ndarray, tuple[int, ...], tuple[int, ...]]:
+        counts = tuple(int(item[2]) for item in metadata)
+        offsets = cls._region_offsets(counts)
+        blocks = [
+            cls._block_descriptors(
+                base_addr=int(base_addr),
+                block_bytes=int(block_bytes),
+                num_blocks=int(num_blocks),
+                device_id=int(device_id),
+            )
+            for base_addr, block_bytes, num_blocks, device_id in metadata
+        ]
+        if not blocks:
+            raise RuntimeError("PCP page-push cannot prepare an empty region set")
+        return np.concatenate(blocks, axis=0), offsets, counts
+
     def register_tensor(self, kv_cache: torch.Tensor) -> NixlMemoryRegion:
         self._ensure_wrapper()
         assert self._wrapper is not None and self._memory_type is not None
@@ -149,31 +190,22 @@ class PCPNixlPeerTransport:
             return existing
         if kv_cache.device.type != self.device.type:
             raise RuntimeError(
-                "PCP page-pull KV cache device changed unexpectedly: "
+                "PCP page-push KV cache device changed unexpectedly: "
                 f"runtime={self.device}, cache={kv_cache.device}"
             )
         num_blocks, block_bytes = self.physical_page_geometry(kv_cache)
         if num_blocks <= 0 or block_bytes <= 0:
-            raise RuntimeError("PCP page-pull cannot register an empty KV cache")
+            raise RuntimeError("PCP page-push cannot register an empty KV cache")
         device_id = max(kv_cache.get_device(), 0)
         reg_descs = self._wrapper.get_reg_descs(
             [(ptr, num_blocks * block_bytes, device_id, "")], self._memory_type
         )
         self._wrapper.register_memory(reg_descs, backends=list(self.nixl_backends))
-        block_data = self._block_descriptors(
-            base_addr=ptr,
-            block_bytes=block_bytes,
-            num_blocks=num_blocks,
-            device_id=device_id,
-        )
-        xfer_descs = self._wrapper.get_xfer_descs(block_data, self._memory_type)
-        local_handle = self._wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", xfer_descs)
         region = NixlMemoryRegion(
             base_addr=ptr,
             block_bytes=block_bytes,
             num_blocks=num_blocks,
             device_id=device_id,
-            local_xfer_handle=local_handle,
         )
         self._registered_descs.append(reg_descs)
         self._memory_by_ptr[ptr] = region
@@ -189,64 +221,70 @@ class PCPNixlPeerTransport:
         )
 
     def exchange_regions(self, regions: Sequence[NixlMemoryRegion]) -> None:
-        """Exchange stable peer geometry once and prepare remote descriptor lists."""
+        """Exchange stable geometry and prepare aggregate descriptor lists once."""
         signature = tuple(self._wire_meta(region) for region in regions)
         if self._metadata_exchanged:
             if signature != self._registered_region_signature:
-                raise RuntimeError("PCP page-pull registered region geometry changed")
+                raise RuntimeError("PCP page-push registered region geometry changed")
             return
         if not regions:
             return
         self.ensure_peers()
         assert self._wrapper is not None and self._memory_type is not None
+
         group = self._group()
         local_meta = tuple(self._wire_meta(region) for region in regions)
         gathered: list[Any] = [None] * self.world_size
         dist.all_gather_object(gathered, local_meta, group=group.cpu_group)
-        for source_rank, remote_regions in enumerate(gathered):
+
+        local_blocks, local_offsets, local_counts = self._aggregate_block_descriptors(
+            local_meta
+        )
+        local_descs = self._wrapper.get_xfer_descs(local_blocks, self._memory_type)
+        self._local_xfer_handle = self._wrapper.prep_xfer_dlist(
+            "NIXL_INIT_AGENT", local_descs
+        )
+        self._local_region_offsets = local_offsets
+        self._local_num_blocks = local_counts
+
+        for peer_rank, remote_regions in enumerate(gathered):
             if len(remote_regions) != len(regions):
                 raise RuntimeError(
-                    "PCP page-pull region registration differs across ranks: "
-                    f"rank={source_rank}, regions={len(remote_regions)}, "
+                    "PCP page-push region registration differs across ranks: "
+                    f"rank={peer_rank}, regions={len(remote_regions)}, "
                     f"local={len(regions)}"
                 )
-            if source_rank == self.rank:
-                continue
             for region_id, meta in enumerate(remote_regions):
-                base_addr, block_bytes, num_blocks, device_id = map(int, meta)
-                local = regions[region_id]
-                if block_bytes != local.block_bytes:
+                _, block_bytes, num_blocks, _ = map(int, meta)
+                if block_bytes != regions[region_id].block_bytes:
                     raise RuntimeError(
-                        "PCP page-pull requires homogeneous KV page bytes: "
-                        f"local={local.block_bytes}, remote={block_bytes}, "
-                        f"source_rank={source_rank}, region_id={region_id}"
+                        "PCP page-push requires homogeneous KV page bytes: "
+                        f"local={regions[region_id].block_bytes}, remote={block_bytes}, "
+                        f"peer_rank={peer_rank}, region_id={region_id}"
                     )
-                block_data = self._block_descriptors(
-                    base_addr=base_addr,
-                    block_bytes=block_bytes,
-                    num_blocks=num_blocks,
-                    device_id=device_id,
-                )
-                descs = self._wrapper.get_xfer_descs(block_data, self._memory_type)
-                self._remote_region_handles[(source_rank, region_id)] = (
-                    self._wrapper.prep_xfer_dlist(
-                        self._remote_agents[source_rank], descs
-                    )
-                )
-                self._remote_num_blocks[(source_rank, region_id)] = num_blocks
+                self._remote_num_blocks[(peer_rank, region_id)] = num_blocks
+            if peer_rank == self.rank:
+                continue
+            remote_blocks, remote_offsets, _ = self._aggregate_block_descriptors(
+                remote_regions
+            )
+            remote_descs = self._wrapper.get_xfer_descs(
+                remote_blocks, self._memory_type
+            )
+            self._remote_xfer_handles[peer_rank] = self._wrapper.prep_xfer_dlist(
+                self._remote_agents[peer_rank], remote_descs
+            )
+            self._remote_region_offsets[peer_rank] = remote_offsets
+
         self._registered_region_signature = signature
         self._metadata_exchanged = True
 
-    def send_notification(self, destination_ranks: Sequence[int], payload: bytes) -> None:
+    def send_notification(self, destination_rank: int, payload: bytes) -> None:
         self.ensure_peers()
         assert self._wrapper is not None
-        for destination_rank in destination_ranks:
-            self._wrapper.send_notif(
-                self._remote_agents[destination_rank], notif_msg=payload
-            )
-
-    def get_notifications(self) -> list[bytes]:
-        return list(self.iter_notifications())
+        self._wrapper.send_notif(
+            self._remote_agents[destination_rank], notif_msg=payload
+        )
 
     def iter_notifications(self) -> Iterator[bytes]:
         self._ensure_wrapper()
@@ -254,71 +292,90 @@ class PCPNixlPeerTransport:
         for notifications in self._wrapper.get_new_notifs().values():
             yield from notifications
 
-    def submit_read(
-        self,
-        *,
-        local_region: NixlMemoryRegion,
-        local_block_ids: Sequence[int],
-        source_rank: int,
-        remote_region_id: int,
-        remote_block_ids: Sequence[int],
-    ) -> int:
-        local_ids = np.asarray(local_block_ids, dtype=np.int64)
-        remote_ids = np.asarray(remote_block_ids, dtype=np.int64)
-        if local_ids.size == 0 or remote_ids.size == 0:
-            raise ValueError("PCP NIXL READ requires at least one page")
-        return self.submit_prepared_read(
-            local_region=local_region,
-            local_block_ids=local_ids,
-            local_max_block_id=int(local_ids.max()),
-            source_rank=source_rank,
-            remote_region_id=remote_region_id,
-            remote_block_ids=remote_ids,
-            remote_max_block_id=int(remote_ids.max()),
-        )
+    @staticmethod
+    def _validate_block_ids(name: str, block_ids: np.ndarray, num_blocks: int) -> None:
+        if block_ids.dtype != np.int64 or block_ids.ndim != 1:
+            raise TypeError(f"PCP {name} block IDs must be one-dimensional int64 arrays")
+        if block_ids.size == 0:
+            raise ValueError(f"PCP {name} requires at least one page")
+        if int(block_ids.min()) < 0 or int(block_ids.max()) >= num_blocks:
+            raise RuntimeError(
+                f"PCP {name} block id exceeds registered cache: "
+                f"min={int(block_ids.min())}, max={int(block_ids.max())}, "
+                f"num_blocks={num_blocks}"
+            )
 
-    def submit_prepared_read(
+    def submit_write_batch(
         self,
         *,
-        local_region: NixlMemoryRegion,
-        local_block_ids: np.ndarray,
-        local_max_block_id: int,
-        source_rank: int,
-        remote_region_id: int,
-        remote_block_ids: np.ndarray,
-        remote_max_block_id: int,
+        destination_rank: int,
+        writes: Sequence[NixlWrite],
     ) -> int:
-        if local_block_ids.dtype != np.int64 or remote_block_ids.dtype != np.int64:
-            raise TypeError("PCP prepared READ block IDs must be int64 NumPy arrays")
-        if local_block_ids.ndim != 1 or remote_block_ids.ndim != 1:
-            raise ValueError("PCP prepared READ block IDs must be one-dimensional")
-        if local_block_ids.size != remote_block_ids.size:
-            raise ValueError("PCP NIXL READ source/destination page counts differ")
-        if local_block_ids.size == 0:
-            raise ValueError("PCP NIXL READ requires at least one page")
-        if local_max_block_id >= local_region.num_blocks:
+        """Submit one WRITE handle spanning one or more registered layer regions."""
+        if not writes:
+            raise ValueError("PCP NIXL WRITE batch requires at least one mapping")
+        if self._local_xfer_handle is None:
+            raise RuntimeError("PCP NIXL regions were not exchanged before WRITE")
+        remote_handle = self._remote_xfer_handles.get(destination_rank)
+        remote_offsets = self._remote_region_offsets.get(destination_rank)
+        if remote_handle is None or remote_offsets is None:
             raise RuntimeError(
-                "PCP page-pull destination block id exceeds local cache: "
-                f"max={local_max_block_id}, num_blocks={local_region.num_blocks}"
+                f"PCP NIXL destination rank {destination_rank} has no prepared regions"
             )
-        remote_num_blocks = self._remote_num_blocks[(source_rank, remote_region_id)]
-        if remote_max_block_id >= remote_num_blocks:
-            raise RuntimeError(
-                "PCP page-pull source block id exceeds remote cache: "
-                f"max={remote_max_block_id}, num_blocks={remote_num_blocks}"
+
+        local_indices: list[np.ndarray] = []
+        remote_indices: list[np.ndarray] = []
+        for write in writes:
+            local_region_id = write.local_region_id
+            remote_region_id = write.remote_region_id
+            if not 0 <= local_region_id < len(self._local_num_blocks):
+                raise ValueError(f"invalid PCP local region id: {local_region_id}")
+            if not 0 <= remote_region_id < len(remote_offsets):
+                raise ValueError(f"invalid PCP remote region id: {remote_region_id}")
+            remote_num_blocks = self._remote_num_blocks[
+                (destination_rank, remote_region_id)
+            ]
+            self._validate_block_ids(
+                "WRITE source",
+                write.local_block_ids,
+                self._local_num_blocks[local_region_id],
             )
+            self._validate_block_ids(
+                "WRITE destination",
+                write.remote_block_ids,
+                remote_num_blocks,
+            )
+            if write.local_block_ids.size != write.remote_block_ids.size:
+                raise ValueError("PCP NIXL WRITE source/destination page counts differ")
+            local_indices.append(
+                write.local_block_ids + self._local_region_offsets[local_region_id]
+            )
+            remote_indices.append(
+                write.remote_block_ids + remote_offsets[remote_region_id]
+            )
+
+        local_ids = (
+            local_indices[0]
+            if len(local_indices) == 1
+            else np.concatenate(local_indices)
+        )
+        remote_ids = (
+            remote_indices[0]
+            if len(remote_indices) == 1
+            else np.concatenate(remote_indices)
+        )
         assert self._wrapper is not None
         handle = self._wrapper.make_prepped_xfer(
-            "READ",
-            local_region.local_xfer_handle,
-            local_block_ids,
-            self._remote_region_handles[(source_rank, remote_region_id)],
-            remote_block_ids,
+            "WRITE",
+            self._local_xfer_handle,
+            local_ids,
+            remote_handle,
+            remote_ids,
         )
         self._wrapper.transfer(handle)
         return handle
 
-    def check_read(self, handle: int) -> str:
+    def check_transfer(self, handle: int) -> str:
         assert self._wrapper is not None
         state = self._wrapper.check_xfer_state(handle)
         if state != "PROC":
@@ -326,4 +383,4 @@ class PCPNixlPeerTransport:
         return state
 
 
-__all__ = ["NixlMemoryRegion", "PCPNixlPeerTransport"]
+__all__ = ["NixlMemoryRegion", "NixlWrite", "PCPNixlPeerTransport"]
