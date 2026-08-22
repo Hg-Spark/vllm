@@ -12,7 +12,6 @@ import torch
 
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.config.pcp_runahead import (
-    RUNAHEAD_MIN_PREFILL_TOKENS,
     TransportPolicy,
     parse_pcp_runahead_config,
     parse_runahead_weights,
@@ -121,36 +120,6 @@ def weighted_partition_lengths(
     return tuple(
         boundaries[index + 1] - boundaries[index] for index in range(num_segments)
     )
-
-
-def runahead_batch_eligible(
-    *,
-    num_reqs: int,
-    is_prefilling: np.ndarray,
-    num_scheduled_tokens: np.ndarray,
-    num_computed_tokens: np.ndarray,
-    prefill_len: np.ndarray,
-    pcp_world_size: int,
-    require_full_prefill: bool = True,
-    min_prefill_tokens: int = RUNAHEAD_MIN_PREFILL_TOKENS,
-) -> bool:
-    """Compatibility helper for callers/tests that need an admission predicate.
-
-    The runahead manager itself is fail-closed and never uses this predicate to
-    fall back to baseline PCP. Once the manager is selected, unsupported steps
-    raise explicitly.
-    """
-    if num_reqs <= 0 or not bool(is_prefilling[:num_reqs].all()):
-        return False
-    if require_full_prefill:
-        if not bool((num_computed_tokens[:num_reqs] == 0).all()):
-            return False
-        if not bool(
-            (num_scheduled_tokens[:num_reqs] == prefill_len[:num_reqs]).all()
-        ):
-            return False
-    total_prefill_tokens = int(num_scheduled_tokens[:num_reqs].sum())
-    return total_prefill_tokens >= max(pcp_world_size, min_prefill_tokens)
 
 
 class RunaheadPCPManager(PCPManager):
@@ -625,8 +594,7 @@ class RunaheadPCPManager(PCPManager):
 
         if self._config.transport == "page_pull":
             # Per-request continuity is validated by PCPPageStateTracker during
-            # segment compilation. No size threshold can redirect this manager
-            # to baseline PCP.
+            # segment compilation. There is no baseline routing path.
             return
 
         computed = input_batch.num_computed_tokens_np[: input_batch.num_reqs]
@@ -919,11 +887,9 @@ class RunaheadPCPManager(PCPManager):
 __all__ = [
     "LogicalSegment",
     "PageOwnerUpdate",
-    "RUNAHEAD_MIN_PREFILL_TOKENS",
     "RunaheadPCPManager",
     "RunaheadStep",
     "SegmentLayout",
     "parse_runahead_weights",
-    "runahead_batch_eligible",
     "weighted_partition_lengths",
 ]
