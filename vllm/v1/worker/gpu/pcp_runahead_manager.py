@@ -606,15 +606,11 @@ class RunaheadPCPManager(PCPManager):
         query_start_loc_np: np.ndarray,
     ) -> list[RankSegment]:
         step = self._active_step
-        if step is not None:
-            return list(step.layout.segments_by_rank[rank])
-        return super()._get_rank_segments(
-            rank,
-            num_scheduled_tokens,
-            num_computed_tokens,
-            is_prefilling,
-            query_start_loc_np,
-        )
+        if step is None:
+            raise RuntimeError(
+                "PCP runahead rank-segment lookup requires an active compiled step"
+            )
+        return list(step.layout.segments_by_rank[rank])
 
     def _validate_step_semantics(self, input_batch: InputBatch) -> None:
         if input_batch.num_reqs <= 0:
