@@ -16,17 +16,16 @@ TransportPolicy = Literal[
 ]
 
 RUNAHEAD_CONFIG_KEY = "pcp_runahead"
-RUNAHEAD_MIN_PREFILL_TOKENS = 1024
 
 
 @dataclass(frozen=True)
 class PCPBindingPlan:
     """Compiled rank coordinates for one PCP runahead configuration.
 
-    ``segments[].pcp_rank`` is always a physical PCP rank.  Tensor transports
-    run in primary-PCP-group rank coordinates.  For one-segment-per-rank
+    ``segments[].pcp_rank`` is always a physical PCP rank. Tensor transports
+    run in primary-PCP-group rank coordinates. For one-segment-per-rank
     permutations the primary group is reordered once at startup, so logical
-    segment order becomes group-rank order.  Repeated ownership keeps the
+    segment order becomes group-rank order. Repeated ownership keeps the
     primary group in physical order and remains explicit in the segment map.
     """
 
@@ -110,7 +109,6 @@ class PCPRunaheadConfig:
     transport: TransportPolicy
     weights: tuple[float, ...]
     binding: PCPBindingPlan
-    min_tokens: int = RUNAHEAD_MIN_PREFILL_TOKENS
     max_inflight_sends: int = 4
     max_inflight_reads: int = 4
     nixl_backends: tuple[str, ...] = ("UCX",)
@@ -223,7 +221,7 @@ def parse_pcp_runahead_config(
         return None
     if not isinstance(raw, dict) or not raw:
         raise ValueError(f"{RUNAHEAD_CONFIG_KEY} must be a non-empty JSON object")
-    unknown = set(raw) - {"transport", "partition", "eligibility", "runtime"}
+    unknown = set(raw) - {"transport", "partition", "runtime"}
     if unknown:
         raise ValueError(f"unsupported {RUNAHEAD_CONFIG_KEY} keys: {sorted(unknown)}")
 
@@ -257,14 +255,6 @@ def parse_pcp_runahead_config(
             "repeated segment bindings require transport=page_pull"
         )
 
-    eligibility = _object(raw.get("eligibility"), "pcp_runahead.eligibility")
-    unknown = set(eligibility) - {"min_tokens"}
-    if unknown:
-        raise ValueError(f"unsupported eligibility keys: {sorted(unknown)}")
-    min_tokens = eligibility.get("min_tokens", RUNAHEAD_MIN_PREFILL_TOKENS)
-    if not isinstance(min_tokens, int) or isinstance(min_tokens, bool) or min_tokens < 0:
-        raise ValueError("eligibility.min_tokens must be a non-negative integer")
-
     runtime = _object(raw.get("runtime"), "pcp_runahead.runtime")
     unknown = set(runtime) - {
         "max_inflight_sends",
@@ -291,7 +281,6 @@ def parse_pcp_runahead_config(
         transport=transport,
         weights=weights,
         binding=binding,
-        min_tokens=min_tokens,
         max_inflight_sends=max_inflight_sends,
         max_inflight_reads=max_inflight_reads,
         nixl_backends=tuple(backends_raw),
@@ -302,7 +291,6 @@ __all__ = [
     "PCPBindingPlan",
     "PCPRunaheadConfig",
     "RUNAHEAD_CONFIG_KEY",
-    "RUNAHEAD_MIN_PREFILL_TOKENS",
     "TransportPolicy",
     "compile_pcp_binding",
     "is_rank_permutation",
