@@ -54,7 +54,9 @@ class PCPPageStateTracker:
             ),
         )
 
-    def existing_request(self, req_state_idx: int, request_id: str):
+    def existing_request(
+        self, req_state_idx: int, request_id: str
+    ) -> _RequestPageState | None:
         state = self._states.get(req_state_idx)
         if state is None or state.request_id != request_id:
             return None
