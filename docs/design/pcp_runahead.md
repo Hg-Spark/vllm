@@ -1,26 +1,25 @@
 # PCP causal-prefix runahead
 
-This experimental path extends vLLM V2 PCP for standard FlashAttention prefill.
-It reuses stock PCP batch/block-table machinery and keeps four transport choices:
+This experimental path extends vLLM V2 PCP for long-prefill execution. It reuses
+stock PCP batch/block-table machinery and keeps four transport choices:
 `full_kv_collective`, `prefix_p2p`, `direct_p2p`, and `page_pull`.
 
-The refactor has three core rules:
+The implementation follows four rules:
 
-1. compile logical segments once per batch;
+1. compile logical compute segments once per scheduler step;
 2. encode one-segment-per-rank permutations in the primary PCP group order;
-3. keep repeated ownership local to the page-pull plan.
+3. keep repeated ownership local to the page-pull plan;
+4. once `pcp_runahead` selects the runahead manager, unsupported steps fail
+   explicitly instead of silently switching back to baseline PCP.
 
 ## Configuration
 
-A non-empty `pcp_runahead` object enables the path. Runahead always uses compact
-rank-major execution and requires a fresh complete prefill.
-
-### One segment per rank with arbitrary binding
+A non-empty `pcp_runahead` object enables the path.
 
 ```json
 {
   "pcp_runahead": {
-    "transport": "direct_p2p",
+    "transport": "page_pull",
     "partition": {
       "segments": [
         {"weight": 4.0, "pcp_rank": 2},
@@ -29,71 +28,74 @@ rank-major execution and requires a fresh complete prefill.
         {"weight": 1.6, "pcp_rank": 1}
       ]
     },
-    "eligibility": {"min_tokens": 1024},
-    "runtime": {"max_inflight_sends": 4}
-  }
-}
-```
-
-The configured physical ownership is:
-
-```text
-logical segment:  0     1     2     3
-physical rank:    2     0     3     1
-```
-
-For a permutation, startup constructs the **primary PCP group** with member order
-`[rank2, rank0, rank3, rank1]`. No second runahead communicator exists. After
-startup:
-
-```text
-logical segment index == get_pcp_group().rank_in_group
-```
-
-Tensor collectives and both P2P transports therefore use ordinary PCP ranks with
-no per-layer rank translation or rank-major/segment-major reorder.
-
-`partition.weights` remains accepted and implies identity binding.
-
-### Repeated ownership
-
-Repeated ownership is supported only by `page_pull`:
-
-```json
-{
-  "pcp_runahead": {
-    "transport": "page_pull",
-    "partition": {
-      "segments": [
-        {"weight": 1, "pcp_rank": 1},
-        {"weight": 1, "pcp_rank": 0},
-        {"weight": 1, "pcp_rank": 1}
-      ]
-    },
     "runtime": {
       "nixl_backends": ["UCX"],
-      "max_inflight_reads": 4
+      "max_inflight_reads": 4,
+      "max_inflight_sends": 4
     }
   }
 }
 ```
 
-A process cannot occupy two ranks in one process group. Repeated ownership thus
-leaves the primary PCP group in its normal order and remains in `SegmentLayout`
-and `PCPPagePlan`. Every physical PCP rank must own at least one segment.
+`partition.weights` remains accepted and implies identity binding. Repeated
+physical ownership is supported only by `page_pull`.
+
+## Step admission semantics
+
+Runahead is fail-closed. `RunaheadPCPManager.partition_batch()` either constructs
+an active runahead step or raises. There is no `eligible=False -> baseline PCP`
+path after the runahead manager has been selected.
+
+The tensor transports remain fresh-prefill-only:
+
+```text
+full_kv_collective
+prefix_p2p
+direct_p2p
+
+require:
+  all requests are prefilling
+  num_computed_tokens == 0
+  num_scheduled_tokens == prefill_len
+```
+
+`page_pull` supports both fresh prefill and tracked chunked-prefill continuation:
+
+```text
+chunk N starts at scheduler.num_computed_tokens
+                == PCPPageStateTracker.committed_tokens
+```
+
+A new request with a nonzero untracked prefix is rejected. APC/external-prefix
+migration into PCP runahead is not implemented. A scheduler rewind or forward
+jump relative to the committed PCP page state is also rejected.
+
+Decode and mixed decode/prefill after rank-sharded page-pull prefill remain
+unsupported.
+
+The current model path still requires every physical PCP rank to receive at least
+one token in a runahead step. Inactive/zero-row rank execution is a separate
+follow-up; a too-small or otherwise unrepresentable chunk raises rather than
+switching transport or baseline mode.
+
+`eligibility.min_tokens` is retained as a compatibility configuration field, but
+it is not used to redirect an enabled runahead manager to baseline PCP.
 
 ## Segment compilation and compact layout
 
-The manager partitions every scheduled request once into a `SegmentLayout`:
+The manager compiles every scheduled request into a `SegmentLayout`:
 
 ```text
 segments_by_rank
 rows_per_rank
 logical_segments(req, start_pos, end_pos, owner_rank)
+causal_segments_by_request
+page_owner_updates
 ```
 
-Internal page-alignment validity is checked during this same pass. The compiler
-cost is `O(batch * logical_segments)`.
+For `page_pull`, existing partial tail pages stay on their previously committed
+owner. Internal ownership cuts are aligned to the kernel block size so two ranks
+never write different token ranges into the same physical KV page.
 
 Runahead uses exact rank widths:
 
@@ -101,8 +103,7 @@ Runahead uses exact rank widths:
 rank0 rows | rank1 rows | ... | rankN rows
 ```
 
-No max-width padded slab is created. Hidden-state restore and full-KV transport
-retain the equal-width fast path:
+Hidden-state restore and full-KV transport retain the equal-width fast path:
 
 ```text
 equal rank widths     -> all_gather
@@ -111,24 +112,14 @@ variable rank widths  -> all_gatherv
 
 ## Transport modes
 
-| Transport | Data unit | Route | Repeated ownership |
+| Transport | Data unit | Route | Chunked continuation |
 | --- | --- | --- | --- |
 | `full_kv_collective` | contiguous K/V rows | primary PCP collective | no |
 | `prefix_p2p` | accumulated prefix rows | logical rank chain | no |
-| `direct_p2p` | one logical segment | rank to all later ranks | no |
+| `direct_p2p` | one logical segment | rank to later ranks | no |
 | `page_pull` | physical KV pages | consumer NIXL READ | yes |
 
-All runahead transports require:
-
-```text
-num_computed_tokens == 0
-num_scheduled_tokens == prefill_len
-```
-
-Continued prefill and decode remain unsupported after a causal-prefix transport
-because persistent KV state is rank-specific.
-
-## Prefix P2P
+### Prefix P2P
 
 For four logical PCP ranks:
 
@@ -137,12 +128,9 @@ rank0 -> rank1 -> rank2 -> rank3
   S0      S0+S1   S0+S1+S2
 ```
 
-Configured physical binding is already represented by the primary PCP group, so
-neighbors are simply `rank-1` and `rank+1`.
+### Direct P2P
 
-## Direct P2P
-
-Each logical rank sends only its local segment directly to later ranks:
+Each logical rank sends its local segment directly to later ranks:
 
 ```text
 S0 -> S1, S2, S3
@@ -150,34 +138,73 @@ S1 ->     S2, S3
 S2 ->         S3
 ```
 
-This removes relay dependencies while preserving the fresh-prefill information
-volume.
+This removes the relay dependency while keeping causal-prefix semantics.
 
-## Page pull
+## Chunked page pull
 
-`page_pull` moves completed physical KV pages instead of temporary K/V rows.
-Internal segment boundaries are aligned to the common kernel-page granularity
-from `BlockTables.kernel_block_sizes`. An unaligned step falls back.
+`page_pull` moves completed physical KV pages rather than temporary K/V rows.
+The scheduler remains authoritative for chunk size and physical block allocation;
+PCP adds only ownership and rank-local validity metadata.
+
+### Persistent page state
+
+For each live request slot, `PCPPageStateTracker` stores:
+
+```text
+logical page -> authoritative owner rank
+logical page -> local valid physical block id
+committed_tokens
+```
+
+The physical block id comes from vLLM `BlockTables`. If vLLM reallocates/COWs a
+logical page to another physical block, the saved local-valid id no longer
+matches and the page is demanded again from its authoritative owner.
+
+Ownership is transactional. New `page_owner_updates`, mutable-tail invalidation,
+rank-local validity, and `committed_tokens` are committed only after the forward
+and required page reads complete. A failed forward therefore does not publish
+future page ownership.
+
+### Historical and current routes
+
+Every page-pull step compiles two dependency classes:
+
+```text
+history route
+  page was produced by an earlier chunk
+  source page is already readable
+  NIXL READ can be submitted immediately
+
+current route
+  page is produced in the current chunk/layer
+  consumer waits for READY(epoch, layer, source)
+  then submits NIXL READ
+```
+
+There is no background fill or chunk-end replication. A page is pulled only when
+the current rank's attention requires it and the rank-local physical block does
+not already contain a valid copy.
 
 ### CPU block plan
 
-`BlockTables` maintains a lightweight CPU mirror of the kernel block IDs written
-to its staged GPU table. Page-plan compilation therefore stays on CPU:
+`BlockTables` maintains a CPU mirror of kernel block IDs. Page-plan compilation
+therefore stays on CPU:
 
 ```text
-logical segment
+logical request page
   -> request state index
-  -> token-position block interval
   -> BlockTables.get_block_ids_cpu(...)
-  -> physical block IDs
+  -> physical block id
+  -> local-valid check
+  -> authoritative source rank
+  -> PCPPageRoute
 ```
 
-The supported PCP execution receives the same scheduler block allocation on all
-model workers, so source and destination descriptor IDs are identical. There is
-no per-step GPU slot-map readback, Python-object block-map all-gather, or block
-fingerprint collective.
+The currently supported replicated scheduler allocation gives identical source
+and destination physical block IDs. `PCPPageRoute` nevertheless keeps source and
+destination IDs separate for future asymmetric allocation/residency work.
 
-### Stable registration phase
+### Stable NIXL registration
 
 The first layer-cache discovery registers every write-owning attention KV cache.
 NIXL agent metadata and stable layer geometry are exchanged once:
@@ -186,130 +213,86 @@ NIXL agent metadata and stable layer geometry are exchanged once:
 layer_id -> base address, block bytes, block count, device
 ```
 
-Remote descriptor lists are prepared once and reused. Cache addresses must stay
-stable while the transport is alive.
+Cache addresses must remain stable while the transport is alive. NHD and HND
+logical views are accepted when each physical block is one dense whole-page byte
+span.
 
-NHD and HND logical views are accepted when `stride(0)` proves that each physical
-block still occupies one dense whole-page byte span.
+### Per-layer ordering and runahead
 
-### Per-layer ordering
-
-The normal FlashAttention KV update remains the only local cache write:
+The normal native KV cache update remains the only local write:
 
 ```text
 projection K/V
     |
     v
-prepare_standard_pcp_kv_cache_inputs
-    |  - select local slots
-    |  - register pending page-pull layer
-    v
-native reshape_and_cache_flash
+native KV cache write
     |
     v
-unified KV-update dummy dependency
+CUDA event / READY for current-chunk producer
     |
-    v
-attention-entry PCP hook
-    |  - page_pull_after_cache_write
-    |  - record CUDA event
-    v
-progress thread event.query()
-    |
-    v
-NIXL READY(epoch, layer, source)
-    |
-    v
-consumer NIXL READ -> destination KV pages
-    |
-    v
-all required reads DONE
-    |
-    v
-FlashAttention
+    +-------------------------+
+    |                         |
+historical READs        current READY-gated READs
+    |                         |
+    +------------+------------+
+                 v
+          wait_layer(layer)
+                 |
+                 v
+             attention
 ```
 
-The attention custom op already depends on the unified KV-update custom op via
-`kv_cache_dummy_dep`; the page-pull hook uses that existing ordering instead of
-patching FlashAttention. READY becomes externally visible only after the CUDA
-event recorded after the native write reports completion. The model thread does
-not call `event.synchronize()`.
+`wait_layer(L)` waits only for this rank's required routes for layer `L`. It does
+not wait for all PCP ranks to finish `L`, so ranks naturally advance to different
+layers and retain the diagonal cross-layer runahead pipeline.
 
-READY uses NIXL notifications. Per-layer messages contain only changing state:
+Historical reads for later layers may already be queued while the model thread
+computes an earlier layer. The progress engine prioritizes the currently demanded
+layer without making prefetched later-layer reads part of that layer's completion
+condition.
+
+READY uses NIXL notifications containing only changing state:
 
 ```text
 epoch, layer_id, source_rank
 ```
 
-Memory geometry remains in the registration phase.
+The model thread does not call `event.synchronize()`.
 
-### Repeated-owner short circuit
+## Repeated ownership
 
-For:
+Repeated ownership remains page-pull-only. For:
 
 ```text
 segment_to_rank = [1, 0, 1]
 ```
 
-rank 1 owns `S0` and `S2`. While executing `S2`, `S0` is already local and only
-`S1` is pulled from rank 0.
+rank 1 owns both `S0` and `S2`; while executing `S2`, its own `S0` pages are local
+and only missing predecessor pages are pulled.
 
-## MoE execution
+## MLA and MoE
 
-Runahead does not use PCP ranks as a MoE tensor/expert parallel group. With the
-supported `TP=1`, `DP=1`, and `EP=off` configuration, every PCP rank loads the
-complete routed-expert set and executes routing plus expert kernels locally.
-This avoids MoE PCP `all_gather`/`reduce_scatter` collectives, which are unsafe
-when runahead ranks are executing different layers concurrently.
+Dense MLA `page_pull` uses the native latent KV cache write and supports
+unquantized FP16/BF16 cache pages. Sparse MLA/indexer remains unsupported.
 
-## Performance and scaling notes
-
-The refactor removes several PCP-size-sensitive costs:
-
-- repeated partition passes;
-- runtime rank/segment reorder for permutations;
-- padded compact staging;
-- duplicate local KV-cache writes;
-- per-layer Gloo READY tensors/receives;
-- per-step GPU block-map readback/object exchange.
-
-Page-pull still has a producer-fanout scaling limit. With `P` logical segments:
-
-```text
-S0: P-1 consumers
-S1: P-2 consumers
-...
-```
-
-At larger PCP sizes this can saturate an early source GPU or NIC. Hierarchical
-relay, replication, or resident-page-aware source selection are future options.
-Physical rank binding should also consider multi-node topology.
+Runahead does not use PCP ranks as a MoE tensor/expert-parallel group. With the
+supported `TP=1`, `DP=1`, and `EP=off` configuration, each PCP rank loads the
+complete routed-expert set and executes routing/expert kernels locally. This
+avoids layer-synchronous PCP collectives while ranks are on different layers.
 
 ## Current validation constraints
 
-- standard MHA/GQA/MQA with FlashAttention;
 - PCP > 1;
 - TP = 1, PP = 1, DP = 1, DCP = 1;
-- no EP; MoE uses full expert replication on every PCP rank;
-- no DBO, speculative decoding, async scheduling, or request-level KV transfer
-  connector;
+- EP off; MoE experts replicated locally;
+- no DBO, speculative decoding, async scheduling, LoRA, MM, or encoder-decoder;
 - eager execution (`cudagraph_mode=NONE`);
-- fresh complete prefill only;
-- `page_pull`: NIXL available, one standard-attention KV-cache group,
-  block-major dense FP16/BF16 physical pages, page-aligned internal cuts, stable
-  KV-cache addresses.
-
-## Persistent KV semantics
-
-`full_kv_collective` reconstructs a replicated current-step cache. Causal
-transports leave rank-specific prefix state:
-
-- `prefix_p2p`: prefix through this logical rank;
-- `direct_p2p`: the same state without relay;
-- `page_pull`: pages required through the rank's latest owned logical segment.
-
-Sampling the current forward is valid. A later model step is rejected until a
-persistent sharded-KV continuation/decode path is implemented.
+- no request-level KV transfer connector;
+- tensor transports: fresh complete prefill only;
+- `page_pull`: fresh or exactly tracked chunked prefill, one KV-cache group,
+  NIXL available, dense unquantized FP16/BF16 pages, stable KV-cache addresses;
+- `page_pull`: no APC/external-prefix adoption, preemption rewind migration,
+  decode, mixed decode/prefill, or inactive/zero-row rank execution yet.
 
 ## Profiling
 
@@ -319,15 +302,11 @@ Set the PCP profiling flag before worker startup:
 VLLM_PCP_NVTX=1
 ```
 
-The flag is registered with vLLM's environment registry and is read when the PCP
-profiling helper is imported. PCP scopes use structured fields such as epoch,
-rank, layer, source/destination rank, rows, and page count. Important events
-include P2P send/receive waits and the page-pull lifecycle from READY publication
-through READ submission/completion and per-layer wait.
+Important scopes/marks include runahead step begin/end, whole decoder layers,
+page-plan compilation, READY publication, READ submission/completion, and
+`pcp.page_pull_wait`.
 
-PCP profiling consists only of direct call-site ranges/marks. It does not patch
-FlashAttention or the page-pull progress engine and does not add CUDA
-synchronization. For generic vLLM execution scopes, it can be combined with:
+For generic vLLM execution scopes it can be combined with:
 
 ```bash
 VLLM_NVTX_SCOPES_FOR_PROFILING=1
