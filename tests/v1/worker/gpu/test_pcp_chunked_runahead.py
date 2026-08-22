@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from vllm.config.pcp_runahead import PCPRunaheadConfig, compile_pcp_binding
 from vllm.v1.attention.ops.pcp_page_state import PCPPageStateTracker
@@ -35,6 +36,7 @@ def _chunk_manager() -> RunaheadPCPManager:
     )
     manager._pending_page_valid_updates = []
     manager._pending_page_advances = []
+    manager._pending_tail_invalidations = []
     return manager
 
 
@@ -65,12 +67,12 @@ def test_chunked_layout_keeps_mutable_tail_on_existing_owner() -> None:
     manager = _chunk_manager()
     tracker = manager._page_state
     assert tracker is not None
-    state = tracker.prepare_request(0, "req", 5)
+    state = tracker.prepare_request(0, "req", 0)
     tracker.assign_owner(state, 0, 1)
+    tracker.advance(state, 5)
 
     layout = manager._compile_segment_layout(_batch(scheduled=64, computed=5))
 
-    assert layout is not None
     assert layout.rows_per_rank == (32, 32)
     assert [
         (piece.start_pos, piece.end_pos, piece.owner_group_rank)
@@ -85,17 +87,44 @@ def test_chunked_layout_keeps_mutable_tail_on_existing_owner() -> None:
     } == {(1, 0), (2, 0), (3, 1), (4, 1)}
 
 
-def test_chunked_layout_rejects_unknown_nonzero_prefix() -> None:
+def test_chunked_layout_rejects_untracked_nonzero_prefix() -> None:
     manager = _chunk_manager()
 
-    assert manager._compile_segment_layout(_batch(scheduled=64, computed=64)) is None
+    with pytest.raises(RuntimeError, match="untracked nonzero prefix"):
+        manager._compile_segment_layout(_batch(scheduled=64, computed=64))
+
+
+def test_page_state_rejects_scheduler_progress_jump() -> None:
+    tracker = PCPPageStateTracker(rank=0, block_size=16, max_model_len=128)
+    state = tracker.prepare_request(0, "req", 0)
+    tracker.assign_owner(state, 0, 0)
+    tracker.advance(state, 16)
+
+    with pytest.raises(RuntimeError, match="progress diverged"):
+        tracker.prepare_request(0, "req", 32)
+
+
+def test_new_page_ownership_is_not_committed_during_planning() -> None:
+    manager = _chunk_manager()
+    tracker = manager._page_state
+    assert tracker is not None
+
+    layout = manager._compile_segment_layout(_batch(scheduled=32, computed=0))
+    state = tracker.existing_request(0, "req")
+    assert state is not None
+    assert tracker.owner(state, 0) == -1
+    assert tracker.owner(state, 1) == -1
+    assert {(u.page_idx, u.owner_rank) for u in layout.page_owner_updates} == {
+        (0, 0),
+        (1, 1),
+    }
 
 
 def test_chunked_plan_separates_history_from_current_dependencies() -> None:
     manager = _chunk_manager()
     tracker = manager._page_state
     assert tracker is not None
-    state = tracker.prepare_request(0, "req", 32)
+    state = tracker.prepare_request(0, "req", 0)
     tracker.assign_owner(state, 0, 0)
     tracker.assign_owner(state, 1, 1)
     tracker.mark_local_valid(state, 0, 10)
@@ -103,8 +132,6 @@ def test_chunked_plan_separates_history_from_current_dependencies() -> None:
 
     batch = _batch(scheduled=32, computed=32)
     layout = manager._compile_segment_layout(batch)
-    assert layout is not None
-    manager._commit_page_owner_updates(layout, batch)
     manager._active_step = RunaheadStep(layout=layout, transport="page_pull")
     manager._global_batch = batch
 
@@ -135,9 +162,10 @@ def test_local_validity_is_bound_to_vllm_physical_block_id() -> None:
 
 def test_non_owner_mutable_tail_replica_is_invalidated() -> None:
     tracker = PCPPageStateTracker(rank=0, block_size=16, max_model_len=128)
-    state = tracker.prepare_request(0, "req", 5)
+    state = tracker.prepare_request(0, "req", 0)
     tracker.assign_owner(state, 0, 1)
     tracker.mark_local_valid(state, 0, 7)
+    tracker.advance(state, 5)
 
     tracker.invalidate_mutable_tail(state, 5)
 
