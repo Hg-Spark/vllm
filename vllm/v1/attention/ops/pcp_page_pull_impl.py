@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -18,10 +18,15 @@ from vllm.v1.attention.ops.pcp_page_plan import PCPPagePlan
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_mark, pcp_nvtx_range
 
 
+_RouteKind = Literal["history", "current"]
+_RouteKey = tuple[int, int, _RouteKind]
+
+
 @dataclass
 class _InflightRead:
     layer_id: int
     source_rank: int
+    kind: _RouteKind
     handle: int
     num_pages: int
 
@@ -69,9 +74,9 @@ class PCPPagePullTransport:
         self._plan: PCPPagePlan | None = None
         self._step_finished = True
         self._pending_ready: deque[_PendingReady] = deque()
-        self._ready_waiting: deque[tuple[int, int]] = deque()
-        self._inflight: dict[tuple[int, int], _InflightRead] = {}
-        self._done_pairs: set[tuple[int, int]] = set()
+        self._ready_waiting: deque[_RouteKey] = deque()
+        self._inflight: dict[_RouteKey, _InflightRead] = {}
+        self._done_routes: set[_RouteKey] = set()
         self._demand_layer: int | None = None
 
         self._progress_stop = threading.Event()
@@ -102,8 +107,22 @@ class PCPPagePullTransport:
         self._pending_ready.clear()
         self._ready_waiting.clear()
         self._inflight.clear()
-        self._done_pairs.clear()
+        self._done_routes.clear()
         self._demand_layer = None
+
+    def _enqueue_history_reads_locked(self) -> None:
+        plan = self._plan
+        if plan is None or not self._layer_memory:
+            return
+        for layer_id in range(len(self._layer_memory)):
+            for source_rank in plan.historical_source_ranks(self.rank):
+                key: _RouteKey = (layer_id, source_rank, "history")
+                if (
+                    key not in self._done_routes
+                    and key not in self._inflight
+                    and key not in self._ready_waiting
+                ):
+                    self._ready_waiting.append(key)
 
     def configure_step(self, *, epoch: int, plan: PCPPagePlan) -> None:
         self.finish_step()
@@ -122,6 +141,7 @@ class PCPPagePullTransport:
             self._plan = plan
             self._step_finished = False
             self._clear_step_state_locked()
+            self._enqueue_history_reads_locked()
         if self._layer_memory:
             self._peer.ensure_peers()
             self._start_progress_thread()
@@ -181,6 +201,8 @@ class PCPPagePullTransport:
         self._peer.exchange_regions(self._layer_memory)
         with self._progress_lock:
             active = self._plan is not None
+            if active:
+                self._enqueue_history_reads_locked()
         if active:
             self._start_progress_thread()
             self._progress_wakeup.set()
@@ -267,13 +289,13 @@ class PCPPagePullTransport:
                     "PCP page-pull READY epoch mismatch: "
                     f"got={epoch_i}, expected={self._epoch}"
                 )
-            if not self._plan.requires_source(self.rank, source_i):
+            if not self._plan.requires_current_source(self.rank, source_i):
                 raise RuntimeError(
                     f"unexpected PCP READY source rank {source_i} for rank {self.rank}"
                 )
-            key = (layer_i, source_i)
+            key: _RouteKey = (layer_i, source_i, "current")
             if (
-                key not in self._done_pairs
+                key not in self._done_routes
                 and key not in self._inflight
                 and key not in self._ready_waiting
             ):
@@ -286,29 +308,38 @@ class PCPPagePullTransport:
                     dst=self.rank,
                 )
 
-    def _pop_ready_locked(self) -> tuple[int, int] | None:
+    def _pop_ready_locked(self) -> _RouteKey | None:
         if not self._ready_waiting:
             return None
         demand_layer = self._demand_layer
         if demand_layer is None:
             return self._ready_waiting.popleft()
-        for index, key in enumerate(self._ready_waiting):
-            if key[0] != demand_layer:
-                continue
-            self._ready_waiting.rotate(-index)
-            selected = self._ready_waiting.popleft()
-            self._ready_waiting.rotate(index)
-            return selected
+        # Prefer historical reads for the demanded layer because they are
+        # immediately available and cannot be unblocked by another producer.
+        for wanted_kind in ("history", "current"):
+            for index, key in enumerate(self._ready_waiting):
+                if key[0] != demand_layer or key[2] != wanted_kind:
+                    continue
+                self._ready_waiting.rotate(-index)
+                selected = self._ready_waiting.popleft()
+                self._ready_waiting.rotate(index)
+                return selected
         return self._ready_waiting.popleft()
 
-    def _start_read_locked(self, layer_id: int, source_rank: int) -> None:
+    def _start_read_locked(
+        self, layer_id: int, source_rank: int, kind: _RouteKind
+    ) -> None:
         assert self._plan is not None
         local = self._layer_memory[layer_id]
-        route = self._plan.transfer_route(self.rank, source_rank)
-        key = (layer_id, source_rank)
+        route = (
+            self._plan.history_transfer_route(self.rank, source_rank)
+            if kind == "history"
+            else self._plan.current_transfer_route(self.rank, source_rank)
+        )
+        key: _RouteKey = (layer_id, source_rank, kind)
         num_pages = route.num_pages
         if num_pages == 0:
-            self._done_pairs.add(key)
+            self._done_routes.add(key)
             return
         with pcp_nvtx_range(
             "pcp.page_pull_read_submit",
@@ -317,6 +348,7 @@ class PCPPagePullTransport:
             src=source_rank,
             dst=self.rank,
             pages=num_pages,
+            kind=kind,
         ):
             handle = self._peer.submit_prepared_read(
                 local_region=local,
@@ -330,6 +362,7 @@ class PCPPagePullTransport:
         self._inflight[key] = _InflightRead(
             layer_id=layer_id,
             source_rank=source_rank,
+            kind=kind,
             handle=handle,
             num_pages=num_pages,
         )
@@ -349,9 +382,9 @@ class PCPPagePullTransport:
                     raise RuntimeError(
                         "PCP page-pull NIXL READ failed: "
                         f"state={state}, layer_id={transfer.layer_id}, "
-                        f"source_rank={transfer.source_rank}"
+                        f"source_rank={transfer.source_rank}, kind={transfer.kind}"
                     )
-                self._done_pairs.add(key)
+                self._done_routes.add(key)
                 pcp_nvtx_mark(
                     "pcp.page_pull_read_done",
                     e=self._epoch,
@@ -359,13 +392,14 @@ class PCPPagePullTransport:
                     src=transfer.source_rank,
                     dst=self.rank,
                     pages=transfer.num_pages,
+                    kind=transfer.kind,
                 )
             while len(self._inflight) < self.max_inflight_reads:
                 ready = self._pop_ready_locked()
                 if ready is None:
                     break
-                layer_id, source_rank = ready
-                self._start_read_locked(layer_id, source_rank)
+                layer_id, source_rank, kind = ready
+                self._start_read_locked(layer_id, source_rank, kind)
 
     def _progress_loop(self) -> None:
         try:
@@ -420,12 +454,15 @@ class PCPPagePullTransport:
                     plan = self._plan
                     if plan is None:
                         return
-                    required = plan.required_source_ranks(self.rank)
-                    complete = all(
-                        (layer_id, source_rank) in self._done_pairs
-                        for source_rank in required
+                    history_complete = all(
+                        (layer_id, source_rank, "history") in self._done_routes
+                        for source_rank in plan.historical_source_ranks(self.rank)
                     )
-                if complete:
+                    current_complete = all(
+                        (layer_id, source_rank, "current") in self._done_routes
+                        for source_rank in plan.current_source_ranks(self.rank)
+                    )
+                if history_complete and current_complete:
                     return
                 if self._progress_thread is None:
                     self._progress_once()
@@ -437,13 +474,16 @@ class PCPPagePullTransport:
                 if self._demand_layer == layer_id:
                     self._demand_layer = None
 
-    def _expected_pairs_locked(self) -> set[tuple[int, int]]:
+    def _expected_routes_locked(self) -> set[_RouteKey]:
         assert self._plan is not None
-        required_sources = self._plan.required_source_ranks(self.rank)
         return {
-            (layer_id, source_rank)
+            (layer_id, source_rank, kind)
             for layer_id in range(len(self._layer_memory))
-            for source_rank in required_sources
+            for kind, sources in (
+                ("history", self._plan.historical_source_ranks(self.rank)),
+                ("current", self._plan.current_source_ranks(self.rank)),
+            )
+            for source_rank in sources
         }
 
     def _finish_step_if_ready(self) -> bool:
@@ -451,8 +491,8 @@ class PCPPagePullTransport:
             if self._step_finished:
                 return True
             if self._plan is not None and self._layer_memory:
-                expected = self._expected_pairs_locked()
-                if self._pending_ready or not expected.issubset(self._done_pairs):
+                expected = self._expected_routes_locked()
+                if self._pending_ready or not expected.issubset(self._done_routes):
                     return False
             self._plan = None
             self._clear_step_state_locked()
