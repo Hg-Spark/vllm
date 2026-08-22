@@ -27,6 +27,11 @@ class PCPPageStateTracker:
     vLLM remains authoritative for physical block allocation. This tracker only
     records which PCP rank produced each logical page and whether this process'
     current physical block contains a valid copy of that page.
+
+    Once a request enters this tracker, its committed token count is authoritative
+    for PCP continuation. Scheduler progress must match it exactly; an external
+    prefix-cache hit, preemption rewind, or other progress jump is rejected rather
+    than silently switching to baseline PCP with rank-sharded KV state.
     """
 
     def __init__(
@@ -70,15 +75,30 @@ class PCPPageStateTracker:
     ) -> _RequestPageState:
         if not 0 <= computed_tokens <= self.max_pages * self.block_size:
             raise ValueError(f"invalid computed token count: {computed_tokens}")
+
         state = self._states.get(req_state_idx)
-        if (
-            state is None
-            or state.request_id != request_id
-            or computed_tokens < state.computed_tokens
-        ):
+        if state is None or state.request_id != request_id:
+            if computed_tokens != 0:
+                raise RuntimeError(
+                    "PCP page_pull cannot adopt an untracked nonzero prefix: "
+                    f"request={request_id!r}, computed_tokens={computed_tokens}. "
+                    "APC/external-prefix migration into runahead is not implemented."
+                )
             state = self._new_state(request_id)
             self._states[req_state_idx] = state
+            return state
+
+        if computed_tokens != state.computed_tokens:
+            raise RuntimeError(
+                "PCP page-state progress diverged from scheduler state: "
+                f"request={request_id!r}, scheduler={computed_tokens}, "
+                f"committed={state.computed_tokens}. "
+                "Preemption rewind/external progress migration is not implemented."
+            )
         return state
+
+    def committed_tokens(self, state: _RequestPageState) -> int:
+        return state.computed_tokens
 
     def has_known_prefix(self, state: _RequestPageState, num_tokens: int) -> bool:
         if num_tokens <= 0:
