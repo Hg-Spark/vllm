@@ -96,7 +96,10 @@ class PCPPagePlan:
     def __post_init__(self) -> None:
         if self.block_size <= 0:
             raise ValueError("page-pull block_size must be positive")
-        if self.history_routes_by_rank is not None or self.current_routes_by_rank is not None:
+        if (
+            self.history_routes_by_rank is not None
+            or self.current_routes_by_rank is not None
+        ):
             self._init_explicit_routes()
             return
         self._init_legacy_segments()
@@ -321,7 +324,9 @@ class PCPPagePlan:
     def current_transfer_route(
         self, destination_rank: int, source_rank: int
     ) -> PCPPageRoute:
-        return self._route(self._current_routes, destination_rank, source_rank, "current")
+        return self._route(
+            self._current_routes, destination_rank, source_rank, "current"
+        )
 
     def transfer_route(self, destination_rank: int, source_rank: int) -> PCPPageRoute:
         """Compatibility accessor for fresh-prefill/current routes."""
