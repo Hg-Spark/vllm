@@ -110,7 +110,7 @@ class PCPRunaheadConfig:
     weights: tuple[float, ...]
     binding: PCPBindingPlan
     max_inflight_sends: int = 4
-    max_inflight_reads: int = 4
+    max_inflight_writes: int = 4
     nixl_backends: tuple[str, ...] = ("UCX",)
 
     @property
@@ -128,6 +128,11 @@ class PCPRunaheadConfig:
     @property
     def pcp_group_order(self) -> tuple[int, ...]:
         return self.binding.group_rank_to_physical_rank
+
+    @property
+    def max_inflight_reads(self) -> int:
+        """Legacy runtime accessor retained until the manager call site is renamed."""
+        return self.max_inflight_writes
 
 
 def parse_runahead_weights(
@@ -258,16 +263,25 @@ def parse_pcp_runahead_config(
     runtime = _object(raw.get("runtime"), "pcp_runahead.runtime")
     unknown = set(runtime) - {
         "max_inflight_sends",
+        "max_inflight_writes",
         "max_inflight_reads",
         "nixl_backends",
     }
     if unknown:
         raise ValueError(f"unsupported runtime keys: {sorted(unknown)}")
+    if "max_inflight_writes" in runtime and "max_inflight_reads" in runtime:
+        raise ValueError(
+            "runtime.max_inflight_writes and legacy max_inflight_reads are "
+            "mutually exclusive"
+        )
     max_inflight_sends = _positive_int(
         runtime.get("max_inflight_sends"), "runtime.max_inflight_sends", 4
     )
-    max_inflight_reads = _positive_int(
-        runtime.get("max_inflight_reads"), "runtime.max_inflight_reads", 4
+    inflight_raw = runtime.get(
+        "max_inflight_writes", runtime.get("max_inflight_reads")
+    )
+    max_inflight_writes = _positive_int(
+        inflight_raw, "runtime.max_inflight_writes", 4
     )
     backends_raw = runtime.get("nixl_backends", ["UCX"])
     if (
@@ -282,7 +296,7 @@ def parse_pcp_runahead_config(
         weights=weights,
         binding=binding,
         max_inflight_sends=max_inflight_sends,
-        max_inflight_reads=max_inflight_reads,
+        max_inflight_writes=max_inflight_writes,
         nixl_backends=tuple(backends_raw),
     )
 
