@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -122,8 +122,6 @@ class PCPNixlPeerTransport:
             )
         num_blocks = int(kv_cache.shape[0])
         page_elements = math.prod(kv_cache.shape[1:])
-        # NHD and HND are different logical views of the same dense physical
-        # page. Inner logical contiguity is irrelevant for whole-page NIXL I/O.
         if kv_cache.stride(0) != page_elements:
             raise NotImplementedError(
                 "PCP page_pull requires dense block-major KV pages; "
@@ -248,13 +246,13 @@ class PCPNixlPeerTransport:
             )
 
     def get_notifications(self) -> list[bytes]:
+        return list(self.iter_notifications())
+
+    def iter_notifications(self) -> Iterator[bytes]:
         self._ensure_wrapper()
         assert self._wrapper is not None
-        return [
-            raw
-            for notifications in self._wrapper.get_new_notifs().values()
-            for raw in notifications
-        ]
+        for notifications in self._wrapper.get_new_notifs().values():
+            yield from notifications
 
     def submit_read(
         self,
@@ -265,28 +263,57 @@ class PCPNixlPeerTransport:
         remote_region_id: int,
         remote_block_ids: Sequence[int],
     ) -> int:
-        if len(local_block_ids) != len(remote_block_ids):
-            raise ValueError("PCP NIXL READ source/destination page counts differ")
-        if not local_block_ids:
+        local_ids = np.asarray(local_block_ids, dtype=np.int64)
+        remote_ids = np.asarray(remote_block_ids, dtype=np.int64)
+        if local_ids.size == 0 or remote_ids.size == 0:
             raise ValueError("PCP NIXL READ requires at least one page")
-        if max(local_block_ids) >= local_region.num_blocks:
+        return self.submit_prepared_read(
+            local_region=local_region,
+            local_block_ids=local_ids,
+            local_max_block_id=int(local_ids.max()),
+            source_rank=source_rank,
+            remote_region_id=remote_region_id,
+            remote_block_ids=remote_ids,
+            remote_max_block_id=int(remote_ids.max()),
+        )
+
+    def submit_prepared_read(
+        self,
+        *,
+        local_region: NixlMemoryRegion,
+        local_block_ids: np.ndarray,
+        local_max_block_id: int,
+        source_rank: int,
+        remote_region_id: int,
+        remote_block_ids: np.ndarray,
+        remote_max_block_id: int,
+    ) -> int:
+        if local_block_ids.dtype != np.int64 or remote_block_ids.dtype != np.int64:
+            raise TypeError("PCP prepared READ block IDs must be int64 NumPy arrays")
+        if local_block_ids.ndim != 1 or remote_block_ids.ndim != 1:
+            raise ValueError("PCP prepared READ block IDs must be one-dimensional")
+        if local_block_ids.size != remote_block_ids.size:
+            raise ValueError("PCP NIXL READ source/destination page counts differ")
+        if local_block_ids.size == 0:
+            raise ValueError("PCP NIXL READ requires at least one page")
+        if local_max_block_id >= local_region.num_blocks:
             raise RuntimeError(
                 "PCP page-pull destination block id exceeds local cache: "
-                f"max={max(local_block_ids)}, num_blocks={local_region.num_blocks}"
+                f"max={local_max_block_id}, num_blocks={local_region.num_blocks}"
             )
         remote_num_blocks = self._remote_num_blocks[(source_rank, remote_region_id)]
-        if max(remote_block_ids) >= remote_num_blocks:
+        if remote_max_block_id >= remote_num_blocks:
             raise RuntimeError(
                 "PCP page-pull source block id exceeds remote cache: "
-                f"max={max(remote_block_ids)}, num_blocks={remote_num_blocks}"
+                f"max={remote_max_block_id}, num_blocks={remote_num_blocks}"
             )
         assert self._wrapper is not None
         handle = self._wrapper.make_prepped_xfer(
             "READ",
             local_region.local_xfer_handle,
-            np.asarray(local_block_ids, dtype=np.int64),
+            local_block_ids,
             self._remote_region_handles[(source_rank, remote_region_id)],
-            np.asarray(remote_block_ids, dtype=np.int64),
+            remote_block_ids,
         )
         self._wrapper.transfer(handle)
         return handle
