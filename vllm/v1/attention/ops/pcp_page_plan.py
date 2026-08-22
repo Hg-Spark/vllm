@@ -10,12 +10,60 @@ import numpy as np
 
 
 @dataclass(frozen=True)
+class PCPPageRoute:
+    """One precompiled page transfer between two PCP ranks."""
+
+    destination_rank: int
+    source_rank: int
+    destination_block_ids: tuple[int, ...]
+    source_block_ids: tuple[int, ...]
+    destination_block_array: np.ndarray = field(init=False, repr=False, compare=False)
+    source_block_array: np.ndarray = field(init=False, repr=False, compare=False)
+    destination_max_block_id: int = field(init=False)
+    source_max_block_id: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        if len(self.destination_block_ids) != len(self.source_block_ids):
+            raise ValueError("page route source/destination page counts differ")
+        source = np.asarray(self.source_block_ids, dtype=np.int64)
+        destination = (
+            source
+            if self.destination_block_ids == self.source_block_ids
+            else np.asarray(self.destination_block_ids, dtype=np.int64)
+        )
+        object.__setattr__(self, "destination_block_array", destination)
+        object.__setattr__(self, "source_block_array", source)
+        object.__setattr__(
+            self,
+            "destination_max_block_id",
+            max(self.destination_block_ids) if self.destination_block_ids else -1,
+        )
+        object.__setattr__(
+            self,
+            "source_max_block_id",
+            max(self.source_block_ids) if self.source_block_ids else -1,
+        )
+
+    @property
+    def num_pages(self) -> int:
+        return len(self.source_block_ids)
+
+
+@dataclass(frozen=True)
 class PCPPagePlan:
-    """Per-step ownership plus precompiled source/page routes."""
+    """Per-step ownership plus precompiled source/page routes.
+
+    ``blocks_by_segment`` names the source-rank physical blocks that own each
+    logical segment. ``destination_blocks_by_segment`` may override the local
+    destination blocks when allocator identities differ across ranks. The
+    current replicated scheduler allocation leaves it unset, preserving the
+    zero-metadata identical-ID fast path.
+    """
 
     segment_to_rank: tuple[int, ...]
     blocks_by_segment: tuple[tuple[int, ...], ...]
     block_size: int
+    destination_blocks_by_segment: tuple[tuple[int, ...], ...] | None = None
     _required_sources_by_rank: tuple[tuple[int, ...], ...] = field(
         init=False, repr=False, compare=False
     )
@@ -25,13 +73,7 @@ class PCPPagePlan:
     _consumers_by_rank: tuple[tuple[int, ...], ...] = field(
         init=False, repr=False, compare=False
     )
-    _transfer_ids_by_rank: tuple[tuple[tuple[int, ...], ...], ...] = field(
-        init=False, repr=False, compare=False
-    )
-    _transfer_arrays_by_rank: tuple[tuple[np.ndarray, ...], ...] = field(
-        init=False, repr=False, compare=False
-    )
-    _transfer_max_by_rank: tuple[tuple[int, ...], ...] = field(
+    _routes_by_rank: tuple[tuple[PCPPageRoute | None, ...], ...] = field(
         init=False, repr=False, compare=False
     )
 
@@ -40,6 +82,20 @@ class PCPPagePlan:
             raise ValueError("page-pull plan requires at least one logical segment")
         if len(self.blocks_by_segment) != len(self.segment_to_rank):
             raise ValueError("page map must match logical segment count")
+        destination_by_segment = self.destination_blocks_by_segment
+        if destination_by_segment is None:
+            destination_by_segment = self.blocks_by_segment
+        if len(destination_by_segment) != len(self.segment_to_rank):
+            raise ValueError("destination page map must match logical segment count")
+        for segment_idx, (source_ids, destination_ids) in enumerate(
+            zip(self.blocks_by_segment, destination_by_segment, strict=True)
+        ):
+            if len(source_ids) != len(destination_ids):
+                raise ValueError(
+                    "source/destination page counts differ for logical segment "
+                    f"{segment_idx}: source={len(source_ids)}, "
+                    f"destination={len(destination_ids)}"
+                )
         if self.block_size <= 0:
             raise ValueError("page-pull block_size must be positive")
         if min(self.segment_to_rank) < 0:
@@ -54,39 +110,44 @@ class PCPPagePlan:
             )
 
         required_sources_by_rank: list[tuple[int, ...]] = []
-        transfer_ids_by_rank: list[tuple[tuple[int, ...], ...]] = []
-        transfer_arrays_by_rank: list[tuple[np.ndarray, ...]] = []
-        transfer_max_by_rank: list[tuple[int, ...]] = []
-        for rank in range(world_size):
+        routes_by_rank: list[tuple[PCPPageRoute | None, ...]] = []
+        for destination_rank in range(world_size):
             owned = [
                 segment_idx
                 for segment_idx, owner in enumerate(self.segment_to_rank)
-                if owner == rank
+                if owner == destination_rank
             ]
             max_segment = owned[-1]
             source_blocks: list[list[int]] = [[] for _ in range(world_size)]
+            destination_blocks: list[list[int]] = [[] for _ in range(world_size)]
             source_order: list[int] = []
             seen_sources: set[int] = set()
             for segment_idx in range(max_segment):
                 source_rank = self.segment_to_rank[segment_idx]
-                if source_rank == rank:
+                if source_rank == destination_rank:
                     continue
                 if source_rank not in seen_sources:
                     seen_sources.add(source_rank)
                     source_order.append(source_rank)
                 source_blocks[source_rank].extend(self.blocks_by_segment[segment_idx])
+                destination_blocks[source_rank].extend(
+                    destination_by_segment[segment_idx]
+                )
 
-            ids_by_source = tuple(tuple(blocks) for blocks in source_blocks)
-            arrays_by_source = tuple(
-                np.asarray(blocks, dtype=np.int64) for blocks in ids_by_source
-            )
-            max_by_source = tuple(
-                max(blocks) if blocks else -1 for blocks in ids_by_source
-            )
             required_sources_by_rank.append(tuple(source_order))
-            transfer_ids_by_rank.append(ids_by_source)
-            transfer_arrays_by_rank.append(arrays_by_source)
-            transfer_max_by_rank.append(max_by_source)
+            routes_by_rank.append(
+                tuple(
+                    PCPPageRoute(
+                        destination_rank=destination_rank,
+                        source_rank=source_rank,
+                        destination_block_ids=tuple(destination_blocks[source_rank]),
+                        source_block_ids=tuple(source_blocks[source_rank]),
+                    )
+                    if source_blocks[source_rank]
+                    else None
+                    for source_rank in range(world_size)
+                )
+            )
 
         required_sources = tuple(required_sources_by_rank)
         required_source_sets = tuple(frozenset(items) for items in required_sources)
@@ -104,11 +165,7 @@ class PCPPagePlan:
             self, "_required_source_sets_by_rank", required_source_sets
         )
         object.__setattr__(self, "_consumers_by_rank", consumers)
-        object.__setattr__(self, "_transfer_ids_by_rank", tuple(transfer_ids_by_rank))
-        object.__setattr__(
-            self, "_transfer_arrays_by_rank", tuple(transfer_arrays_by_rank)
-        )
-        object.__setattr__(self, "_transfer_max_by_rank", tuple(transfer_max_by_rank))
+        object.__setattr__(self, "_routes_by_rank", tuple(routes_by_rank))
 
     @property
     def num_segments(self) -> int:
@@ -148,17 +205,35 @@ class PCPPagePlan:
     def consumer_ranks(self, source_rank: int) -> tuple[int, ...]:
         return self._consumers_by_rank[source_rank]
 
+    def transfer_route(self, destination_rank: int, source_rank: int) -> PCPPageRoute:
+        route = self._routes_by_rank[destination_rank][source_rank]
+        if route is None:
+            raise ValueError(
+                "no page-pull route for "
+                f"source={source_rank}, destination={destination_rank}"
+            )
+        return route
+
     def transfer_block_ids(
         self, destination_rank: int, source_rank: int
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        ids = self._transfer_ids_by_rank[destination_rank][source_rank]
-        return ids, ids
+        route = self.transfer_route(destination_rank, source_rank)
+        return route.destination_block_ids, route.source_block_ids
 
     def transfer_block_arrays(
         self, destination_rank: int, source_rank: int
     ) -> tuple[np.ndarray, np.ndarray, int]:
-        ids = self._transfer_arrays_by_rank[destination_rank][source_rank]
-        return ids, ids, self._transfer_max_by_rank[destination_rank][source_rank]
+        """Compatibility accessor for identical source/destination mappings."""
+        route = self.transfer_route(destination_rank, source_rank)
+        if route.destination_max_block_id != route.source_max_block_id:
+            raise RuntimeError(
+                "independent source/destination mappings require transfer_route()"
+            )
+        return (
+            route.destination_block_array,
+            route.source_block_array,
+            route.source_max_block_id,
+        )
 
 
-__all__ = ["PCPPagePlan"]
+__all__ = ["PCPPagePlan", "PCPPageRoute"]

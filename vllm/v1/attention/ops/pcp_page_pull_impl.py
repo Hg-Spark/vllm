@@ -304,11 +304,9 @@ class PCPPagePullTransport:
     def _start_read_locked(self, layer_id: int, source_rank: int) -> None:
         assert self._plan is not None
         local = self._layer_memory[layer_id]
-        destination_ids, source_ids, max_block_id = self._plan.transfer_block_arrays(
-            self.rank, source_rank
-        )
+        route = self._plan.transfer_route(self.rank, source_rank)
         key = (layer_id, source_rank)
-        num_pages = int(destination_ids.size)
+        num_pages = route.num_pages
         if num_pages == 0:
             self._done_pairs.add(key)
             return
@@ -322,12 +320,12 @@ class PCPPagePullTransport:
         ):
             handle = self._peer.submit_prepared_read(
                 local_region=local,
-                local_block_ids=destination_ids,
-                local_max_block_id=max_block_id,
+                local_block_ids=route.destination_block_array,
+                local_max_block_id=route.destination_max_block_id,
                 source_rank=source_rank,
                 remote_region_id=layer_id,
-                remote_block_ids=source_ids,
-                remote_max_block_id=max_block_id,
+                remote_block_ids=route.source_block_array,
+                remote_max_block_id=route.source_max_block_id,
             )
         self._inflight[key] = _InflightRead(
             layer_id=layer_id,
