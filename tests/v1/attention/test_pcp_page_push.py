@@ -48,18 +48,15 @@ def test_replica_plan_fills_non_current_destination() -> None:
     transport._plan = _plan_with_routes(current=current)
     transport._epoch = 1
 
-    # block_size=4. Each rank finalizes one physical page.
     slots = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int64)
     transport.configure_slot_mapping(slots, (0, 4, 8))
 
-    # Rank 0 -> rank 1 is already covered by CURRENT. Rank 1 -> rank 0 needs a
-    # background REPLICA for the next chunk.
     assert (1, 0) not in transport._replica_routes
     replica = transport._replica_routes[(0, 1)]
     assert replica.source_block_ids == replica.destination_block_ids == (1,)
 
 
-def test_history_route_is_strict_assertion_without_read_fallback() -> None:
+def test_historical_transfer_route_is_rejected_without_fallback() -> None:
     history = PCPPageRoute(
         destination_rank=0,
         source_rank=1,
@@ -71,16 +68,9 @@ def test_history_route_is_strict_assertion_without_read_fallback() -> None:
         rank=0,
         device=torch.device("cpu"),
     )
-    transport._plan = _plan_with_routes(history=history)
-    transport._epoch = 2
-    transport._layer_names = ("model.layers.0",)
-    transport._layer_memory = [object()]  # type: ignore[list-item]
 
-    with pytest.raises(RuntimeError, match="READ fallback is disabled"):
-        transport._validate_history_replicas_locked()
-
-    transport._persistent_visible_blocks[(0, 1)] = {7}
-    transport._validate_history_replicas_locked()
+    with pytest.raises(RuntimeError, match="fallback is disabled"):
+        transport.configure_step(epoch=2, plan=_plan_with_routes(history=history))
 
 
 def test_current_visibility_requires_all_causal_sources() -> None:
