@@ -14,7 +14,8 @@ import torch.distributed as dist
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed.parallel_state import Handle, get_pcp_group
-from vllm.v1.attention.ops.pcp_page_pull import PCPPagePlan, PCPPagePullTransport
+from vllm.v1.attention.ops.pcp_page_plan import PCPPagePlan
+from vllm.v1.attention.ops.pcp_page_push_impl import PCPPagePushTransport
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_mark, pcp_nvtx_range
 
 
@@ -33,13 +34,7 @@ class _PendingSend:
 
 
 class PCPRunaheadRuntime:
-    """Per-process state for one logical PCP communicator.
-
-    One-segment-per-rank bindings are compiled into the primary PCP communicator
-    member order, so ``rank`` is the logical causal segment index for tensor
-    transports. Repeated logical ownership is page-pull-only and lives in
-    ``PCPPagePlan``.
-    """
+    """Per-process state for one logical PCP communicator."""
 
     def __init__(
         self,
@@ -47,26 +42,24 @@ class PCPRunaheadRuntime:
         pcp_rank: int,
         device: torch.device,
         max_inflight_sends: int = 4,
-        max_inflight_reads: int = 4,
+        max_inflight_writes: int = 4,
         nixl_backends: tuple[str, ...] = ("UCX",),
         pcp_group: Any | None = None,
     ) -> None:
         if max_inflight_sends <= 0:
             raise ValueError("max_inflight_sends must be positive")
-        if max_inflight_reads <= 0:
-            raise ValueError("max_inflight_reads must be positive")
+        if max_inflight_writes <= 0:
+            raise ValueError("max_inflight_writes must be positive")
         self.world_size = pcp_world_size
         self.rank = pcp_rank
         self.device = device
         self.max_inflight_sends = max_inflight_sends
-        self.max_inflight_reads = max_inflight_reads
+        self.max_inflight_writes = max_inflight_writes
         self.nixl_backends = nixl_backends
         self.group = pcp_group
 
-        # Runahead is created while model initialization owns the vLLM config
-        # context. Retain only the mutable static-forward-context reference that
-        # page-pull actually needs. KV-cache tensors are bound later on the same
-        # layer objects, so the reference must not be copied.
+        # KV-cache tensors are bound to static-forward-context layer objects
+        # after model initialization, so retain the mutable reference itself.
         vllm_config = get_current_vllm_config_or_none()
         self._static_forward_context = (
             vllm_config.compilation_config.static_forward_context
@@ -79,7 +72,7 @@ class PCPRunaheadRuntime:
         self.rows_per_rank: tuple[int, ...] = ()
         self.rank_offsets: tuple[int, ...] = ()
         self._pending_sends: deque[_PendingSend] = deque()
-        self._page_pull: PCPPagePullTransport | None = None
+        self._page_push: PCPPagePushTransport | None = None
         self._pending_page_layers: dict[int, int] = {}
         self._epoch = 0
 
@@ -161,22 +154,22 @@ class PCPRunaheadRuntime:
             raise ValueError(
                 f"page plan world size {plan.world_size} != runtime {self.world_size}"
             )
-        if self._page_pull is None:
-            self._page_pull = PCPPagePullTransport(
+        if self._page_push is None:
+            self._page_push = PCPPagePushTransport(
                 world_size=self.world_size,
                 rank=self.rank,
                 device=self.device,
-                max_inflight_reads=self.max_inflight_reads,
+                max_inflight_writes=self.max_inflight_writes,
                 nixl_backends=self.nixl_backends,
                 pcp_group=self._group(),
                 static_forward_context=self._static_forward_context,
             )
-        self._page_pull.configure_step(epoch=self._epoch, plan=plan)
+        self._page_push.configure_step(epoch=self._epoch, plan=plan)
 
     def disable_step(self) -> None:
         self.flush()
-        if self._page_pull is not None:
-            self._page_pull.disable_step()
+        if self._page_push is not None:
+            self._page_push.disable_step()
         if self.active:
             pcp_nvtx_mark(
                 "pcp.runahead_step_end",
@@ -198,8 +191,8 @@ class PCPRunaheadRuntime:
                 "rank-major slot mapping is shorter than configured PCP rows: "
                 f"slots={slot_mapping.shape[0]}, rows={self.total_rows}"
             )
-        if self.transport == "page_pull" and self._page_pull is not None:
-            self._page_pull.configure_slot_mapping(slot_mapping, self.rank_offsets)
+        if self.transport == "page_pull" and self._page_push is not None:
+            self._page_push.configure_slot_mapping(slot_mapping, self.rank_offsets)
         start = self.rank_offsets[self.rank]
         stop = self.rank_offsets[self.rank + 1]
         return slot_mapping[start:stop]
@@ -218,7 +211,7 @@ class PCPRunaheadRuntime:
             return self.exchange_direct(tensors, slot_mapping)
         if self.transport == "page_pull":
             raise RuntimeError(
-                "page_pull uses KV-cache page transport, not tensor exchange"
+                "page_pull uses producer-push KV-page transport, not tensor exchange"
             )
         raise RuntimeError(f"unsupported active PCP transport: {self.transport!r}")
 
@@ -413,30 +406,30 @@ class PCPRunaheadRuntime:
                 work.wait()
         return visible, slot_mapping[: self.visible_rows]
 
-    def page_pull_prepare_layer(self, kv_cache: torch.Tensor) -> None:
-        if self.transport != "page_pull" or self._page_pull is None:
-            raise RuntimeError("page-pull layer requested before page plan setup")
+    def page_push_prepare_layer(self, kv_cache: torch.Tensor) -> None:
+        if self.transport != "page_pull" or self._page_push is None:
+            raise RuntimeError("page-push layer requested before page plan setup")
         ptr = kv_cache.data_ptr()
         if ptr in self._pending_page_layers:
-            raise RuntimeError("page-pull layer cache update was prepared twice")
-        self._pending_page_layers[ptr] = self._page_pull.register_current_layer(kv_cache)
+            raise RuntimeError("page-push layer cache update was prepared twice")
+        self._pending_page_layers[ptr] = self._page_push.register_current_layer(kv_cache)
 
-    def page_pull_after_cache_write(self, kv_cache: torch.Tensor) -> None:
-        if self.transport != "page_pull" or self._page_pull is None:
+    def page_push_after_cache_write(self, kv_cache: torch.Tensor) -> None:
+        if self.transport != "page_pull" or self._page_push is None:
             return
         ptr = kv_cache.data_ptr()
         layer_id = self._pending_page_layers.pop(ptr, None)
         if layer_id is None:
-            raise RuntimeError("page-pull native cache write has no prepared layer")
-        self._page_pull.publish_ready(layer_id)
-        if not self._page_pull.layer_visible(layer_id):
+            raise RuntimeError("page-push native cache write has no prepared layer")
+        self._page_push.publish_ready(layer_id)
+        if not self._page_push.layer_visible(layer_id):
             with pcp_nvtx_range(
                 "pcp.page_push_stall",
                 e=self._epoch,
                 rank=self.rank,
                 layer_id=layer_id,
             ):
-                self._page_pull.wait_layer(layer_id)
+                self._page_push.wait_layer(layer_id)
 
     def flush(self) -> None:
         with pcp_nvtx_range("pcp.flush", e=self._epoch, rank=self.rank):
@@ -444,11 +437,11 @@ class PCPRunaheadRuntime:
                 self._pending_sends.popleft().wait()
             if self._pending_page_layers:
                 raise RuntimeError(
-                    "page-pull step ended before native KV cache writes completed: "
+                    "page-push step ended before native KV cache writes completed: "
                     f"pending={len(self._pending_page_layers)}"
                 )
-            if self._page_pull is not None and self._page_pull.enabled:
-                self._page_pull.finish_step()
+            if self._page_push is not None and self._page_push.enabled:
+                self._page_push.finish_step()
 
 
 _RUNTIME: PCPRunaheadRuntime | None = None
