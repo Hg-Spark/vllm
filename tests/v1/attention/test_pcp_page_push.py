@@ -3,7 +3,6 @@
 
 from collections import deque
 
-import pytest
 import torch
 
 from vllm.v1.attention.ops.pcp_nixl import NixlMemoryRegion
@@ -15,19 +14,15 @@ def _empty_matrix(world_size: int):
     return tuple(tuple(None for _ in range(world_size)) for _ in range(world_size))
 
 
-def _plan_with_routes(*, current=None, history=None, block_size: int = 4):
+def _plan_with_route(current=None, block_size: int = 4):
     world_size = 2
     current_matrix = [list(row) for row in _empty_matrix(world_size)]
-    history_matrix = [list(row) for row in _empty_matrix(world_size)]
     if current is not None:
         current_matrix[current.destination_rank][current.source_rank] = current
-    if history is not None:
-        history_matrix[history.destination_rank][history.source_rank] = history
     return PCPPagePlan(
         segment_to_rank=(),
         blocks_by_segment=(),
         block_size=block_size,
-        history_routes_by_rank=tuple(tuple(row) for row in history_matrix),
         current_routes_by_rank=tuple(tuple(row) for row in current_matrix),
         explicit_world_size=world_size,
     )
@@ -45,7 +40,7 @@ def test_replica_plan_fills_non_current_destination() -> None:
         rank=0,
         device=torch.device("cpu"),
     )
-    transport._plan = _plan_with_routes(current=current)
+    transport._plan = _plan_with_route(current)
     transport._epoch = 1
 
     slots = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int64)
@@ -54,23 +49,6 @@ def test_replica_plan_fills_non_current_destination() -> None:
     assert (1, 0) not in transport._replica_routes
     replica = transport._replica_routes[(0, 1)]
     assert replica.source_block_ids == replica.destination_block_ids == (1,)
-
-
-def test_historical_transfer_route_is_rejected_without_fallback() -> None:
-    history = PCPPageRoute(
-        destination_rank=0,
-        source_rank=1,
-        destination_block_ids=(7,),
-        source_block_ids=(7,),
-    )
-    transport = PCPPagePushTransport(
-        world_size=2,
-        rank=0,
-        device=torch.device("cpu"),
-    )
-
-    with pytest.raises(RuntimeError, match="fallback is disabled"):
-        transport.configure_step(epoch=2, plan=_plan_with_routes(history=history))
 
 
 def test_current_visibility_requires_all_causal_sources() -> None:
@@ -85,7 +63,7 @@ def test_current_visibility_requires_all_causal_sources() -> None:
         rank=1,
         device=torch.device("cpu"),
     )
-    transport._plan = _plan_with_routes(current=current)
+    transport._plan = _plan_with_route(current)
 
     assert not transport._layer_visible_locked(0)
     transport._incoming_done.add((0, 0, "current"))
