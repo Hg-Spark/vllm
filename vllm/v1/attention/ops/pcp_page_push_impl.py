@@ -6,7 +6,8 @@ The data path is owner-driven NIXL WRITE:
 
 * CURRENT pushes satisfy same-step causal dependencies.
 * REPLICA pushes materialize finalized full pages for later chunks.
-* Historical demand is an assertion only; there is no READ fallback.
+* Historical replicas are owned by PCPPageStateTracker; this transport has no
+  cross-step state and rejects historical transfer routes.
 
 Writes are drained before the restore/scheduler boundary, so NIXL DMA never
 outlives vLLM's physical KV-block lifetime fence.
@@ -55,8 +56,8 @@ class PCPPagePushTransport:
     """Per-process producer-push page pipeline.
 
     Ready routes are opportunistically coalesced by destination and route kind.
-    The pipeline never delays a CURRENT route waiting for future layers: it only
-    batches layers that are already CUDA-ready when a submission slot opens.
+    CURRENT never waits for future layers merely to fill a batch; batching uses
+    only layers that are already CUDA-ready when a submission slot opens.
     """
 
     _POLL_INTERVAL_S = 0.00005
@@ -112,11 +113,6 @@ class PCPPagePushTransport:
         self._incoming_done: set[_RouteKey] = set()
         self._deferred_notifications: deque[bytes] = deque()
 
-        # The manager commits page-state only after restore. Keep one transport
-        # proof table across adjacent steps so a historical route can assert that
-        # the preceding CURRENT/REPLICA WRITE populated the exact physical block.
-        self._persistent_visible_blocks: dict[tuple[int, int], set[int]] = {}
-
         self._progress_stop = threading.Event()
         self._progress_wakeup = threading.Event()
         self._progress_lock = threading.Lock()
@@ -150,29 +146,37 @@ class PCPPagePushTransport:
         self._incoming_done.clear()
         self._deferred_notifications.clear()
 
+    def _reject_historical_routes(self, plan: PCPPagePlan) -> None:
+        historical = {
+            rank: plan.historical_source_ranks(rank)
+            for rank in range(self.world_size)
+            if plan.historical_source_ranks(rank)
+        }
+        if historical:
+            raise RuntimeError(
+                "PCP producer-push received a historical transfer route; "
+                "historical replicas must already be present in page state and "
+                f"fallback is disabled: {historical}"
+            )
+
     def configure_step(self, *, epoch: int, plan: PCPPagePlan) -> None:
         self.finish_step()
         self._check_progress_error()
-        if not self._layer_memory:
-            caches = self._discover_bound_layer_caches()
-            if caches:
-                self.register_layer_caches(caches)
         if plan.world_size != self.world_size:
             raise ValueError(
                 "page plan PCP world size mismatch: "
                 f"plan={plan.world_size}, runtime={self.world_size}"
             )
+        self._reject_historical_routes(plan)
+        if not self._layer_memory:
+            caches = self._discover_bound_layer_caches()
+            if caches:
+                self.register_layer_caches(caches)
         with self._progress_lock:
             self._epoch = epoch
             self._plan = plan
             self._step_finished = False
             self._clear_step_state_locked()
-            try:
-                self._validate_history_replicas_locked()
-            except BaseException:
-                self._plan = None
-                self._step_finished = True
-                raise
         if self._layer_memory:
             self._peer.ensure_peers()
             self._start_progress_thread()
@@ -231,8 +235,6 @@ class PCPPagePushTransport:
         self._peer.exchange_regions(self._layer_memory)
         with self._progress_lock:
             active = self._plan is not None
-            if active:
-                self._validate_history_replicas_locked()
         if active:
             self._start_progress_thread()
             self._progress_wakeup.set()
@@ -254,39 +256,6 @@ class PCPPagePushTransport:
             )
         self._check_progress_error()
         return layer_id
-
-    def _validate_history_replicas_locked(self) -> None:
-        plan = self._plan
-        if plan is None or not self._layer_memory:
-            return
-        for layer_id in range(len(self._layer_memory)):
-            for source_rank in plan.historical_source_ranks(self.rank):
-                route = plan.history_transfer_route(self.rank, source_rank)
-                visible = self._persistent_visible_blocks.get(
-                    (layer_id, source_rank), set()
-                )
-                missing = [
-                    block_id
-                    for block_id in route.destination_block_ids
-                    if block_id not in visible
-                ]
-                if missing:
-                    raise RuntimeError(
-                        "PCP page-push historical replica is missing; READ fallback "
-                        "is disabled: "
-                        f"epoch={self._epoch}, rank={self.rank}, "
-                        f"layer={self._layer_label(layer_id)}, "
-                        f"source_rank={source_rank}, missing_blocks={missing[:8]}, "
-                        f"missing_count={len(missing)}"
-                    )
-                pcp_nvtx_mark(
-                    "pcp.page_push_history_hit",
-                    e=self._epoch,
-                    l=self._layer_label(layer_id),
-                    src=source_rank,
-                    dst=self.rank,
-                    pages=route.num_pages,
-                )
 
     def configure_slot_mapping(
         self,
@@ -413,7 +382,10 @@ class PCPPagePushTransport:
                     "PCP page-push layer became ready before slot plan configuration"
                 )
             has_current = bool(plan.consumer_ranks(self.rank))
-            has_replica = any(source_rank == self.rank for _, source_rank in self._replica_routes)
+            has_replica = any(
+                source_rank == self.rank
+                for _, source_rank in self._replica_routes
+            )
             if not has_current and not has_replica:
                 return
         if not 0 <= layer_id < len(self._layer_memory):
@@ -476,9 +448,6 @@ class PCPPagePushTransport:
             layer_id = key[0]
             route = self._route_locked(key, incoming=False)
             self._queued_outgoing.discard(key)
-            if route.num_pages == 0:
-                self._outgoing_done.add(key)
-                continue
             writes.append(
                 NixlWrite(
                     local_region_id=layer_id,
@@ -488,8 +457,6 @@ class PCPPagePushTransport:
                 )
             )
             num_pages += route.num_pages
-        if not writes:
-            return
 
         with pcp_nvtx_range(
             "pcp.page_push_write_submit",
@@ -550,11 +517,7 @@ class PCPPagePushTransport:
                 )
         elif not self._slot_mapping_configured:
             raise RuntimeError("replica visibility arrived before slot plan")
-
-        route = self._route_locked(key, incoming=True)
-        self._persistent_visible_blocks.setdefault((layer_id, source_rank), set()).update(
-            route.destination_block_ids
-        )
+        self._route_locked(key, incoming=True)
         self._incoming_done.add(key)
         pcp_nvtx_mark(
             "pcp.page_push_visible",
@@ -562,7 +525,6 @@ class PCPPagePushTransport:
             l=self._layer_label(layer_id),
             src=source_rank,
             dst=self.rank,
-            pages=route.num_pages,
             kind=kind,
         )
 
@@ -618,8 +580,6 @@ class PCPPagePushTransport:
         if self._current_waiting:
             return
 
-        # Reserve one handle for a CURRENT route that becomes ready while
-        # background replication is using the transport.
         replica_limit = max(1, self.max_inflight_writes - 1)
         replica_inflight = sum(
             batch.kind == "replica" for batch in self._inflight.values()
