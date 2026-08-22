@@ -187,8 +187,8 @@ class RunaheadPCPManager(PCPManager):
             and block_tables.num_kv_cache_groups != 1
         ):
             raise NotImplementedError(
-                "PCP page_pull currently supports one standard-attention KV cache "
-                f"group, got {block_tables.num_kv_cache_groups}"
+                "PCP page_pull currently supports one KV cache group, "
+                f"got {block_tables.num_kv_cache_groups}"
             )
 
         self._sharded_kv_history = False
@@ -286,16 +286,10 @@ class RunaheadPCPManager(PCPManager):
         if vllm_config.scheduler_config.async_scheduling:
             raise NotImplementedError("PCP runahead does not support async scheduling")
 
-        if model.use_mla:
-            if hasattr(model.hf_text_config, "index_topk"):
-                raise NotImplementedError(
-                    "PCP runahead does not support sparse MLA/indexer yet"
-                )
-            if config.transport == "page_pull":
-                raise NotImplementedError(
-                    "PCP runahead MLA does not support page_pull yet; use "
-                    "full_kv_collective, prefix_p2p, or direct_p2p"
-                )
+        if model.use_mla and hasattr(model.hf_text_config, "index_topk"):
+            raise NotImplementedError(
+                "PCP runahead does not support sparse MLA/indexer yet"
+            )
 
         if config.transport == "page_pull":
             cache_dtype = str(vllm_config.cache_config.cache_dtype)
