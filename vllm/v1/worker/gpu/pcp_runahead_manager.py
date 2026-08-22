@@ -87,7 +87,7 @@ def weighted_partition_lengths(
     if num_tokens == 0:
         return (0,) * num_segments
 
-    if alignment == 1 or num_tokens < num_segments * alignment:
+    if alignment == 1:
         ideal = [num_tokens * weight / total_weight for weight in weights]
         lengths = [math.floor(value) for value in ideal]
         remainder = num_tokens - sum(lengths)
@@ -99,23 +99,52 @@ def weighted_partition_lengths(
             lengths[segment] += 1
         return tuple(lengths)
 
+    # Page-pull ownership is defined on whole pages. Quantize cumulative
+    # weighted cuts directly in that domain. When there are enough tokens to
+    # make every logical segment non-empty, reserve one aligned page for every
+    # non-final segment and at least one token for the final segment. Otherwise
+    # zero-length logical segments are allowed and the execution layer pads the
+    # corresponding physical ranks without assigning them page ownership.
+    require_positive = (
+        start_pos % alignment == 0
+        and num_tokens >= (num_segments - 1) * alignment + 1
+    )
     boundaries = [0]
     cumulative_weight = 0.0
     for segment in range(num_segments - 1):
         cumulative_weight += weights[segment]
-        ideal_abs = start_pos + num_tokens * cumulative_weight / total_weight
-        min_cut = boundaries[-1] + 1
-        max_cut = num_tokens - (num_segments - segment - 1)
-        min_abs = start_pos + min_cut
-        max_abs = start_pos + max_cut
-        candidate_abs = int(round(ideal_abs / alignment)) * alignment
-        if candidate_abs < min_abs:
-            candidate_abs = math.ceil(min_abs / alignment) * alignment
-        if candidate_abs > max_abs:
-            candidate_abs = math.floor(max_abs / alignment) * alignment
-        if candidate_abs < min_abs or candidate_abs > max_abs:
-            candidate_abs = min(max(int(round(ideal_abs)), min_abs), max_abs)
-        boundaries.append(candidate_abs - start_pos)
+        ideal_rel = num_tokens * cumulative_weight / total_weight
+        ideal_abs = start_pos + ideal_rel
+
+        if require_positive:
+            min_cut = (segment + 1) * alignment
+            remaining_segments = num_segments - segment - 1
+            max_cut = num_tokens - ((remaining_segments - 1) * alignment + 1)
+            candidates: set[int] = set()
+        else:
+            min_cut = boundaries[-1]
+            max_cut = num_tokens
+            candidates = {boundaries[-1], num_tokens}
+
+        lower_abs = math.floor(ideal_abs / alignment) * alignment
+        upper_abs = math.ceil(ideal_abs / alignment) * alignment
+        min_abs = math.ceil((start_pos + min_cut) / alignment) * alignment
+        max_abs = math.floor((start_pos + max_cut) / alignment) * alignment
+        for candidate_abs in (lower_abs, upper_abs, min_abs, max_abs):
+            candidate_rel = int(candidate_abs - start_pos)
+            if min_cut <= candidate_rel <= max_cut:
+                candidates.add(candidate_rel)
+
+        if not candidates:
+            raise AssertionError(
+                "PCP page-aligned partition has no legal cumulative boundary"
+            )
+        boundary = min(
+            candidates,
+            key=lambda cut: (abs(cut - ideal_rel), cut),
+        )
+        boundaries.append(boundary)
+
     boundaries.append(num_tokens)
     return tuple(
         boundaries[index + 1] - boundaries[index] for index in range(num_segments)
@@ -211,8 +240,23 @@ class RunaheadPCPManager(PCPManager):
             device=device,
         )
 
+    def _execution_rows_per_rank(self) -> tuple[int, ...]:
+        step = self._active_step
+        if step is None:
+            return ()
+        rows = step.layout.rows_per_rank
+        if step.transport != "page_pull" or all(row > 0 for row in rows):
+            return rows
+        padded_rows = max(rows)
+        if padded_rows <= 0:
+            raise RuntimeError("PCP page_pull compiled a step without executable rows")
+        return (padded_rows,) * self.pcp_world_size
+
     def _compact_layout_enabled(self) -> bool:
-        return self._active_step is not None
+        step = self._active_step
+        if step is None:
+            return False
+        return self._execution_rows_per_rank() == step.layout.rows_per_rank
 
     def _resize_local_request_buffers_if_needed(
         self,
@@ -581,11 +625,18 @@ class RunaheadPCPManager(PCPManager):
             )
         return list(step.layout.segments_by_rank[rank])
 
+    @staticmethod
+    def _is_warmup_batch(input_batch: InputBatch) -> bool:
+        req_ids = input_batch.req_ids[: input_batch.num_reqs]
+        return bool(req_ids) and all(req_id.startswith("_warmup_") for req_id in req_ids)
+
     def _validate_step_semantics(self, input_batch: InputBatch) -> None:
         if input_batch.num_reqs <= 0:
             raise RuntimeError("PCP runahead requires a non-empty batch")
         if not bool(input_batch.is_prefilling_np[: input_batch.num_reqs].all()):
             if self._config.transport == "page_pull":
+                if self._is_warmup_batch(input_batch):
+                    return
                 raise RuntimeError(
                     "PCP page_pull decode/mixed decode-prefill execution is not "
                     "implemented after rank-sharded KV prefill"
@@ -621,11 +672,12 @@ class RunaheadPCPManager(PCPManager):
         self._clear_pending_page_updates()
         self._validate_step_semantics(input_batch)
         layout = self._compile_segment_layout(input_batch)
-        if any(rows <= 0 for rows in layout.rows_per_rank):
+        if self._config.transport != "page_pull" and any(
+            rows <= 0 for rows in layout.rows_per_rank
+        ):
             raise RuntimeError(
-                "PCP runahead requires every physical rank to receive at least one "
-                "token in the current step; inactive-rank execution is not yet "
-                f"implemented: rows={layout.rows_per_rank}"
+                "PCP tensor runahead requires every physical rank to receive at "
+                f"least one token in the current step: rows={layout.rows_per_rank}"
             )
 
         self._active_step = RunaheadStep(
@@ -633,8 +685,13 @@ class RunaheadPCPManager(PCPManager):
             transport=self._config.transport,
         )
         local_batch = super().partition_batch(input_batch)
+        execution_rows = self._execution_rows_per_rank()
+        if any(rows <= 0 for rows in execution_rows):
+            raise AssertionError(
+                f"PCP runahead execution rows must be positive: {execution_rows}"
+            )
         self._runahead_runtime.begin_step(
-            layout.rows_per_rank,
+            execution_rows,
             transport=self._config.transport,
         )
         return local_batch

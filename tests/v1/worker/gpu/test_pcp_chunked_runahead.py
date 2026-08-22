@@ -9,7 +9,11 @@ import pytest
 
 from vllm.config.pcp_runahead import PCPRunaheadConfig, compile_pcp_binding
 from vllm.v1.attention.ops.pcp_page_state import PCPPageStateTracker
-from vllm.v1.worker.gpu.pcp_runahead_manager import RunaheadPCPManager, RunaheadStep
+from vllm.v1.worker.gpu.pcp_runahead_manager import (
+    RunaheadPCPManager,
+    RunaheadStep,
+    weighted_partition_lengths,
+)
 
 
 def _chunk_manager() -> RunaheadPCPManager:
@@ -36,14 +40,119 @@ def _chunk_manager() -> RunaheadPCPManager:
     return manager
 
 
-def _batch(*, scheduled: int, computed: int) -> SimpleNamespace:
+def _batch(
+    *,
+    scheduled: int,
+    computed: int,
+    req_id: str = "req",
+    prefilling: bool = True,
+) -> SimpleNamespace:
     return SimpleNamespace(
         num_reqs=1,
+        req_ids=[req_id],
         num_scheduled_tokens=np.asarray([scheduled], dtype=np.int32),
         num_computed_tokens_np=np.asarray([computed], dtype=np.int32),
+        is_prefilling_np=np.asarray([prefilling], dtype=np.bool_),
         query_start_loc_np=np.asarray([0, scheduled], dtype=np.int32),
         idx_mapping_np=np.asarray([0], dtype=np.int32),
     )
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [
+        (1, (0, 1)),
+        (17, (16, 1)),
+        (31, (16, 15)),
+        (32, (16, 16)),
+        (100, (48, 52)),
+        (202752, (101376, 101376)),
+    ],
+)
+def test_page_aligned_partition_uses_cumulative_boundaries(
+    num_tokens: int, expected: tuple[int, int]
+) -> None:
+    assert weighted_partition_lengths(
+        num_tokens,
+        (1.0, 1.0),
+        alignment=16,
+    ) == expected
+
+
+def test_page_aligned_partition_keeps_segments_nonempty_when_feasible() -> None:
+    assert weighted_partition_lengths(
+        17,
+        (0.01, 0.99),
+        alignment=16,
+    ) == (16, 1)
+    assert weighted_partition_lengths(
+        33,
+        (0.01, 0.01, 0.98),
+        alignment=16,
+    ) == (16, 16, 1)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 16, 17, 31, 33, 100])
+def test_page_aligned_partition_has_no_unaligned_internal_cut(
+    num_tokens: int,
+) -> None:
+    lengths = weighted_partition_lengths(
+        num_tokens,
+        (1.0, 1.0, 1.0, 1.0),
+        alignment=16,
+    )
+    assert sum(lengths) == num_tokens
+
+    cut = 0
+    for length in lengths[:-1]:
+        cut += length
+        if 0 < cut < num_tokens:
+            assert cut % 16 == 0
+
+
+def test_inactive_page_pull_rank_uses_noncompact_padding() -> None:
+    manager = _chunk_manager()
+    batch = _batch(scheduled=1, computed=0)
+
+    layout = manager._compile_segment_layout(batch)
+    assert layout.rows_per_rank == (0, 1)
+    assert [
+        (piece.start_pos, piece.end_pos, piece.owner_group_rank)
+        for piece in layout.causal_segments_by_request[0]
+    ] == [(0, 1, 1)]
+    assert {(u.page_idx, u.owner_rank) for u in layout.page_owner_updates} == {(0, 1)}
+
+    manager._active_step = RunaheadStep(layout=layout, transport="page_pull")
+    assert manager._execution_rows_per_rank() == (1, 1)
+    assert not manager._compact_layout_enabled()
+
+
+def test_page_pull_keeps_compact_layout_when_all_ranks_are_active() -> None:
+    manager = _chunk_manager()
+    layout = manager._compile_segment_layout(_batch(scheduled=32, computed=0))
+
+    assert layout.rows_per_rank == (16, 16)
+    manager._active_step = RunaheadStep(layout=layout, transport="page_pull")
+    assert manager._execution_rows_per_rank() == (16, 16)
+    assert manager._compact_layout_enabled()
+
+
+def test_warmup_decode_semantics_are_allowed_only_for_synthetic_requests() -> None:
+    manager = _chunk_manager()
+
+    manager._validate_step_semantics(
+        _batch(
+            scheduled=1,
+            computed=1,
+            req_id="_warmup_0_",
+            prefilling=False,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="decode/mixed"):
+        manager._validate_step_semantics(
+            _batch(scheduled=1, computed=1, req_id="req", prefilling=False)
+        )
 
 
 def test_chunked_layout_keeps_mutable_tail_on_existing_owner() -> None:
