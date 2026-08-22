@@ -102,14 +102,14 @@ def test_mla_page_pull_uses_local_latents_and_native_page_lifecycle() -> None:
     runtime.exchange_cache_inputs.assert_not_called()
     runtime.page_pull_prepare_layer.assert_called_once_with(kv_cache)
     runtime.page_pull_after_cache_write.assert_called_once_with(kv_cache)
-    original_cache_update.assert_called_once_with(
-        kv_c,
-        k_pe,
-        kv_cache,
-        local_slots,
-        "auto",
-        k_scale,
-    )
+    original_cache_update.assert_called_once()
+    call_args = original_cache_update.call_args.args
+    assert call_args[0] is kv_c
+    assert torch.equal(call_args[1], k_pe)
+    assert call_args[2] is kv_cache
+    assert call_args[3] is local_slots
+    assert call_args[4] == "auto"
+    assert call_args[5] is k_scale
     assert cache_kv is kv_c
     assert torch.equal(cache_kpe, k_pe)
     assert cache_slots is local_slots
