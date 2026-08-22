@@ -12,7 +12,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from vllm.config import get_current_vllm_config_or_none, set_current_vllm_config
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed.parallel_state import Handle, get_pcp_group
 from vllm.v1.attention.ops.pcp_page_pull import PCPPagePlan, PCPPagePullTransport
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_mark, pcp_nvtx_range
@@ -62,12 +62,17 @@ class PCPRunaheadRuntime:
         self.max_inflight_reads = max_inflight_reads
         self.nixl_backends = nixl_backends
         self.group = pcp_group
-        # Runahead is created while the model initialization config context is
-        # active. Keep the config object so page-pull can temporarily restore
-        # that context when it discovers bound layer KV caches during warmup.
-        # Do not copy the config/static_forward_context: KV-cache bindings are
-        # populated later and must remain visible through the same reference.
-        self._vllm_config = get_current_vllm_config_or_none()
+
+        # Runahead is created while model initialization owns the vLLM config
+        # context. Retain only the mutable static-forward-context reference that
+        # page-pull actually needs. KV-cache tensors are bound later on the same
+        # layer objects, so the reference must not be copied.
+        vllm_config = get_current_vllm_config_or_none()
+        self._static_forward_context = (
+            vllm_config.compilation_config.static_forward_context
+            if vllm_config is not None
+            else None
+        )
 
         self.active = False
         self.transport: str | None = None
@@ -164,17 +169,9 @@ class PCPRunaheadRuntime:
                 max_inflight_reads=self.max_inflight_reads,
                 nixl_backends=self.nixl_backends,
                 pcp_group=self._group(),
+                static_forward_context=self._static_forward_context,
             )
-        if self._vllm_config is None:
-            raise RuntimeError(
-                "PCP page_pull requires the vLLM config captured during "
-                "runahead runtime initialization"
-            )
-        # prepare_attn()/warmup runs outside vLLM's initialization config
-        # context, while page-pull cache discovery still needs the static
-        # forward context. Restore only around that discovery/registration.
-        with set_current_vllm_config(self._vllm_config):
-            self._page_pull.configure_step(epoch=self._epoch, plan=plan)
+        self._page_pull.configure_step(epoch=self._epoch, plan=plan)
 
     def disable_step(self) -> None:
         self.flush()
@@ -420,17 +417,7 @@ class PCPRunaheadRuntime:
         ptr = kv_cache.data_ptr()
         if ptr in self._pending_page_layers:
             raise RuntimeError("page-pull layer cache update was prepared twice")
-        if self._vllm_config is None:
-            raise RuntimeError(
-                "PCP page_pull requires the vLLM config captured during "
-                "runahead runtime initialization"
-            )
-        # Registration normally happened in configure_page_plan(). Keep the
-        # same narrow context here as a safe fallback if KV binding was deferred.
-        with set_current_vllm_config(self._vllm_config):
-            self._pending_page_layers[ptr] = self._page_pull.register_current_layer(
-                kv_cache
-            )
+        self._pending_page_layers[ptr] = self._page_pull.register_current_layer(kv_cache)
 
     def page_pull_after_cache_write(self, kv_cache: torch.Tensor) -> None:
         if self.transport != "page_pull" or self._page_pull is None:

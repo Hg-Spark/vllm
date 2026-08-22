@@ -12,7 +12,6 @@ from typing import Any, Literal
 
 import torch
 
-from vllm.config import get_current_vllm_config
 from vllm.v1.attention.ops.pcp_nixl import NixlMemoryRegion, PCPNixlPeerTransport
 from vllm.v1.attention.ops.pcp_page_plan import PCPPagePlan
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_mark, pcp_nvtx_range
@@ -50,6 +49,7 @@ class PCPPagePullTransport:
         max_inflight_reads: int = 4,
         nixl_backends: tuple[str, ...] = ("UCX",),
         pcp_group: Any | None = None,
+        static_forward_context: dict[str, Any] | None = None,
     ) -> None:
         if max_inflight_reads <= 0:
             raise ValueError("max_inflight_reads must be positive")
@@ -57,6 +57,7 @@ class PCPPagePullTransport:
         self.rank = rank
         self.device = device
         self.max_inflight_reads = max_inflight_reads
+        self._static_forward_context = static_forward_context
         self._peer = PCPNixlPeerTransport(
             world_size=world_size,
             rank=rank,
@@ -151,13 +152,9 @@ class PCPPagePullTransport:
     def disable_step(self) -> None:
         self.finish_step()
 
-    @staticmethod
-    def _discover_bound_layer_caches() -> dict[str, torch.Tensor]:
-        try:
-            forward_context = (
-                get_current_vllm_config().compilation_config.static_forward_context
-            )
-        except (AttributeError, RuntimeError):
+    def _discover_bound_layer_caches(self) -> dict[str, torch.Tensor]:
+        forward_context = self._static_forward_context
+        if forward_context is None:
             return {}
         result: dict[str, torch.Tensor] = {}
         for layer_name, layer in forward_context.items():

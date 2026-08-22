@@ -10,17 +10,10 @@ from vllm.distributed.kv_transfer import (
     is_v1_kv_transfer_group,
 )
 from vllm.utils.torch_utils import _resolve_layer_name
-from vllm.v1.attention.ops.pcp_runahead import get_pcp_runahead_runtime
 
 
 def maybe_transfer_kv_layer(func: Callable) -> Callable:
-    """Handle KV movement immediately before and after an attention layer.
-
-    The PCP page-pull hook runs on attention entry. unified_attention's dummy
-    dependency guarantees that the native KV-cache update custom op has already
-    executed, so READY is published after the cache write without patching an
-    attention backend.
-    """
+    """Handle KV connector movement immediately before and after an attention layer."""
     # Import at runtime to avoid circular dependency
     from vllm.model_executor.layers.attention.attention import get_attention_context
 
@@ -38,28 +31,14 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        runtime = get_pcp_runahead_runtime()
-        page_pull = runtime is not None and runtime.transport == "page_pull"
         kv_transfer = has_kv_transfer_group() and is_v1_kv_transfer_group()
-        if not page_pull and not kv_transfer:
+        if not kv_transfer:
             return func(*args, **kwargs)
 
         layer_name = _resolve_layer_name(args[layer_name_index])
 
         # Extract attention context (metadata, layer, kv_cache, layer_slot_mapping)
-        attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(
-            layer_name
-        )
-
-        # unified_kv_cache_update calls do_kv_cache_update under the same
-        # layer_slot_mapping condition, so only a real native write gets a
-        # page-pull post-write/READY transition.
-        if page_pull and layer_slot_mapping is not None:
-            assert runtime is not None
-            runtime.page_pull_after_cache_write(kv_cache)
-
-        if not kv_transfer:
-            return func(*args, **kwargs)
+        attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
 
         connector = get_kv_transfer_group()
         if attn_metadata is None or not connector.has_connector_metadata():
