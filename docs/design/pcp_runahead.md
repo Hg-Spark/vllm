@@ -40,6 +40,9 @@ A non-empty `pcp_runahead` object enables the path.
 `partition.weights` remains accepted and implies identity binding. Repeated
 physical ownership is supported only by `page_pull`.
 
+The former `eligibility.min_tokens` admission axis has been removed. An enabled
+runahead manager never switches to baseline PCP because of step size or layout.
+
 ## Step admission semantics
 
 Runahead is fail-closed. `RunaheadPCPManager.partition_batch()` either constructs
@@ -77,9 +80,6 @@ The current model path still requires every physical PCP rank to receive at leas
 one token in a runahead step. Inactive/zero-row rank execution is a separate
 follow-up; a too-small or otherwise unrepresentable chunk raises rather than
 switching transport or baseline mode.
-
-`eligibility.min_tokens` is retained as a compatibility configuration field, but
-it is not used to redirect an enabled runahead manager to baseline PCP.
 
 ## Segment compilation and compact layout
 
