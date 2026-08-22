@@ -17,8 +17,7 @@ from vllm.config.pcp_runahead import (
     parse_runahead_weights,
 )
 from vllm.distributed.parallel_state import get_pcp_group
-from vllm.v1.attention.ops.pcp_page_pull import PCPPagePlan
-from vllm.v1.attention.ops.pcp_page_plan import PCPPageRoute
+from vllm.v1.attention.ops.pcp_page_plan import PCPPagePlan, PCPPageRoute
 from vllm.v1.attention.ops.pcp_page_state import PCPPageStateTracker
 from vllm.v1.attention.ops.pcp_profile import pcp_nvtx_range
 from vllm.v1.attention.ops.pcp_runahead import (
@@ -119,7 +118,7 @@ def weighted_partition_lengths(
             lengths[segment] += 1
         return tuple(lengths)
 
-    # Page-pull ownership is defined on whole pages. Quantize cumulative
+    # Producer-push ownership is defined on whole pages. Quantize cumulative
     # weighted cuts directly in that domain. When there are enough tokens to
     # make every logical segment non-empty, reserve one aligned page for every
     # non-final segment and at least one token for the final segment. Otherwise
@@ -249,7 +248,7 @@ class RunaheadPCPManager(PCPManager):
             pcp_rank=pcp_rank,
             device=device,
             max_inflight_sends=config.max_inflight_sends,
-            max_inflight_reads=config.max_inflight_reads,
+            max_inflight_writes=config.max_inflight_writes,
             nixl_backends=config.nixl_backends,
             pcp_group=get_pcp_group(),
         )
@@ -291,8 +290,6 @@ class RunaheadPCPManager(PCPManager):
         max_segments_per_rank = max(
             mapping.count(rank) for rank in range(self.pcp_world_size)
         )
-        # A chunk that starts inside a mutable page can add one forced segment
-        # on its existing owner in addition to the configured logical segments.
         if self._config.transport == "page_pull":
             max_segments_per_rank += 1
         if (
@@ -416,13 +413,7 @@ class RunaheadPCPManager(PCPManager):
         return req_state_idx, request_id
 
     def _select_decode_rank(self, req_state_idx: int, request_id: str) -> int:
-        """Select the authoritative decode rank for a tracked request.
-
-        The current policy chooses the final causal page owner, which already has
-        a complete prefix after page-pull prefill. Future placement policies may
-        select another rank and materialize its missing prefix in
-        ``_ensure_decode_ready`` without changing the decode execution path.
-        """
+        """Select the authoritative decode rank for a tracked request."""
         tracker = self._page_state
         if tracker is None:
             raise RuntimeError("PCP page_pull decode placement requires page state")
@@ -440,9 +431,8 @@ class RunaheadPCPManager(PCPManager):
     ) -> None:
         """Ensure the selected rank has a complete usable prefix.
 
-        Today the selected rank is the final causal owner, so readiness is a
-        strict validation. This is the extension point for a future explicit
-        prefill-to-decode KV materialization/handoff to an arbitrary selected rank.
+        The selected rank is currently the final causal owner. A future policy
+        may materialize a prefix on another rank before this validation point.
         """
         if self.pcp_rank != decode_rank:
             return
@@ -705,9 +695,9 @@ class RunaheadPCPManager(PCPManager):
                 offset = next_offset
                 absolute = end_pos
 
-            # A partial page already contains historical KV. Keep its existing
-            # authoritative owner so native whole-page writes never require an
-            # ownership migration or overwrite an old prefix after a remote READ.
+            # A partial historical page remains on its authoritative owner. This
+            # prevents ownership migration from producing a whole-page WRITE
+            # whose source lacks the old prefix bytes.
             if absolute % block_size:
                 tail_page = absolute // block_size
                 tail_owner = tracker.owner(state, tail_page)
@@ -793,8 +783,6 @@ class RunaheadPCPManager(PCPManager):
             raise RuntimeError("PCP runahead tensor transports support prefill only")
 
         if self._config.transport == "page_pull":
-            # Per-request continuity is validated by PCPPageStateTracker during
-            # segment compilation. There is no baseline routing path.
             return
 
         computed = input_batch.num_computed_tokens_np[: input_batch.num_reqs]
@@ -908,9 +896,6 @@ class RunaheadPCPManager(PCPManager):
 
         world_size = self.pcp_world_size
         block_size = tracker.block_size
-        history_pages = [
-            [[] for _ in range(world_size)] for _ in range(world_size)
-        ]
         current_pages = [
             [[] for _ in range(world_size)] for _ in range(world_size)
         ]
@@ -956,33 +941,30 @@ class RunaheadPCPManager(PCPManager):
                 ]
                 for rank in range(world_size)
             ]
-
-            # Historical full pages are already complete on their authoritative
-            # producer. Only this process' missing pages need explicit routes.
             local_owned_indices = owned_indices_by_rank[self.pcp_rank]
-            history_page_limit = start_pos // block_size
+
+            # Historical full pages must already be locally materialized by an
+            # earlier CURRENT/REPLICA WRITE. No transport fallback is permitted.
             if local_owned_indices:
-                for page_idx in range(history_page_limit):
+                for page_idx in range(start_pos // block_size):
                     block_id = int(request_blocks[page_idx])
                     owner_rank = tracker.owner(state, page_idx)
                     if owner_rank < 0:
-                        raise RuntimeError(
-                            "PCP history page has no authoritative owner"
-                        )
+                        raise RuntimeError("PCP history page has no authoritative owner")
                     if owner_rank == self.pcp_rank:
-                        # vLLM owns allocation/COW. The authoritative owner's
-                        # current physical block is valid after vLLM's copy path.
+                        # vLLM owns allocation/COW on the authoritative writer.
                         self._pending_page_valid_updates.append(
                             (req_state_idx, request_id, page_idx, block_id)
                         )
                     elif not tracker.local_is_valid(state, page_idx, block_id):
-                        history_pages[self.pcp_rank][owner_rank].append(block_id)
-                        self._pending_page_valid_updates.append(
-                            (req_state_idx, request_id, page_idx, block_id)
+                        raise RuntimeError(
+                            "PCP historical full page is missing locally and "
+                            "fallback is disabled: "
+                            f"request={request_id!r}, rank={self.pcp_rank}, "
+                            f"page={page_idx}, block={block_id}, owner={owner_rank}"
                         )
 
-            # Current-chunk routes are deterministic across ranks and therefore
-            # compiled for every destination. READY fanout uses these rows.
+            # CURRENT routes describe only same-step predecessor dependencies.
             for destination_rank, owned_indices in enumerate(owned_indices_by_rank):
                 if not owned_indices:
                     continue
@@ -998,9 +980,8 @@ class RunaheadPCPManager(PCPManager):
                         for page_idx in range(first_page, last_page)
                     )
 
-            # After a successful forward, this rank has a valid copy of every
-            # current page through its last causal segment: locally produced
-            # pages plus predecessor pages pulled before attention.
+            # Same-step CURRENT visibility makes every page through this rank's
+            # final causal segment usable immediately after forward.
             if local_owned_indices:
                 max_local_index = local_owned_indices[-1]
                 seen_pages: set[int] = set()
@@ -1020,6 +1001,20 @@ class RunaheadPCPManager(PCPManager):
                             )
                         )
 
+            # Every page finalized in this chunk is replicated to every PCP rank
+            # before restore completes. Commit those replicas directly into the
+            # page-state tracker so the transport needs no cross-step block table.
+            first_current_page = start_pos // block_size
+            for page_idx in range(first_current_page, end_pos // block_size):
+                self._pending_page_valid_updates.append(
+                    (
+                        req_state_idx,
+                        request_id,
+                        page_idx,
+                        int(request_blocks[page_idx]),
+                    )
+                )
+
             self._pending_tail_invalidations.append(
                 (req_state_idx, request_id, start_pos)
             )
@@ -1032,9 +1027,6 @@ class RunaheadPCPManager(PCPManager):
                 segment_to_rank=(),
                 blocks_by_segment=(),
                 block_size=block_size,
-                history_routes_by_rank=self._build_route_matrix(
-                    history_pages, world_size
-                ),
                 current_routes_by_rank=self._build_route_matrix(
                     current_pages, world_size
                 ),
@@ -1046,7 +1038,7 @@ class RunaheadPCPManager(PCPManager):
         step = self._active_step
         block_tables = self._block_tables
         if step is None or step.transport != "page_pull":
-            raise RuntimeError("PCP page_pull has no active page-pull step")
+            raise RuntimeError("PCP page_pull has no active producer-push step")
         if block_tables is None or self._page_state is None:
             raise RuntimeError("PCP page_pull requires block tables and page state")
         if block_tables.num_kv_cache_groups != 1:
@@ -1057,7 +1049,7 @@ class RunaheadPCPManager(PCPManager):
         slot_mappings = super().prepare_slot_mappings()
         step = self._active_step
         if step is not None and step.transport == "page_pull":
-            with pcp_nvtx_range("pcp.page_pull_plan"):
+            with pcp_nvtx_range("pcp.page_push_plan"):
                 self._configure_page_pull_plan()
         return slot_mappings
 
@@ -1066,17 +1058,14 @@ class RunaheadPCPManager(PCPManager):
         if tracker is None:
             raise RuntimeError("PCP page_pull completion requires page state")
 
-        # Commit ownership only after the model forward and all required READs
-        # completed. A failed step therefore cannot publish owners for KV pages
-        # that were never successfully produced.
+        # Ownership becomes authoritative only after model forward and all
+        # producer WRITEs have completed. A failed step publishes no new pages.
         for update in step.layout.page_owner_updates:
             state = tracker.existing_request(update.req_state_idx, update.request_id)
             if state is None:
                 raise RuntimeError("PCP page-state request disappeared after forward")
             tracker.assign_owner(state, update.page_idx, update.owner_rank)
 
-        # Appending into a historical partial page invalidates old non-owner
-        # replicas. Apply this before marking copies produced by this step valid.
         for req_state_idx, request_id, start_pos in self._pending_tail_invalidations:
             state = tracker.existing_request(req_state_idx, request_id)
             if state is None:
