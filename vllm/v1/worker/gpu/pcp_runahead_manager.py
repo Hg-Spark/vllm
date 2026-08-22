@@ -255,7 +255,11 @@ class RunaheadPCPManager(PCPManager):
         # on its existing owner in addition to the configured logical segments.
         if self._config.transport == "page_pull":
             max_segments_per_rank += 1
-        if max_segments_per_rank <= 2 or max_num_reqs is None or max_num_tokens is None:
+        if (
+            max_segments_per_rank <= 2
+            or max_num_reqs is None
+            or max_num_tokens is None
+        ):
             return
         max_num_local_reqs = max_segments_per_rank * max_num_reqs
         self._input_buffers = InputBuffers(max_num_local_reqs, max_num_tokens, device)
@@ -330,7 +334,9 @@ class RunaheadPCPManager(PCPManager):
                     f"got cache_dtype={cache_dtype}"
                 )
 
-    def _partition_lengths(self, query_len: int, start_pos: int = 0) -> tuple[int, ...]:
+    def _partition_lengths(
+        self, query_len: int, start_pos: int = 0
+    ) -> tuple[int, ...]:
         return weighted_partition_lengths(
             query_len,
             self._config.weights,
@@ -350,7 +356,9 @@ class RunaheadPCPManager(PCPManager):
             return None
         return req_state_idx, request_id
 
-    def _compile_legacy_segment_layout(self, input_batch: InputBatch) -> SegmentLayout | None:
+    def _compile_legacy_segment_layout(
+        self, input_batch: InputBatch
+    ) -> SegmentLayout | None:
         mapping = self._config.segment_to_group_rank
         num_segments = len(mapping)
         segments_by_rank: list[list[RankSegment]] = [
@@ -468,6 +476,7 @@ class RunaheadPCPManager(PCPManager):
                 length: int,
                 owner_rank: int,
                 legacy_segment_idx: int | None,
+                global_batch_req_idx: int = req_idx,
             ) -> bool:
                 nonlocal offset, absolute
                 if length <= 0:
@@ -477,7 +486,7 @@ class RunaheadPCPManager(PCPManager):
                 local_start = rank_rows[owner_rank]
                 segments_by_rank[owner_rank].append(
                     RankSegment(
-                        global_batch_req_idx=req_idx,
+                        global_batch_req_idx=global_batch_req_idx,
                         global_batch_slice=slice(
                             global_start + offset, global_start + next_offset
                         ),
@@ -487,12 +496,12 @@ class RunaheadPCPManager(PCPManager):
                     )
                 )
                 piece = LogicalSegment(
-                    global_batch_req_idx=req_idx,
+                    global_batch_req_idx=global_batch_req_idx,
                     start_pos=absolute,
                     end_pos=end_pos,
                     owner_group_rank=owner_rank,
                 )
-                causal_by_request[req_idx].append(piece)
+                causal_by_request[global_batch_req_idx].append(piece)
                 if legacy_segment_idx is not None:
                     logical_segments[legacy_segment_idx].append(piece)
                 rank_rows[owner_rank] += length
@@ -562,7 +571,9 @@ class RunaheadPCPManager(PCPManager):
             page_owner_updates=tuple(owner_updates.values()),
         )
 
-    def _compile_segment_layout(self, input_batch: InputBatch) -> SegmentLayout | None:
+    def _compile_segment_layout(
+        self, input_batch: InputBatch
+    ) -> SegmentLayout | None:
         if self._config.transport == "page_pull" and getattr(
             self, "_page_state", None
         ) is not None:
@@ -629,7 +640,7 @@ class RunaheadPCPManager(PCPManager):
             )
 
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
-        if self._tensor_sharded_kv_history:
+        if getattr(self, "_tensor_sharded_kv_history", False):
             raise RuntimeError(
                 "PCP tensor runahead left persistent causal-prefix KV sharded across "
                 "ranks; continued/decode execution is not implemented"
@@ -637,7 +648,9 @@ class RunaheadPCPManager(PCPManager):
 
         page_pull = self._config.transport == "page_pull"
         known_page_history = page_pull and self._batch_has_known_page_history(input_batch)
-        all_prefilling = bool(input_batch.is_prefilling_np[: input_batch.num_reqs].all())
+        all_prefilling = bool(
+            input_batch.is_prefilling_np[: input_batch.num_reqs].all()
+        )
         if known_page_history and not all_prefilling:
             raise RuntimeError(
                 "PCP page_pull chunk history is sharded across ranks; decode after "
@@ -734,7 +747,12 @@ class RunaheadPCPManager(PCPManager):
         global_batch = self._global_batch
         block_tables = self._block_tables
         tracker = self._page_state
-        if step is None or global_batch is None or block_tables is None or tracker is None:
+        if (
+            step is None
+            or global_batch is None
+            or block_tables is None
+            or tracker is None
+        ):
             raise RuntimeError("PCP chunked page_pull is missing planner state")
 
         world_size = self.pcp_world_size
@@ -766,10 +784,16 @@ class RunaheadPCPManager(PCPManager):
                 0, req_state_idx, 0, end_page
             )
             if len(request_blocks) < end_page:
-                raise RuntimeError("PCP page_pull block table is shorter than chunk plan")
+                raise RuntimeError(
+                    "PCP page_pull block table is shorter than chunk plan"
+                )
 
             owned_indices_by_rank = [
-                [index for index, piece in enumerate(segments) if piece.owner_group_rank == rank]
+                [
+                    index
+                    for index, piece in enumerate(segments)
+                    if piece.owner_group_rank == rank
+                ]
                 for rank in range(world_size)
             ]
 
@@ -782,7 +806,9 @@ class RunaheadPCPManager(PCPManager):
                     block_id = int(request_blocks[page_idx])
                     owner_rank = tracker.owner(state, page_idx)
                     if owner_rank < 0:
-                        raise RuntimeError("PCP history page has no authoritative owner")
+                        raise RuntimeError(
+                            "PCP history page has no authoritative owner"
+                        )
                     if owner_rank == self.pcp_rank:
                         # Local allocation/COW is managed by vLLM. Treat the
                         # authoritative owner's current physical block as valid.
@@ -797,7 +823,9 @@ class RunaheadPCPManager(PCPManager):
 
             # Current-chunk routes are deterministic across ranks and therefore
             # compiled for every destination. READY fanout uses these rows.
-            for destination_rank, owned_indices in enumerate(owned_indices_by_rank):
+            for destination_rank, owned_indices in enumerate(
+                owned_indices_by_rank
+            ):
                 if not owned_indices:
                     continue
                 max_owned_index = owned_indices[-1]
