@@ -14,12 +14,12 @@ def test_page_plan_precompiles_repeated_owner_routes() -> None:
         block_size=16,
     )
 
-    assert plan.required_source_ranks(0) == (1,)
-    assert plan.required_source_ranks(1) == (0,)
+    assert plan.current_source_ranks(0) == (1,)
+    assert plan.current_source_ranks(1) == (0,)
     assert plan.consumer_ranks(0) == (1,)
     assert plan.consumer_ranks(1) == (0,)
-    assert plan.requires_source(1, 0)
-    assert not plan.requires_source(1, 1)
+    assert plan.requires_current_source(1, 0)
+    assert not plan.requires_current_source(1, 1)
 
     route = plan.current_transfer_route(1, 0)
     assert route.destination_block_ids == route.source_block_ids == (2, 3)
