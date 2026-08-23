@@ -114,44 +114,52 @@ def maybe_launch_mla_pcp_cache_update(
 ) -> bool:
     """Launch pure-prefill PCP cache replication on a dedicated CUDA stream.
 
-    Returns True when this function owns the cache update. The caller must keep
-    the original synchronous gather/write path when False.
+    Returns True only when this function owns an asynchronous pure-prefill cache
+    update. Decode and mixed batches intentionally return False so the caller
+    executes their required synchronous cache update. Configurations that are
+    incompatible with cross-layer overlap raise instead of silently reverting
+    to the synchronous PCP path.
 
     A pending write from the previous invocation of this same layer is fenced on
-    the current compute stream before deciding whether the new invocation can be
-    asynchronous. This keeps decode/mixed batches and cache reuse ordered while
-    allowing layer-L cache replication to overlap layer-L/later computation.
+    the current compute stream before handling decode/mixed batches or launching
+    the next asynchronous pure-prefill update.
     """
-    if not _PCP_CROSS_LAYER_OVERLAP or kv_c_normed.device.type != "cuda":
+    if not _PCP_CROSS_LAYER_OVERLAP:
         return False
+
+    if kv_c_normed.device.type != "cuda":
+        raise RuntimeError("PCP cross-layer overlap requires CUDA tensors")
 
     _wait_previous_mla_pcp_cache_write(attn_layer, kv_c_normed.device)
 
-    if (
-        not attn_layer.use_pcp
-        or num_decode_tokens != 0
-        or slot_mapping is None
-        or getattr(attn_layer.impl, "is_sparse", False)
-    ):
+    # Decode and mixed decode+prefill are deliberately synchronous because the
+    # attention kernel can consume the just-written cache in the same layer.
+    if num_decode_tokens != 0:
         return False
 
+    # No PCP replication or no cache write means there is nothing to overlap.
+    if not attn_layer.use_pcp or slot_mapping is None:
+        return False
+
+    if getattr(attn_layer.impl, "is_sparse", False):
+        raise RuntimeError("PCP cross-layer overlap does not support sparse MLA")
+
     vllm_config = getattr(attn_layer, "_vllm_config", None)
-    # KV-transfer hooks may consume the just-written cache at the layer
-    # boundary. DBO may invoke one layer concurrently from multiple ubatches.
-    # Keep both configurations synchronous until their own fences are wired.
     if vllm_config is not None:
         if getattr(vllm_config, "kv_transfer_config", None) is not None:
-            return False
+            raise RuntimeError(
+                "PCP cross-layer overlap does not support KV transfer"
+            )
         parallel_config = getattr(vllm_config, "parallel_config", None)
         if parallel_config is not None and getattr(
             parallel_config, "enable_dbo", False
         ):
-            return False
+            raise RuntimeError("PCP cross-layer overlap does not support DBO")
 
-    # Cross-stream work must not be introduced while this execution is being
-    # captured into a CUDA graph.
     if torch.cuda.is_current_stream_capturing():
-        return False
+        raise RuntimeError(
+            "PCP cross-layer overlap does not support CUDA graph capture"
+        )
 
     compute_stream = torch.cuda.current_stream(kv_c_normed.device)
     comm_stream = _pcp_cache_comm_stream(kv_c_normed.device)
