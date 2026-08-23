@@ -158,7 +158,7 @@ class PCPManager:
     """MRV2 PC batch manager.
 
     The model runner keeps the global scheduled batch. This manager rewrites only
-    the per-step InputBatch into rank-local DualChunkSwap rows and keeps the
+    the per-step InputBatch into contiguous rank-local prefill rows and keeps the
     global-batch view private to restore to the global batch shape before
     sampling/postprocess.
     """
@@ -189,11 +189,6 @@ class PCPManager:
                 "PCP partition weights must match PCP world size: "
                 f"weights={self._partition_weights}, world_size={pcp_world_size}"
             )
-        segment_weights = [0.0] * (2 * pcp_world_size)
-        for rank, weight in enumerate(self._partition_weights):
-            segment_weights[rank] = weight
-            segment_weights[-1 - rank] = weight
-        self._segment_weights = tuple(segment_weights)
         self._page_alignment = (
             math.lcm(*(int(size) for size in block_tables.kernel_block_sizes))
             if block_tables is not None and block_tables.kernel_block_sizes
@@ -208,6 +203,9 @@ class PCPManager:
         self._gathered_kv_write_mask: torch.Tensor | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
+        # Keep the existing capacity for now. Contiguous PCP needs at most one
+        # prefill row per request, but retaining the old 2x allocation avoids
+        # coupling this partition change to CUDA-graph/input-buffer sizing.
         max_num_local_reqs = 2 * max_num_reqs if max_num_reqs is not None else None
         self._input_buffers = (
             InputBuffers(max_num_local_reqs, max_num_tokens, device)
@@ -337,23 +335,17 @@ class PCPManager:
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
     ) -> list[RankSegment]:
-        """Build one rank's attention-compatible DualChunkSwap rows.
+        """Build one contiguous prefill row per request for one PCP rank.
 
-        PCP=4 partitions each prefill into eight chunks:
-
-            full:  | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
-            rank 0:  0                           7
-            rank 1:      1                   6
-            rank 2:          2           5
-            rank 3:              3   4
-
-        Long-prefill chunk boundaries use cumulative weighted page rounding.
-        Both logical chunks owned by a physical rank carry the same rank weight,
-        preserving DualChunkSwap while allowing static load tuning.
+        Prefill tokens are partitioned directly across PCP ranks. Long-prefill
+        boundaries use cumulative weighted page rounding, so rank weights can
+        compensate for causal-attention imbalance without creating the two
+        disjoint rows per rank that make MLA re-gather/re-project overlapping
+        context. Decode tokens remain replicated on every PCP rank.
         """
         rank_segments = []
         rank_offset = 0
-        num_chunks = 2 * self.pcp_world_size
+        num_chunks = self.pcp_world_size
         for global_batch_req_idx, num_tokens in enumerate(num_scheduled_tokens):
             query_len = int(num_tokens)
             if query_len == 0:
@@ -366,7 +358,7 @@ class PCPManager:
                     alignment = 1
                 chunk_lengths = weighted_partition_lengths(
                     query_len,
-                    self._segment_weights,
+                    self._partition_weights,
                     start_pos=int(num_computed_tokens[global_batch_req_idx]),
                     alignment=alignment,
                 )
@@ -376,7 +368,7 @@ class PCPManager:
                     chunk_offsets[chunk_idx] = running
                     running += chunk_len
                 assert running == query_len
-                chunk_indices = (rank, num_chunks - 1 - rank)
+                chunk_indices = (rank,)
             else:  # decodes are replicated
                 chunk_lengths = (query_len,)
                 chunk_offsets = (0,)
