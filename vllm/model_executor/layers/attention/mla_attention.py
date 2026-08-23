@@ -1102,6 +1102,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
+        # for more details.
         quant_method = (
             self.quant_config.get_quant_method(self, prefix=self.layer_name)
             if self.quant_config
@@ -1533,7 +1534,7 @@ def get_mla_dims(model_config: ModelConfig) -> MLADims:
             v_head_dim=head_dim,
         )
 
-    # DeepseekV2/V3 style config
+    # DeepSeekV2/V3 style config
     return MLADims(
         q_lora_rank=getattr(hf_text_config, "q_lora_rank", None),
         kv_lora_rank=hf_text_config.kv_lora_rank,
