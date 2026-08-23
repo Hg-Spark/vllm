@@ -229,6 +229,7 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 from vllm.model_executor.layers.attention.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
+    maybe_launch_mla_pcp_cache_update,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
@@ -1101,7 +1102,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
-        # for more details.
         quant_method = (
             self.quant_config.get_quant_method(self, prefix=self.layer_name)
             if self.quant_config
@@ -1191,12 +1191,25 @@ def unified_mla_kv_cache_update(
     attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
         layer_name
     )
-    if layer_slot_mapping is not None:
+    num_decode_tokens = (
+        attn_metadata.num_decode_tokens if attn_metadata is not None else None
+    )
+    async_cache_update = maybe_launch_mla_pcp_cache_update(
+        attn_layer,
+        kv_c_normed,
+        k_pe,
+        kv_cache,
+        layer_slot_mapping,
+        num_decode_tokens,
+        kv_cache_dtype,
+        k_scale,
+    )
+    if layer_slot_mapping is not None and not async_cache_update:
         kv_c_normed, k_pe, layer_slot_mapping = maybe_gather_mla_latent_cache_inputs(
             kv_c_normed,
             k_pe,
             layer_slot_mapping,
-            attn_metadata.num_decode_tokens if attn_metadata is not None else None,
+            num_decode_tokens,
             attn_layer.use_pcp,
         )
         attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
