@@ -65,7 +65,7 @@ def test_partition_weights_default_and_validation() -> None:
         )
 
 
-def test_dual_chunk_swap_applies_rank_weights_symmetrically() -> None:
+def test_pcp_prefill_uses_one_contiguous_weighted_segment_per_rank() -> None:
     block_tables = SimpleNamespace(
         kernel_block_sizes=[128],
         num_kv_cache_groups=0,
@@ -98,17 +98,47 @@ def test_dual_chunk_swap_applies_rank_weights_symmetrically() -> None:
         query_start_loc,
     )
 
-    assert sum(segment.num_tokens for segment in rank0) == 2816
-    assert sum(segment.num_tokens for segment in rank1) == 1280
+    assert len(rank0) == 1
+    assert len(rank1) == 1
+    assert rank0[0].global_batch_slice == slice(0, 2688)
+    assert rank1[0].global_batch_slice == slice(2688, 4096)
+    assert rank0[0].num_tokens == 2688
+    assert rank1[0].num_tokens == 1408
+    assert rank0[0].global_batch_slice.stop == rank1[0].global_batch_slice.start
+    assert rank0[0].global_batch_slice.stop % 128 == 0
 
-    slices = sorted(
-        (segment.global_batch_slice.start, segment.global_batch_slice.stop)
-        for segment in (*rank0, *rank1)
+
+def test_equal_weight_contiguous_prefill_has_no_overlap_or_gap() -> None:
+    block_tables = SimpleNamespace(
+        kernel_block_sizes=[128],
+        num_kv_cache_groups=0,
     )
-    assert slices == [
-        (0, 1408),
-        (1408, 2048),
-        (2048, 2688),
-        (2688, 4096),
-    ]
-    assert all(boundary % 128 == 0 for boundary in (1408, 2048, 2688))
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        block_tables=block_tables,
+    )
+
+    num_scheduled_tokens = np.asarray([4096], dtype=np.int32)
+    num_computed_tokens = np.asarray([0], dtype=np.int32)
+    is_prefilling = np.asarray([True], dtype=np.bool_)
+    query_start_loc = np.asarray([0, 4096], dtype=np.int32)
+
+    rank0 = manager._get_rank_segments(
+        0,
+        num_scheduled_tokens,
+        num_computed_tokens,
+        is_prefilling,
+        query_start_loc,
+    )
+    rank1 = manager._get_rank_segments(
+        1,
+        num_scheduled_tokens,
+        num_computed_tokens,
+        is_prefilling,
+        query_start_loc,
+    )
+
+    assert [segment.global_batch_slice for segment in rank0] == [slice(0, 2048)]
+    assert [segment.global_batch_slice for segment in rank1] == [slice(2048, 4096)]
