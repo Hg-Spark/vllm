@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -21,6 +22,125 @@ from vllm.v1.worker.gpu.input_batch import (
 from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
+
+
+def weighted_partition_lengths(
+    num_tokens: int,
+    weights: tuple[float, ...],
+    *,
+    start_pos: int = 0,
+    alignment: int = 1,
+) -> tuple[int, ...]:
+    """Partition tokens using cumulative weighted, optionally page-aligned cuts.
+
+    Alignment is applied to cumulative absolute boundaries instead of rounding
+    each segment independently. This keeps the partition lossless while making
+    long-prefill boundaries line up with KV-cache pages.
+    """
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    if not weights:
+        raise ValueError("weighted PCP partition requires at least one weight")
+    if alignment <= 0:
+        raise ValueError(f"alignment must be positive, got {alignment}")
+
+    total_weight = sum(weights)
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError(f"invalid PCP load weights: {weights}")
+    num_segments = len(weights)
+    if num_tokens == 0:
+        return (0,) * num_segments
+
+    if alignment == 1:
+        ideal = [num_tokens * weight / total_weight for weight in weights]
+        lengths = [math.floor(value) for value in ideal]
+        remainder = num_tokens - sum(lengths)
+        order = sorted(
+            range(num_segments),
+            key=lambda segment: (-(ideal[segment] - lengths[segment]), segment),
+        )
+        for segment in order[:remainder]:
+            lengths[segment] += 1
+        return tuple(lengths)
+
+    require_positive = (
+        start_pos % alignment == 0
+        and num_tokens >= (num_segments - 1) * alignment + 1
+    )
+    boundaries = [0]
+    cumulative_weight = 0.0
+    for segment in range(num_segments - 1):
+        cumulative_weight += weights[segment]
+        ideal_rel = num_tokens * cumulative_weight / total_weight
+        ideal_abs = start_pos + ideal_rel
+
+        if require_positive:
+            min_cut = (segment + 1) * alignment
+            remaining_segments = num_segments - segment - 1
+            max_cut = num_tokens - ((remaining_segments - 1) * alignment + 1)
+            candidates: set[int] = set()
+        else:
+            min_cut = boundaries[-1]
+            max_cut = num_tokens
+            candidates = {boundaries[-1], num_tokens}
+
+        lower_abs = math.floor(ideal_abs / alignment) * alignment
+        upper_abs = math.ceil(ideal_abs / alignment) * alignment
+        min_abs = math.ceil((start_pos + min_cut) / alignment) * alignment
+        max_abs = math.floor((start_pos + max_cut) / alignment) * alignment
+        for candidate_abs in (lower_abs, upper_abs, min_abs, max_abs):
+            candidate_rel = int(candidate_abs - start_pos)
+            if min_cut <= candidate_rel <= max_cut:
+                candidates.add(candidate_rel)
+
+        if not candidates:
+            raise AssertionError(
+                "PCP page-aligned partition has no legal cumulative boundary"
+            )
+        boundary = min(candidates, key=lambda cut: (abs(cut - ideal_rel), cut))
+        boundaries.append(boundary)
+
+    boundaries.append(num_tokens)
+    return tuple(
+        boundaries[index + 1] - boundaries[index]
+        for index in range(num_segments)
+    )
+
+
+def _parse_partition_weights(
+    additional_config: object,
+    pcp_world_size: int,
+) -> tuple[float, ...]:
+    default = (1.0,) * pcp_world_size
+    if not isinstance(additional_config, dict):
+        return default
+    partition = additional_config.get("pcp_partition")
+    if partition is None:
+        return default
+    if not isinstance(partition, dict):
+        raise ValueError("pcp_partition must be a JSON object")
+    unknown = set(partition) - {"weights"}
+    if unknown:
+        raise ValueError(f"unsupported pcp_partition keys: {sorted(unknown)}")
+    raw = partition.get("weights")
+    if raw is None:
+        return default
+    if not isinstance(raw, (list, tuple)) or len(raw) != pcp_world_size:
+        got = len(raw) if isinstance(raw, (list, tuple)) else type(raw).__name__
+        raise ValueError(
+            f"pcp_partition.weights requires {pcp_world_size} positive values, "
+            f"got {got}: {raw}"
+        )
+    try:
+        weights = tuple(float(value) for value in raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"pcp_partition.weights must be numeric: {raw}") from exc
+    if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
+        raise ValueError(
+            "pcp_partition.weights must contain finite positive values: "
+            f"{weights}"
+        )
+    return weights
 
 
 @dataclass(frozen=True)
@@ -55,6 +175,7 @@ class PCPManager:
         dcp_world_size: int = 1,
         dcp_rank: int = 0,
         cp_interleave: int = 1,
+        partition_weights: tuple[float, ...] | None = None,
     ) -> None:
         self.pcp_world_size = pcp_world_size
         self.pcp_rank = pcp_rank
@@ -62,6 +183,22 @@ class PCPManager:
         self.dcp_world_size = dcp_world_size
         self.dcp_rank = dcp_rank
         self.cp_interleave = cp_interleave
+        self._partition_weights = partition_weights or (1.0,) * pcp_world_size
+        if len(self._partition_weights) != pcp_world_size:
+            raise ValueError(
+                "PCP partition weights must match PCP world size: "
+                f"weights={self._partition_weights}, world_size={pcp_world_size}"
+            )
+        segment_weights = [0.0] * (2 * pcp_world_size)
+        for rank, weight in enumerate(self._partition_weights):
+            segment_weights[rank] = weight
+            segment_weights[-1 - rank] = weight
+        self._segment_weights = tuple(segment_weights)
+        self._page_alignment = (
+            math.lcm(*(int(size) for size in block_tables.kernel_block_sizes))
+            if block_tables is not None and block_tables.kernel_block_sizes
+            else 1
+        )
 
         self._global_batch: InputBatch | None = None
         self._req_states = req_states
@@ -209,6 +346,10 @@ class PCPManager:
             rank 1:      1                   6
             rank 2:          2           5
             rank 3:              3   4
+
+        Long-prefill chunk boundaries use cumulative weighted page rounding.
+        Both logical chunks owned by a physical rank carry the same rank weight,
+        preserving DualChunkSwap while allowing static load tuning.
         """
         rank_segments = []
         rank_offset = 0
@@ -220,15 +361,30 @@ class PCPManager:
             global_batch_start = int(query_start_loc_np[global_batch_req_idx])
             chunk_indices: tuple[int, ...]
             if bool(is_prefilling[global_batch_req_idx]):
-                chunk_size = (query_len + num_chunks - 1) // num_chunks
+                alignment = self._page_alignment
+                if query_len < num_chunks * alignment:
+                    alignment = 1
+                chunk_lengths = weighted_partition_lengths(
+                    query_len,
+                    self._segment_weights,
+                    start_pos=int(num_computed_tokens[global_batch_req_idx]),
+                    alignment=alignment,
+                )
+                chunk_offsets = [0] * num_chunks
+                running = 0
+                for chunk_idx, chunk_len in enumerate(chunk_lengths):
+                    chunk_offsets[chunk_idx] = running
+                    running += chunk_len
+                assert running == query_len
                 chunk_indices = (rank, num_chunks - 1 - rank)
             else:  # decodes are replicated
-                chunk_size = query_len
+                chunk_lengths = (query_len,)
+                chunk_offsets = (0,)
                 chunk_indices = (0,)
 
             for chunk_idx in chunk_indices:
-                chunk_offset = chunk_idx * chunk_size
-                chunk_len = min(chunk_size, query_len - chunk_offset)
+                chunk_offset = chunk_offsets[chunk_idx]
+                chunk_len = chunk_lengths[chunk_idx]
                 if chunk_len <= 0:
                     continue
                 chunk_start = global_batch_start + chunk_offset
@@ -677,4 +833,7 @@ def maybe_build_pcp_manager(
         dcp_world_size=dcp_size,
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
+        partition_weights=_parse_partition_weights(
+            vllm_config.additional_config, pcp_size
+        ),
     )
