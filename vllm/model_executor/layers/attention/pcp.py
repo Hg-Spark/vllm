@@ -117,7 +117,7 @@ def maybe_launch_mla_pcp_cache_update(
     Returns True when this function owns the cache update. The caller must keep
     the original synchronous gather/write path when False.
 
-    A pending write from the previous invocation of the same layer is fenced on
+    A pending write from the previous invocation of this same layer is fenced on
     the current compute stream before deciding whether the new invocation can be
     asynchronous. This keeps decode/mixed batches and cache reuse ordered while
     allowing layer-L cache replication to overlap layer-L/later computation.
@@ -139,7 +139,10 @@ def maybe_launch_mla_pcp_cache_update(
     # boundary. Keep that configuration synchronous until a transfer-side fence
     # is wired explicitly.
     vllm_config = getattr(attn_layer, "_vllm_config", None)
-    if vllm_config is not None and vllm_config.kv_transfer_config is not None:
+    if (
+        vllm_config is not None
+        and getattr(vllm_config, "kv_transfer_config", None) is not None
+    ):
         return False
 
     # Cross-stream work must not be introduced while this execution is being
@@ -161,7 +164,11 @@ def maybe_launch_mla_pcp_cache_update(
     layer_key = id(attn_layer)
     event = _PCP_CACHE_WRITE_EVENTS.get(layer_key)
     if event is None:
-        event = torch.cuda.Event(blocking=False, interprocess=False)
+        device_index = kv_c_normed.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        with torch.cuda.device(device_index):
+            event = torch.cuda.Event(blocking=False, interprocess=False)
         _PCP_CACHE_WRITE_EVENTS[layer_key] = event
 
     with torch.cuda.stream(comm_stream):
