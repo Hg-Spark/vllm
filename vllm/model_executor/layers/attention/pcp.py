@@ -135,15 +135,18 @@ def maybe_launch_mla_pcp_cache_update(
     ):
         return False
 
-    # KV-transfer hooks may consume the just-written cache at the layer
-    # boundary. Keep that configuration synchronous until a transfer-side fence
-    # is wired explicitly.
     vllm_config = getattr(attn_layer, "_vllm_config", None)
-    if (
-        vllm_config is not None
-        and getattr(vllm_config, "kv_transfer_config", None) is not None
-    ):
-        return False
+    # KV-transfer hooks may consume the just-written cache at the layer
+    # boundary. DBO may invoke one layer concurrently from multiple ubatches.
+    # Keep both configurations synchronous until their own fences are wired.
+    if vllm_config is not None:
+        if getattr(vllm_config, "kv_transfer_config", None) is not None:
+            return False
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        if parallel_config is not None and getattr(
+            parallel_config, "enable_dbo", False
+        ):
+            return False
 
     # Cross-stream work must not be introduced while this execution is being
     # captured into a CUDA graph.
