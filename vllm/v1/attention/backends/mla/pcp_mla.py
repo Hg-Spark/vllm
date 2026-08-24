@@ -5,7 +5,7 @@
 
 The selected upstream dense MLA backend remains authoritative for local prefill
 and normal decode. PCP replaces only cached-prefix chunked-context
-materialization with a common compressed-KV latent-prefix engine.
+materialization with FlashInfer's absorbed paged-MLA incremental-prefill path.
 """
 
 from functools import cache
@@ -13,6 +13,7 @@ import sys
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
@@ -22,11 +23,8 @@ from vllm.model_executor.layers.attention.mla_attention import (
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
 logger = init_logger(__name__)
-
-_PCP_LATENT_CONTEXT_QUERY_CHUNK = 256
 
 
 def split_unquantized_mla_up_weights(
@@ -71,121 +69,290 @@ def _validate_pcp_merge_lse(
         raise ValueError(f"{name} LSE must be on {device}, got {lse.device}")
 
 
-class TritonPCPLatentPrefixEngine:
-    """Compressed-MLA prefix engine reusable by dense top-level backends."""
+def _flashinfer_mla_backend(device: torch.device) -> str:
+    """Pick the LSE-capable FlashInfer MLA backend for this device."""
+    if device.type != "cuda":
+        return "fa2"
+    major, _ = torch.cuda.get_device_capability(device)
+    return "fa3" if major == 9 else "fa2"
+
+
+@cache
+def _flashinfer_mla_wrapper_cls():
+    try:
+        from flashinfer.mla import BatchMLAPagedAttentionWrapper
+    except (ImportError, AttributeError) as exc:
+        raise NotImplementedError(
+            "FlashInfer BatchMLAPagedAttentionWrapper is unavailable"
+        ) from exc
+    return BatchMLAPagedAttentionWrapper
+
+
+class _FlashInferLatentPrefixRuntime:
+    """One shared FlashInfer MLA runtime for sequential attention layers."""
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        num_heads: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        page_size: int,
+        scale: float,
+    ) -> None:
+        workspace_bytes = int(envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE)
+        self.workspace = torch.empty(
+            workspace_bytes, dtype=torch.uint8, device=device
+        )
+        wrapper_cls = _flashinfer_mla_wrapper_cls()
+        self.wrapper = wrapper_cls(
+            self.workspace,
+            backend=_flashinfer_mla_backend(device),
+        )
+        self.q_dtype = q_dtype
+        self.kv_dtype = kv_dtype
+        self.num_heads = num_heads
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.page_size = page_size
+        self.scale = float(scale)
+        self.planned_metadata = None
+        self.planned_signature: tuple[int, int, int, int] | None = None
+
+    def ensure_plan(
+        self,
+        *,
+        plan_key: object,
+        q_len: int,
+        context_len: int,
+        block_table_row: torch.Tensor,
+    ) -> None:
+        num_pages = (context_len + self.page_size - 1) // self.page_size
+        if num_pages > block_table_row.shape[1]:
+            raise ValueError(
+                "cached-prefix page table is shorter than the context: "
+                f"pages={num_pages} table_cols={block_table_row.shape[1]}"
+            )
+        if block_table_row.dtype != torch.int32:
+            raise ValueError(
+                f"cached-prefix block table must be int32, got {block_table_row.dtype}"
+            )
+
+        signature = (
+            q_len,
+            context_len,
+            block_table_row.data_ptr(),
+            num_pages,
+        )
+        if self.planned_metadata is plan_key and self.planned_signature == signature:
+            return
+
+        device = block_table_row.device
+        qo_indptr = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+        kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+        kv_indices = block_table_row[0, :num_pages].contiguous()
+        kv_len_arr = torch.tensor([context_len], dtype=torch.int32, device=device)
+
+        self.wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            self.num_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self.page_size,
+            False,  # cached prefix is entirely before the local query span
+            self.scale,
+            self.q_dtype,
+            self.kv_dtype,
+        )
+        # Keep a strong reference so object-id reuse cannot make a stale plan look
+        # current. All layers sharing this metadata reuse the same FlashInfer plan.
+        self.planned_metadata = plan_key
+        self.planned_signature = signature
+
+
+_FLASHINFER_LATENT_PREFIX_RUNTIMES: dict[
+    tuple[
+        str,
+        int | None,
+        torch.dtype,
+        torch.dtype,
+        int,
+        int,
+        int,
+        int,
+        float,
+    ],
+    _FlashInferLatentPrefixRuntime,
+] = {}
+
+
+def _get_flashinfer_latent_prefix_runtime(
+    *,
+    device: torch.device,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    page_size: int,
+    scale: float,
+) -> _FlashInferLatentPrefixRuntime:
+    key = (
+        device.type,
+        device.index,
+        q_dtype,
+        kv_dtype,
+        num_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        page_size,
+        float(scale),
+    )
+    runtime = _FLASHINFER_LATENT_PREFIX_RUNTIMES.get(key)
+    if runtime is None:
+        runtime = _FlashInferLatentPrefixRuntime(
+            device=device,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            num_heads=num_heads,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            page_size=page_size,
+            scale=scale,
+        )
+        _FLASHINFER_LATENT_PREFIX_RUNTIMES[key] = runtime
+    return runtime
+
+
+class FlashInferPCPLatentPrefixEngine:
+    """Absorbed paged-MLA incremental-prefill for a cached PCP prefix."""
 
     @staticmethod
     def run(
         impl,
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        context_lens: torch.Tensor,
+        block_table_row: torch.Tensor,
+        context_len_row: torch.Tensor,
         w_uk_t: torch.Tensor,
         w_uv: torch.Tensor,
-        k_scale: torch.Tensor,
+        *,
+        plan_key: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch = q.shape[0]
-        if batch <= 0 or batch > _PCP_LATENT_CONTEXT_QUERY_CHUNK:
+        num_tokens = q.shape[0]
+        if num_tokens <= 0:
+            raise ValueError("PCP latent-prefix query must contain at least one token")
+        if tuple(block_table_row.shape[:1]) != (1,):
             raise ValueError(
-                "PCP latent-prefix engine batch must be in [1, 256], "
-                f"got {batch}"
+                "PCP latent-prefix requires one canonical block-table row, "
+                f"got shape={tuple(block_table_row.shape)}"
             )
-        if block_table.shape[0] != batch:
+        if context_len_row.numel() != 1:
             raise ValueError(
-                "PCP latent-prefix block-table rows must match query rows: "
-                f"block_table={block_table.shape[0]} query={batch}"
+                "PCP latent-prefix requires one canonical context length, "
+                f"got shape={tuple(context_len_row.shape)}"
             )
-        if context_lens.shape[0] != batch:
+        if kv_c_and_k_pe_cache.dtype not in (torch.float16, torch.bfloat16):
+            raise NotImplementedError(
+                "FlashInfer latent-prefix currently supports BF16/FP16 KV cache, "
+                f"got {kv_c_and_k_pe_cache.dtype}"
+            )
+        expected_head_size = impl.kv_lora_rank + impl.qk_rope_head_dim
+        if kv_c_and_k_pe_cache.shape[-1] != expected_head_size:
             raise ValueError(
-                "PCP latent-prefix context lengths must match query rows: "
-                f"context_lens={context_lens.shape[0]} query={batch}"
+                "Unexpected MLA KV-cache head size for latent PCP context: "
+                f"got={kv_c_and_k_pe_cache.shape[-1]}, expected={expected_head_size}"
             )
 
         q_nope, q_pe = q.split(
             [impl.qk_nope_head_dim, impl.qk_rope_head_dim], dim=-1
         )
         ql_nope = torch.bmm(q_nope.transpose(0, 1), w_uk_t).transpose(0, 1)
-        latent_q = torch.cat((ql_nope, q_pe), dim=-1)
 
-        # Use a fixed 256-row allocation shape. The caching allocator can reuse
-        # these same-sized buffers across continuation tiles, avoiding a sequence
-        # of differently-sized workspaces at the tail of each scheduler step.
-        capacity = _PCP_LATENT_CONTEXT_QUERY_CHUNK
-        latent_out_storage = torch.empty(
-            capacity,
+        page_size = kv_c_and_k_pe_cache.shape[1]
+        context_len = int(context_len_row.reshape(-1)[0].item())
+        if context_len < 0:
+            raise ValueError(f"cached-prefix context length must be >= 0, got {context_len}")
+        if context_len == 0:
+            context_output = q.new_zeros(
+                (num_tokens, impl.num_heads, impl.v_head_dim)
+            )
+            context_lse = torch.full(
+                (impl.num_heads, num_tokens),
+                float("-inf"),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            return context_output, context_lse
+
+        runtime = _get_flashinfer_latent_prefix_runtime(
+            device=q.device,
+            q_dtype=q.dtype,
+            kv_dtype=kv_c_and_k_pe_cache.dtype,
+            num_heads=impl.num_heads,
+            kv_lora_rank=impl.kv_lora_rank,
+            qk_rope_head_dim=impl.qk_rope_head_dim,
+            page_size=page_size,
+            scale=impl.scale,
+        )
+        runtime.ensure_plan(
+            plan_key=plan_key,
+            q_len=num_tokens,
+            context_len=context_len,
+            block_table_row=block_table_row,
+        )
+
+        ckv_cache = kv_c_and_k_pe_cache[..., : impl.kv_lora_rank]
+        kpe_cache = kv_c_and_k_pe_cache[..., impl.kv_lora_rank :]
+        latent_out, lse = runtime.wrapper.run(
+            ql_nope,
+            q_pe,
+            ckv_cache,
+            kpe_cache,
+            return_lse=True,
+            return_lse_base_on_e=True,
+        )
+        if tuple(latent_out.shape) != (
+            num_tokens,
             impl.num_heads,
             impl.kv_lora_rank,
-            dtype=q.dtype,
-            device=q.device,
-        )
-        # merge_attn_states' CUDA path consumes LSE values as float32. Keep the
-        # latent producer on that contract even when model activations are BF16.
-        lse_storage = torch.empty(
-            capacity, impl.num_heads, dtype=torch.float32, device=q.device
-        )
-        attn_logits_storage = torch.empty(
-            capacity,
-            impl.num_heads,
-            1,
-            impl.kv_lora_rank + 1,
-            dtype=torch.float32,
-            device=q.device,
-        )
-        context_output_storage = torch.empty(
-            capacity,
+        ):
+            raise ValueError(
+                "FlashInfer latent-prefix output shape mismatch: "
+                f"got={tuple(latent_out.shape)} expected="
+                f"{(num_tokens, impl.num_heads, impl.kv_lora_rank)}"
+            )
+        if tuple(lse.shape) != (num_tokens, impl.num_heads):
+            raise ValueError(
+                "FlashInfer latent-prefix LSE shape mismatch: "
+                f"got={tuple(lse.shape)} expected={(num_tokens, impl.num_heads)}"
+            )
+
+        context_output = torch.empty(
+            num_tokens,
             impl.num_heads,
             impl.v_head_dim,
             dtype=q.dtype,
             device=q.device,
         )
-        latent_out = latent_out_storage[:batch]
-        lse = lse_storage[:batch]
-        attn_logits = attn_logits_storage[:batch]
-
-        cache = kv_c_and_k_pe_cache.unsqueeze(2)
-        kv_c_cache = cache[..., : impl.kv_lora_rank]
-        page_size = cache.size(1)
-
-        # The Triton stage-1 kernel indexes B_Seqlen as a contiguous vector, so
-        # context_lens must be materialized even when all rows share one value.
-        context_lens = context_lens.contiguous()
-        empty_context = context_lens == 0
-        safe_context_lens = context_lens.clamp_min(1).contiguous()
-        decode_attention_fwd(
-            latent_q,
-            cache,
-            kv_c_cache,
-            latent_out,
-            lse,
-            block_table,
-            safe_context_lens,
-            attn_logits,
-            1,
-            impl.scale,
-            page_size,
-            k_scale=k_scale,
-            v_scale=k_scale,
-            is_mla=True,
-        )
-        latent_out.masked_fill_(empty_context[:, None, None], 0)
-        lse.masked_fill_(empty_context[:, None], float("-inf"))
-
-        context_output = context_output_storage[:batch]
         torch.bmm(
             latent_out.transpose(0, 1),
             w_uv,
             out=context_output.transpose(0, 1),
         )
-        # merge_attn_states consumes [heads, tokens]. Make the transposed LSE
-        # explicit and contiguous so it cannot inherit a fragile stride pattern.
         return context_output, lse.transpose(0, 1).contiguous()
 
 
 class PCPMLAImplMixin:
     """Dense MLA PCP override shared by wrapped upstream MLA implementations."""
 
-    pcp_prefix_engine = TritonPCPLatentPrefixEngine
+    pcp_prefix_engine = FlashInferPCPLatentPrefixEngine
     pcp_latent_strict = False
 
     def _pcp_latent_context_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -368,57 +535,49 @@ class PCPMLAImplMixin:
                 output_scale,
             )
 
-        # Correctness-first single-request continuation path. Avoid the former
-        # per-query block_table.index_select completely: one canonical block-table
-        # row is exposed with stride 0, which the Triton kernel supports because
-        # it receives stride_req_to_tokens_b explicitly. Context lengths are
-        # materialized contiguously because that kernel indexes B_Seqlen directly.
+        # Single-request PCP exposes one canonical page-table row and one cached
+        # prefix length. FlashInfer consumes the whole local query span at once;
+        # its internal planner owns split-K / incremental-prefill scheduling.
         block_table_row = prefill_metadata.block_table[:1]
         context_len_row = chunked.context_lens[:1]
-        final_output = output.view(-1, self.num_heads, self.v_head_dim)
-
-        for start in range(0, q.shape[0], _PCP_LATENT_CONTEXT_QUERY_CHUNK):
-            end = min(start + _PCP_LATENT_CONTEXT_QUERY_CHUNK, q.shape[0])
-            tile_rows = end - start
-            block_table_chunk = block_table_row.expand(tile_rows, -1)
-            context_lens_chunk = context_len_row.expand(tile_rows).contiguous()
+        try:
             context_output, context_lse = self.pcp_prefix_engine.run(
                 self,
-                q[start:end],
+                q,
                 kv_c_and_k_pe_cache,
-                block_table_chunk,
-                context_lens_chunk,
+                block_table_row,
+                context_len_row,
                 w_uk_t,
                 w_uv,
+                plan_key=prefill_metadata,
+            )
+            _validate_pcp_merge_lse(
+                "prefix",
+                context_lse,
+                num_heads=self.num_heads,
+                num_tokens=q.shape[0],
+                device=q.device,
+            )
+        except (NotImplementedError, ValueError) as exc:
+            return self._pcp_fallback_forward(
+                str(exc),
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
                 k_scale,
+                output,
+                output_scale,
             )
-            try:
-                _validate_pcp_merge_lse(
-                    "prefix",
-                    context_lse,
-                    num_heads=self.num_heads,
-                    num_tokens=tile_rows,
-                    device=q.device,
-                )
-            except ValueError as exc:
-                return self._pcp_fallback_forward(
-                    str(exc),
-                    q,
-                    kv_c_normed,
-                    k_pe,
-                    kv_c_and_k_pe_cache,
-                    attn_metadata,
-                    k_scale,
-                    output,
-                    output_scale,
-                )
-            merge_attn_states(
-                output=final_output[start:end],
-                prefix_output=context_output,
-                prefix_lse=context_lse,
-                suffix_output=suffix_output[start:end],
-                suffix_lse=suffix_lse[:, start:end],
-            )
+
+        merge_attn_states(
+            output=output.view(-1, self.num_heads, self.v_head_dim),
+            prefix_output=context_output,
+            prefix_lse=context_lse,
+            suffix_output=suffix_output,
+            suffix_lse=suffix_lse,
+        )
 
 
 @cache
