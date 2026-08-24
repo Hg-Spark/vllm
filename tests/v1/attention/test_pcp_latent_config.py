@@ -129,10 +129,9 @@ def test_flashinfer_latent_prefix_uses_full_query_and_reuses_plan(
     pcp_mla._FLASHINFER_LATENT_PREFIX_RUNTIMES.clear()
     monkeypatch.setattr(pcp_mla, "_flashinfer_mla_wrapper_cls", lambda: FakeMLAWrapper)
     monkeypatch.setattr(
-        pcp_mla.envs,
-        "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE",
+        pcp_mla,
+        "_PCP_FLASHINFER_MLA_WORKSPACE_BYTES",
         4096,
-        raising=False,
     )
 
     impl = SimpleNamespace(
@@ -147,7 +146,7 @@ def test_flashinfer_latent_prefix_uses_full_query_and_reuses_plan(
     q = torch.randn(num_tokens, 2, 4, dtype=torch.bfloat16)
     cache = torch.randn(2, 16, 5, dtype=torch.bfloat16)
     block_table = torch.tensor([[0, 1]], dtype=torch.int32)
-    context_len = torch.tensor([17], dtype=torch.int32)
+    context_len = 17
     w_uk_t = torch.randn(2, 3, 4, dtype=torch.bfloat16)
     w_uv = torch.randn(2, 4, 2, dtype=torch.bfloat16)
     plan_key = object()
