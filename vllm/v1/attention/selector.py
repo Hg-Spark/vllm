@@ -58,6 +58,43 @@ class AttentionSelectorConfig(NamedTuple):
         )
 
 
+def _parse_pcp_latent_mla_config(additional_config: object) -> tuple[bool, bool]:
+    """Return (enabled, strict) for the PCP latent-prefix MLA experiment.
+
+    Accepted forms in ``--additional-config``::
+
+        {"pcp_latent_mla": true}
+        {"pcp_latent_mla": {"enabled": true, "strict": false}}
+
+    ``strict=true`` converts every compatibility fallback into a startup/runtime
+    error carrying the same diagnostic text that permissive mode logs.
+    """
+    if not isinstance(additional_config, dict):
+        return False, False
+    raw = additional_config.get("pcp_latent_mla")
+    if raw is None:
+        return False, False
+    if isinstance(raw, bool):
+        return raw, False
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "pcp_latent_mla must be a bool or an object containing "
+            f"enabled/strict, got {type(raw).__name__}: {raw!r}"
+        )
+    unknown = set(raw) - {"enabled", "strict"}
+    if unknown:
+        raise ValueError(f"unsupported pcp_latent_mla keys: {sorted(unknown)}")
+    enabled = raw.get("enabled", True)
+    strict = raw.get("strict", False)
+    if not isinstance(enabled, bool) or not isinstance(strict, bool):
+        raise ValueError(
+            "pcp_latent_mla.enabled and pcp_latent_mla.strict must be bools"
+        )
+    if strict and not enabled:
+        raise ValueError("pcp_latent_mla.strict=true requires enabled=true")
+    return enabled, strict
+
+
 def get_attn_spec_kind(
     use_mla: bool,
     has_sliding_window: bool,
@@ -154,6 +191,9 @@ def get_attn_backend(
         use_kv_connector=use_kv_connector,
         use_pcp=vllm_config.parallel_config.prefill_context_parallel_size > 1,
     )
+    pcp_latent_mla_enabled, pcp_latent_mla_strict = _parse_pcp_latent_mla_config(
+        vllm_config.additional_config
+    )
 
     # A per-KV-group override (keyed by KVCacheSpecKind) takes precedence over
     # the global backend; kinds not present in the map fall back to it.
@@ -171,6 +211,8 @@ def get_attn_backend(
         backend=backend,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
+        pcp_latent_mla_enabled=pcp_latent_mla_enabled,
+        pcp_latent_mla_strict=pcp_latent_mla_strict,
     )
 
 
@@ -179,6 +221,8 @@ def _cached_get_attn_backend(
     backend,
     attn_selector_config: AttentionSelectorConfig,
     num_heads: int | None = None,
+    pcp_latent_mla_enabled: bool = False,
+    pcp_latent_mla_strict: bool = False,
 ) -> type[AttentionBackend]:
     from vllm.platforms import current_platform
 
@@ -192,6 +236,52 @@ def _cached_get_attn_backend(
             f"Invalid attention backend for {current_platform.device_name}"
         )
     backend = resolve_obj_by_qualname(attention_cls)
+
+    if pcp_latent_mla_enabled:
+        reason = None
+        if not attn_selector_config.use_pcp:
+            reason = "prefill context parallelism is not enabled"
+        elif not attn_selector_config.use_mla:
+            reason = "selected attention is not MLA"
+        elif attn_selector_config.use_sparse:
+            reason = "sparse MLA is outside the latent-prefix correctness scope"
+
+        if reason is None:
+            try:
+                from vllm.v1.attention.backends.mla.pcp_mla import (
+                    get_pcp_mla_backend,
+                )
+
+                native_backend = backend
+                backend = get_pcp_mla_backend(
+                    native_backend, strict=pcp_latent_mla_strict
+                )
+                logger.info_once(
+                    "PCP LATENT MLA ACTIVE: native_backend=%s wrapper=%s "
+                    "strict=%s scope=dense-MLA/single-request-continuation/DCP1",
+                    f"{native_backend.__module__}.{native_backend.__qualname__}",
+                    f"{backend.__module__}.{backend.__qualname__}",
+                    pcp_latent_mla_strict,
+                )
+            except (ImportError, NotImplementedError) as exc:
+                reason = str(exc)
+
+        if reason is not None:
+            message = (
+                "PCP LATENT MLA FALLBACK: requested=enabled "
+                f"strict={pcp_latent_mla_strict} reason={reason}; "
+                f"fallback_backend={backend.__module__}.{backend.__qualname__}; "
+                "fallback_path=native-expanded-prefix"
+            )
+            if pcp_latent_mla_strict:
+                raise RuntimeError(message)
+            logger.warning_once(message)
+    elif attn_selector_config.use_pcp and attn_selector_config.use_mla:
+        logger.info_once(
+            "PCP LATENT MLA DISABLED: config pcp_latent_mla is not enabled; "
+            "backend=%s path=native-expanded-prefix",
+            f"{backend.__module__}.{backend.__qualname__}",
+        )
 
     # Adjust kv cache layout if the selected backend requires a specific one
     required_layout = backend.get_required_kv_cache_layout()
