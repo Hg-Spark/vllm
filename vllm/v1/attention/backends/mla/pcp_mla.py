@@ -8,8 +8,8 @@ and normal decode. PCP replaces only cached-prefix chunked-context
 materialization with FlashInfer's absorbed paged-MLA incremental-prefill path.
 """
 
-from functools import cache
 import sys
+from functools import cache
 
 import torch
 
@@ -278,7 +278,10 @@ class FlashInferPCPLatentPrefixEngine:
         page_size = kv_c_and_k_pe_cache.shape[1]
         context_len = int(context_len_row.reshape(-1)[0].item())
         if context_len < 0:
-            raise ValueError(f"cached-prefix context length must be >= 0, got {context_len}")
+            raise ValueError(
+                "cached-prefix context length must be >= 0, "
+                f"got {context_len}"
+            )
         if context_len == 0:
             context_output = q.new_zeros(
                 (num_tokens, impl.num_heads, impl.v_head_dim)
