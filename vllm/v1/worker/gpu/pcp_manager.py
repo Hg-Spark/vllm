@@ -34,8 +34,8 @@ def weighted_partition_lengths(
     """Partition tokens using cumulative weighted, optionally page-aligned cuts.
 
     Alignment is applied to cumulative absolute boundaries instead of rounding
-    each segment independently. This keeps the partition lossless while making
-    long-prefill boundaries line up with KV-cache pages.
+    each segment independently. When there are at least as many tokens as PCP
+    ranks, every positive-weight rank receives at least one real token.
     """
     if num_tokens < 0:
         raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
@@ -61,6 +61,17 @@ def weighted_partition_lengths(
         )
         for segment in order[:remainder]:
             lengths[segment] += 1
+
+        # Extremely skewed weights can otherwise round a rank to zero even when
+        # the chunk has enough real tokens for every PCP rank. Repair by moving
+        # one token from the largest donor; this affects only the rounding tail.
+        if num_tokens >= num_segments:
+            for empty in [i for i, length in enumerate(lengths) if length == 0]:
+                donor = max(range(num_segments), key=lambda i: (lengths[i], -i))
+                if lengths[donor] <= 1:
+                    raise AssertionError("PCP positive partition has no donor")
+                lengths[donor] -= 1
+                lengths[empty] += 1
         return tuple(lengths)
 
     require_positive = (
@@ -155,13 +166,7 @@ class RankSegment:
 
 
 class PCPManager:
-    """MRV2 PC batch manager.
-
-    The model runner keeps the global scheduled batch. This manager rewrites only
-    the per-step InputBatch into contiguous rank-local prefill rows and keeps the
-    global-batch view private to restore to the global batch shape before
-    sampling/postprocess.
-    """
+    """MRV2 PC batch manager with per-step contiguous PCP ownership."""
 
     def __init__(
         self,
@@ -201,11 +206,10 @@ class PCPManager:
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
+        self._collective_num_tokens = 0
+        self._hidden_collective_scratch: torch.Tensor | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
-        # Keep the existing capacity for now. Contiguous PCP needs at most one
-        # prefill row per request, but retaining the old 2x allocation avoids
-        # coupling this partition change to CUDA-graph/input-buffer sizing.
         max_num_local_reqs = 2 * max_num_reqs if max_num_reqs is not None else None
         self._input_buffers = (
             InputBuffers(max_num_local_reqs, max_num_tokens, device)
@@ -302,10 +306,6 @@ class PCPManager:
         is_prefilling: np.ndarray,
         query_start_loc_np: np.ndarray,
     ) -> list[RankSegment]:
-        """Move pure prefills last to match the batch ordering expected by
-        attention backends like MLA and sparse MLA.
-        """
-
         def is_pure_prefill(segment: RankSegment) -> bool:
             req_idx = segment.global_batch_req_idx
             start_pos = (
@@ -337,11 +337,10 @@ class PCPManager:
     ) -> list[RankSegment]:
         """Build one contiguous prefill row per request for one PCP rank.
 
-        Prefill tokens are partitioned directly across PCP ranks. Long-prefill
-        boundaries use cumulative weighted page rounding, so rank weights can
-        compensate for causal-attention imbalance without creating the two
-        disjoint rows per rank that make MLA re-gather/re-project overlapping
-        context. Decode tokens remain replicated on every PCP rank.
+        Normal scheduler chunks are partitioned across all ranks. A tail shorter
+        than PCP world size is replicated because there are not enough distinct
+        tokens to keep every rank non-empty; this removes the old slice(0, 0)
+        compatibility request without introducing an idle-owner execution mode.
         """
         rank_segments = []
         rank_offset = 0
@@ -353,23 +352,36 @@ class PCPManager:
             global_batch_start = int(query_start_loc_np[global_batch_req_idx])
             chunk_indices: tuple[int, ...]
             if bool(is_prefilling[global_batch_req_idx]):
-                alignment = self._page_alignment
-                if query_len < num_chunks * alignment:
-                    alignment = 1
-                chunk_lengths = weighted_partition_lengths(
-                    query_len,
-                    self._partition_weights,
-                    start_pos=int(num_computed_tokens[global_batch_req_idx]),
-                    alignment=alignment,
-                )
-                chunk_offsets = [0] * num_chunks
-                running = 0
-                for chunk_idx, chunk_len in enumerate(chunk_lengths):
-                    chunk_offsets[chunk_idx] = running
-                    running += chunk_len
-                assert running == query_len
-                chunk_indices = (rank,)
-            else:  # decodes are replicated
+                if query_len < num_chunks:
+                    # Replicate a tiny tail on every rank. The work is bounded by
+                    # PCP size-1 tokens and preserves the non-empty model contract.
+                    chunk_lengths = (query_len,)
+                    chunk_offsets = (0,)
+                    chunk_indices = (0,)
+                else:
+                    alignment = self._page_alignment
+                    start_pos = int(num_computed_tokens[global_batch_req_idx])
+                    if query_len < num_chunks * alignment or start_pos % alignment:
+                        alignment = 1
+                    chunk_lengths = weighted_partition_lengths(
+                        query_len,
+                        self._partition_weights,
+                        start_pos=start_pos,
+                        alignment=alignment,
+                    )
+                    chunk_offsets = [0] * num_chunks
+                    running = 0
+                    for chunk_idx, chunk_len in enumerate(chunk_lengths):
+                        chunk_offsets[chunk_idx] = running
+                        running += chunk_len
+                    assert running == query_len
+                    if any(length <= 0 for length in chunk_lengths):
+                        raise AssertionError(
+                            "PCP non-tiny prefill partition produced an empty rank: "
+                            f"lengths={chunk_lengths}, query_len={query_len}"
+                        )
+                    chunk_indices = (rank,)
+            else:
                 chunk_lengths = (query_len,)
                 chunk_offsets = (0,)
                 chunk_indices = (0,)
@@ -418,38 +430,30 @@ class PCPManager:
             segments_by_rank.append(segments)
             per_rank_num_tokens.append(num_rank_tokens)
 
-        # PCP=2 example:
-        #   global batch:       [A B C D E F G]
-        #   rank 0 / rank 1:    [A B G] / [C D E F]
-        #   padded gathered:    [A B G _ | C D E F]
-        #   hidden_restore_idx: [0, 1, 4, 5, 6, 7, 2]
-        #   padded_gather_idx:  [0, 1, 6, 0, 2, 3, 4, 5]
-        # Therefore global = gathered[hidden_restore_idx] and
-        # padded_gathered = global[padded_gather_idx].
         hidden_restore_idx = np.empty(int(query_start_loc_np[-1]), dtype=np.int64)
-        padded_num_tokens = max(per_rank_num_tokens)
-        num_expanded_tokens = padded_num_tokens * self.pcp_world_size
+        collective_num_tokens = max(per_rank_num_tokens, default=0)
+        self._collective_num_tokens = collective_num_tokens
+        num_expanded_tokens = collective_num_tokens * self.pcp_world_size
         padded_gather_idx = np.zeros(num_expanded_tokens, dtype=np.int64)
         gathered_kv_write_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
         for rank, segments in enumerate(segments_by_rank):
-            expanded_rank_offset = rank * padded_num_tokens
+            expanded_rank_offset = rank * collective_num_tokens
             for segment in segments:
-                padded_gathered_slice = slice(
+                gathered_slice = slice(
                     expanded_rank_offset + segment.rank_local_batch_slice.start,
                     expanded_rank_offset + segment.rank_local_batch_slice.stop,
                 )
-                padded_gather_idx[padded_gathered_slice] = np.arange(
+                padded_gather_idx[gathered_slice] = np.arange(
                     segment.global_batch_slice.start,
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
-                # Cache insertion pairs one slot entry with each rank's local decode.
                 if not bool(is_prefilling[segment.global_batch_req_idx]) and rank != 0:
                     continue
-                gathered_kv_write_mask[padded_gathered_slice] = True
+                gathered_kv_write_mask[gathered_slice] = True
                 hidden_restore_idx[segment.global_batch_slice] = np.arange(
-                    padded_gathered_slice.start,
-                    padded_gathered_slice.stop,
+                    gathered_slice.start,
+                    gathered_slice.stop,
                     dtype=np.int64,
                 )
 
@@ -488,13 +492,10 @@ class PCPManager:
 
         local_segments = segments_by_rank[self.pcp_rank]
         if not local_segments:
-            local_segments = [
-                RankSegment(
-                    global_batch_req_idx=0,
-                    global_batch_slice=slice(0, 0),
-                    rank_local_batch_slice=slice(0, 0),
-                )
-            ]
+            raise RuntimeError(
+                "PCP produced an empty local batch. Non-tiny prefills must give "
+                "every rank real tokens and tiny tails are replicated."
+            )
 
         num_local_reqs = len(local_segments)
         if num_local_reqs > input_buffers.max_num_reqs:
@@ -532,7 +533,6 @@ class PCPManager:
         ]
 
         num_local_tokens = int(local_num_scheduled_tokens.sum())
-        num_local_tokens_padded = max(per_rank_num_tokens)
         fresh_prefills = int(
             np.count_nonzero(is_prefilling & (num_computed_tokens == 0))
         )
@@ -542,7 +542,7 @@ class PCPManager:
         logger.debug(
             "PCP batch: rank=%d global_batch_reqs=%d fresh_prefills=%d "
             "continued_prefills=%d decodes=%d local_reqs=%d "
-            "local_tokens=%d per_rank_tokens=%s",
+            "local_tokens=%d collective_width=%d per_rank_tokens=%s",
             self.pcp_rank,
             global_batch.num_reqs,
             fresh_prefills,
@@ -550,23 +550,24 @@ class PCPManager:
             global_batch.num_reqs - fresh_prefills - continued_prefills,
             num_local_reqs,
             num_local_tokens,
+            self._collective_num_tokens,
             per_rank_num_tokens,
         )
-        if num_local_tokens_padded > input_buffers.max_num_tokens:
+        if num_local_tokens > input_buffers.max_num_tokens:
             raise RuntimeError(
                 "PCP local token count exceeds the MRV2 input buffer size: "
-                f"{num_local_tokens_padded} > {input_buffers.max_num_tokens}."
+                f"{num_local_tokens} > {input_buffers.max_num_tokens}."
             )
-        rank_token_start = self.pcp_rank * num_local_tokens_padded
+        rank_token_start = self.pcp_rank * self._collective_num_tokens
         assert self._padded_gather_idx is not None
         local_gather_idx = self._padded_gather_idx[
-            rank_token_start : rank_token_start + num_local_tokens_padded
+            rank_token_start : rank_token_start + num_local_tokens
         ]
         torch.index_select(
             global_batch.input_ids,
             0,
             local_gather_idx,
-            out=input_buffers.input_ids[:num_local_tokens_padded],
+            out=input_buffers.input_ids[:num_local_tokens],
         )
 
         local_query_start_loc_np = np.empty(
@@ -593,16 +594,8 @@ class PCPManager:
             input_buffers.seq_lens[:num_local_reqs],
         )
         seq_lens = input_buffers.seq_lens[:num_local_reqs]
-        is_padding = input_buffers.is_padding[:num_local_tokens_padded]
-        is_padding[:num_local_tokens].fill_(False)
-        is_padding[num_local_tokens:].fill_(True)
-        if num_local_tokens_padded > num_local_tokens:
-            input_buffers.input_ids[:num_local_tokens_padded].masked_fill_(
-                is_padding, 0
-            )
-            input_buffers.positions[:num_local_tokens_padded].masked_fill_(
-                is_padding, 0
-            )
+        is_padding = input_buffers.is_padding[:num_local_tokens]
+        is_padding.fill_(False)
 
         total_num_logits = num_local_reqs if num_local_tokens > 0 else 0
         if total_num_logits > 0:
@@ -665,7 +658,7 @@ class PCPManager:
             ),
             num_scheduled_tokens=local_num_scheduled_tokens,
             num_tokens=num_local_tokens,
-            num_tokens_after_padding=num_local_tokens_padded,
+            num_tokens_after_padding=num_local_tokens,
             num_draft_tokens=0,
             num_draft_tokens_per_req=None,
             query_start_loc=local_query_start_loc,
@@ -680,8 +673,8 @@ class PCPManager:
             max_seq_len_np=global_batch.max_seq_len_np[local_to_global_batch_req_idx_np]
             if global_batch.max_seq_len_np is not None
             else None,
-            input_ids=input_buffers.input_ids[:num_local_tokens_padded],
-            positions=input_buffers.positions[:num_local_tokens_padded],
+            input_ids=input_buffers.input_ids[:num_local_tokens],
+            positions=input_buffers.positions[:num_local_tokens],
             is_padding=is_padding,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
@@ -755,7 +748,32 @@ class PCPManager:
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._hidden_restore_idx is None:
             return hidden_states
-        gathered = get_pcp_group().all_gather(hidden_states, dim=0)
+        collective_num_tokens = self._collective_num_tokens
+        if hidden_states.shape[0] > collective_num_tokens:
+            raise RuntimeError(
+                "PCP hidden-state width exceeds the collective slab: "
+                f"{hidden_states.shape[0]} > {collective_num_tokens}"
+            )
+        if hidden_states.shape[0] < collective_num_tokens:
+            wanted_shape = (collective_num_tokens, *hidden_states.shape[1:])
+            scratch = self._hidden_collective_scratch
+            if (
+                scratch is None
+                or scratch.dtype != hidden_states.dtype
+                or scratch.device != hidden_states.device
+                or scratch.shape[1:] != hidden_states.shape[1:]
+                or scratch.shape[0] < collective_num_tokens
+            ):
+                scratch = hidden_states.new_empty(wanted_shape)
+                self._hidden_collective_scratch = scratch
+            collective_hidden_states = scratch[:collective_num_tokens]
+            local_tokens = hidden_states.shape[0]
+            if local_tokens:
+                collective_hidden_states[:local_tokens].copy_(hidden_states)
+            collective_hidden_states[local_tokens:].zero_()
+        else:
+            collective_hidden_states = hidden_states
+        gathered = get_pcp_group().all_gather(collective_hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 
     def restore_for_sampling(

@@ -19,6 +19,55 @@ _PCP_CROSS_LAYER_OVERLAP = os.getenv("PCP_CROSS_LAYER_OVERLAP", "0").strip().low
 _PCP_CACHE_COMM_STREAMS: dict[int, torch.cuda.Stream] = {}
 _PCP_CACHE_WRITE_EVENTS: dict[int, torch.cuda.Event] = {}
 _PCP_PENDING_CACHE_WRITES: set[int] = set()
+# Padding exists only at the collective ABI. Reuse scratch per execution stream
+# so uneven weighted partitions do not allocate/copy a fresh slab every layer.
+_PCP_COLLECTIVE_SCRATCH: dict[
+    tuple[int, int, torch.dtype, tuple[int, ...]], torch.Tensor
+] = {}
+
+
+def _collective_scratch(
+    tensor: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    if tensor.device.type == "cuda":
+        device_index = tensor.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        stream_id = int(torch.cuda.current_stream(tensor.device).cuda_stream)
+    else:
+        device_index = -1
+        stream_id = 0
+    key = (device_index, stream_id, tensor.dtype, tuple(tensor.shape[1:]))
+    scratch = _PCP_COLLECTIVE_SCRATCH.get(key)
+    if scratch is None or scratch.shape[0] < num_tokens:
+        scratch = tensor.new_empty((num_tokens, *tensor.shape[1:]))
+        _PCP_COLLECTIVE_SCRATCH[key] = scratch
+    return scratch[:num_tokens]
+
+
+def _pad_prefill_for_collective(
+    tensor: torch.Tensor,
+    num_decode_tokens: int,
+    collective_num_tokens: int,
+) -> torch.Tensor:
+    """Pad only the collective payload using reusable stream-local storage."""
+    local_prefill = tensor[num_decode_tokens:]
+    collective_prefill_tokens = collective_num_tokens - num_decode_tokens
+    if collective_prefill_tokens < local_prefill.shape[0]:
+        raise RuntimeError(
+            "PCP collective slab is smaller than the local prefill payload: "
+            f"collective={collective_prefill_tokens}, local={local_prefill.shape[0]}"
+        )
+    if collective_prefill_tokens == local_prefill.shape[0]:
+        return local_prefill.contiguous()
+
+    padded = _collective_scratch(tensor, collective_prefill_tokens)
+    local_prefill_tokens = local_prefill.shape[0]
+    if local_prefill_tokens:
+        padded[:local_prefill_tokens].copy_(local_prefill)
+    padded[local_prefill_tokens:].zero_()
+    return padded
 
 
 def _gather_prefill_cache_inputs(
@@ -26,7 +75,13 @@ def _gather_prefill_cache_inputs(
     slot_mapping: torch.Tensor,
     num_decode_tokens: int,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-    """Keep replicated decode writes local and gather partitioned prefills."""
+    """Keep replicated decode writes local and gather partitioned prefills.
+
+    Weighted PCP ranks may execute different token counts. The model consumes
+    only each rank's real tokens; equal-width padding is introduced only at the
+    collective boundary. PAD_SLOT_ID entries prevent padded values from being
+    committed to KV cache.
+    """
     local_num_tokens = tensors[0].shape[0]
     assert all(tensor.shape[0] == local_num_tokens for tensor in tensors)
     assert 0 <= num_decode_tokens <= local_num_tokens
@@ -35,12 +90,32 @@ def _gather_prefill_cache_inputs(
         return tensors, slot_mapping[:num_decode_tokens]
 
     pcp_group = get_pcp_group()
+    pcp_size = pcp_group.world_size
+    flat_slot_mapping = slot_mapping.reshape(-1)
+    if flat_slot_mapping.numel() % pcp_size != 0:
+        raise RuntimeError(
+            "PCP slot mapping does not contain equal collective slabs: "
+            f"slots={flat_slot_mapping.numel()}, world_size={pcp_size}"
+        )
+    collective_num_tokens = flat_slot_mapping.numel() // pcp_size
+    if local_num_tokens > collective_num_tokens:
+        raise RuntimeError(
+            "PCP local token count exceeds the collective slab: "
+            f"local={local_num_tokens}, collective={collective_num_tokens}"
+        )
+
     gathered_prefills = tuple(
-        pcp_group.all_gather(tensor[num_decode_tokens:].contiguous(), dim=0)
+        pcp_group.all_gather(
+            _pad_prefill_for_collective(
+                tensor,
+                num_decode_tokens,
+                collective_num_tokens,
+            ),
+            dim=0,
+        )
         for tensor in tensors
     )
-    pcp_size = pcp_group.world_size
-    gathered_slot_mapping = slot_mapping[: pcp_size * local_num_tokens]
+    gathered_slot_mapping = flat_slot_mapping[: pcp_size * collective_num_tokens]
     if num_decode_tokens == 0:
         return gathered_prefills, gathered_slot_mapping
 
@@ -48,7 +123,7 @@ def _gather_prefill_cache_inputs(
         torch.cat((tensor[:num_decode_tokens], gathered_prefill), dim=0)
         for tensor, gathered_prefill in zip(tensors, gathered_prefills)
     )
-    rank_slot_mappings = gathered_slot_mapping.view(pcp_size, local_num_tokens)
+    rank_slot_mappings = gathered_slot_mapping.view(pcp_size, collective_num_tokens)
     cache_slot_mapping = torch.cat(
         (
             rank_slot_mappings[0, :num_decode_tokens],
@@ -132,12 +207,9 @@ def maybe_launch_mla_pcp_cache_update(
 
     _wait_previous_mla_pcp_cache_write(attn_layer, kv_c_normed.device)
 
-    # Decode and mixed decode+prefill are deliberately synchronous because the
-    # attention kernel can consume the just-written cache in the same layer.
     if num_decode_tokens != 0:
         return False
 
-    # No PCP replication or no cache write means there is nothing to overlap.
     if not attn_layer.use_pcp or slot_mapping is None:
         return False
 
@@ -165,8 +237,6 @@ def maybe_launch_mla_pcp_cache_update(
     comm_stream = _pcp_cache_comm_stream(kv_c_normed.device)
     comm_stream.wait_stream(compute_stream)
 
-    # These tensors are produced/owned by the compute stream but remain inputs
-    # to communication after the Python cache-update op returns.
     kv_c_normed.record_stream(comm_stream)
     k_pe.record_stream(comm_stream)
     if slot_mapping.is_cuda:
