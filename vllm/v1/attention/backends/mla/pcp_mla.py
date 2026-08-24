@@ -51,6 +51,26 @@ def split_unquantized_mla_up_weights(
     )
 
 
+def _validate_pcp_merge_lse(
+    name: str,
+    lse: torch.Tensor,
+    *,
+    num_heads: int,
+    num_tokens: int,
+    device: torch.device,
+) -> None:
+    """Validate the LSE contract before PCP calls the existing merge op."""
+    expected_shape = (num_heads, num_tokens)
+    if tuple(lse.shape) != expected_shape:
+        raise ValueError(
+            f"{name} LSE shape must be {expected_shape}, got {tuple(lse.shape)}"
+        )
+    if lse.dtype != torch.float32:
+        raise ValueError(f"{name} LSE must be float32, got {lse.dtype}")
+    if lse.device != device:
+        raise ValueError(f"{name} LSE must be on {device}, got {lse.device}")
+
+
 class TritonPCPLatentPrefixEngine:
     """Compressed-MLA prefix engine reusable by dense top-level backends."""
 
@@ -99,8 +119,10 @@ class TritonPCPLatentPrefixEngine:
             dtype=q.dtype,
             device=q.device,
         )
+        # merge_attn_states' CUDA path consumes LSE values as float32. Keep the
+        # latent producer on that contract even when model activations are BF16.
         lse_storage = torch.empty(
-            capacity, impl.num_heads, dtype=q.dtype, device=q.device
+            capacity, impl.num_heads, dtype=torch.float32, device=q.device
         )
         attn_logits_storage = torch.empty(
             capacity,
@@ -325,6 +347,26 @@ class PCPMLAImplMixin:
             )
         )
         suffix_output = suffix_output[..., : self.v_head_dim]
+        try:
+            _validate_pcp_merge_lse(
+                "suffix",
+                suffix_lse,
+                num_heads=self.num_heads,
+                num_tokens=q.shape[0],
+                device=q.device,
+            )
+        except ValueError as exc:
+            return self._pcp_fallback_forward(
+                str(exc),
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                k_scale,
+                output,
+                output_scale,
+            )
 
         # Correctness-first single-request continuation path. Avoid the former
         # per-query block_table.index_select completely: one canonical block-table
@@ -350,6 +392,26 @@ class PCPMLAImplMixin:
                 w_uv,
                 k_scale,
             )
+            try:
+                _validate_pcp_merge_lse(
+                    "prefix",
+                    context_lse,
+                    num_heads=self.num_heads,
+                    num_tokens=tile_rows,
+                    device=q.device,
+                )
+            except ValueError as exc:
+                return self._pcp_fallback_forward(
+                    str(exc),
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    kv_c_and_k_pe_cache,
+                    attn_metadata,
+                    k_scale,
+                    output,
+                    output_scale,
+                )
             merge_attn_states(
                 output=final_output[start:end],
                 prefix_output=context_output,
