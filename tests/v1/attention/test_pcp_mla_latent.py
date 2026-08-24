@@ -11,7 +11,6 @@ from vllm.model_executor.layers.attention.pcp import _pad_prefill_for_collective
 from vllm.v1.attention.backends.mla.pcp_mla import (
     PCPMLAImplMixin,
     TritonPCPLatentPrefixEngine,
-    choose_pcp_latent_query_chunk,
     get_pcp_mla_backend,
     split_unquantized_mla_up_weights,
 )
@@ -127,9 +126,6 @@ def test_empty_query_defense_precedes_metadata_and_native_fallback() -> None:
     k_pe = torch.empty(0, 1, dtype=torch.bfloat16)
     output = torch.empty(0, 4, dtype=torch.bfloat16)
 
-    # Defense-in-depth contract: the upstream root fix should prevent this call,
-    # but if a future caller dispatches zero rows, the guard must run before
-    # touching prefill metadata or delegating to a native backend.
     impl.forward_mha(
         q,
         kv,
@@ -160,80 +156,3 @@ def test_pcp_model_weight_layout_fails_instead_of_silent_fallback() -> None:
     impl = _dummy_impl(weight_dtype=torch.float32)
     with pytest.raises(NotImplementedError, match="BF16/FP16 kv_b_proj"):
         impl._pcp_latent_context_weights()
-
-
-def test_prefix_workspace_matches_padded_suffix_head_stride() -> None:
-    impl = SimpleNamespace(
-        num_heads=2,
-        kv_lora_rank=4,
-        qk_rope_head_dim=1,
-        v_head_dim=2,
-    )
-    q = torch.empty(8, 2, 4, dtype=torch.bfloat16)
-    block_table = torch.empty(1, 4, dtype=torch.int32)
-    context_lens = torch.empty(1, dtype=torch.int32)
-    workspace = TritonPCPLatentPrefixEngine.allocate_workspace(
-        impl,
-        q,
-        block_table,
-        context_lens,
-        8,
-        copy_block_table_rows=False,
-        output_head_stride=5,
-    )
-    assert workspace.context_output.shape == (8, 2, 2)
-    assert workspace.context_output.stride(1) == 5
-    assert workspace.latent_q.shape == (8, 2, 5)
-
-
-def test_adaptive_chunk_exceeds_old_256_for_dsv3_dims() -> None:
-    chunk = choose_pcp_latent_query_chunk(
-        num_queries=8192,
-        num_heads=128,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        q_element_size=2,
-        block_table_width=0,
-        block_table_element_size=4,
-    )
-    assert 256 < chunk <= 4096
-    assert chunk % 128 == 0
-
-
-def test_adaptive_chunk_accounts_for_block_table_copy_pressure() -> None:
-    no_copy = choose_pcp_latent_query_chunk(
-        num_queries=8192,
-        num_heads=32,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        q_element_size=2,
-        block_table_width=0,
-        block_table_element_size=4,
-    )
-    wide_copy = choose_pcp_latent_query_chunk(
-        num_queries=8192,
-        num_heads=32,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        q_element_size=2,
-        block_table_width=32768,
-        block_table_element_size=4,
-    )
-    assert wide_copy < no_copy
-
-
-def test_adaptive_chunk_keeps_small_query_whole() -> None:
-    chunk = choose_pcp_latent_query_chunk(
-        num_queries=96,
-        num_heads=128,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        q_element_size=2,
-        block_table_width=0,
-        block_table_element_size=4,
-    )
-    assert chunk == 96

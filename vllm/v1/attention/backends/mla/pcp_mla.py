@@ -8,7 +8,6 @@ and normal decode. PCP replaces only cached-prefix chunked-context
 materialization with a common compressed-KV latent-prefix engine.
 """
 
-from dataclasses import dataclass
 from functools import cache
 import sys
 
@@ -24,9 +23,7 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
-_PCP_LATENT_CONTEXT_SCRATCH_BYTES = 256 * 1024 * 1024
-_PCP_LATENT_CONTEXT_MAX_QUERY_CHUNK = 4096
-_PCP_LATENT_CONTEXT_QUERY_GRANULARITY = 128
+_PCP_LATENT_CONTEXT_QUERY_CHUNK = 256
 
 
 def split_unquantized_mla_up_weights(
@@ -51,146 +48,8 @@ def split_unquantized_mla_up_weights(
     )
 
 
-def choose_pcp_latent_query_chunk(
-    *,
-    num_queries: int,
-    num_heads: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-    v_head_dim: int,
-    q_element_size: int,
-    block_table_width: int,
-    block_table_element_size: int,
-    context_output_head_stride: int | None = None,
-    scratch_budget_bytes: int = _PCP_LATENT_CONTEXT_SCRATCH_BYTES,
-) -> int:
-    """Choose a memory-bounded query batch instead of a fixed 256-row loop."""
-    if num_queries <= 0:
-        return 0
-
-    output_width = (
-        v_head_dim if context_output_head_stride is None else context_output_head_stride
-    )
-    # Reused tensor scratch per row: latent_q (L+R), latent_out (L), padded
-    # context output, LSE, split-attention logits, and optional copied page table.
-    q_values_per_row = num_heads * (
-        2 * kv_lora_rank + qk_rope_head_dim + output_width + 1
-    )
-    q_bytes_per_row = q_values_per_row * q_element_size
-    logits_bytes_per_row = num_heads * (kv_lora_rank + 1) * 4
-    block_table_bytes_per_row = block_table_width * block_table_element_size
-    scalar_row_bytes = 2 * 4 + 1  # context len, safe len, empty mask
-    bytes_per_row = max(
-        1,
-        q_bytes_per_row
-        + logits_bytes_per_row
-        + block_table_bytes_per_row
-        + scalar_row_bytes,
-    )
-
-    budget_rows = max(1, scratch_budget_bytes // bytes_per_row)
-    chunk = min(num_queries, budget_rows, _PCP_LATENT_CONTEXT_MAX_QUERY_CHUNK)
-    if chunk >= num_queries:
-        return num_queries
-
-    rounded = (
-        chunk // _PCP_LATENT_CONTEXT_QUERY_GRANULARITY
-    ) * _PCP_LATENT_CONTEXT_QUERY_GRANULARITY
-    return max(1, rounded)
-
-
-@dataclass
-class PCPLatentPrefixWorkspace:
-    latent_q: torch.Tensor
-    latent_out: torch.Tensor
-    lse: torch.Tensor
-    attn_logits: torch.Tensor
-    context_output: torch.Tensor
-    block_table_rows: torch.Tensor | None
-    context_lens_rows: torch.Tensor
-    safe_context_lens_rows: torch.Tensor
-    empty_context_rows: torch.Tensor
-
-
 class TritonPCPLatentPrefixEngine:
     """Compressed-MLA prefix engine reusable by dense top-level backends."""
-
-    @staticmethod
-    def allocate_workspace(
-        impl,
-        q: torch.Tensor,
-        block_table: torch.Tensor,
-        context_lens: torch.Tensor,
-        chunk_size: int,
-        *,
-        copy_block_table_rows: bool,
-        output_head_stride: int,
-    ) -> PCPLatentPrefixWorkspace:
-        if output_head_stride < impl.v_head_dim:
-            raise ValueError(
-                "PCP MLA output head stride cannot be smaller than v_head_dim: "
-                f"stride={output_head_stride}, v_head_dim={impl.v_head_dim}."
-            )
-        block_rows = (
-            torch.empty(
-                chunk_size,
-                block_table.shape[1],
-                dtype=block_table.dtype,
-                device=block_table.device,
-            )
-            if copy_block_table_rows
-            else None
-        )
-        context_output_storage = torch.empty(
-            chunk_size,
-            impl.num_heads,
-            output_head_stride,
-            dtype=q.dtype,
-            device=q.device,
-        )
-        return PCPLatentPrefixWorkspace(
-            latent_q=torch.empty(
-                chunk_size,
-                impl.num_heads,
-                impl.kv_lora_rank + impl.qk_rope_head_dim,
-                dtype=q.dtype,
-                device=q.device,
-            ),
-            latent_out=torch.empty(
-                chunk_size,
-                impl.num_heads,
-                impl.kv_lora_rank,
-                dtype=q.dtype,
-                device=q.device,
-            ),
-            lse=torch.empty(
-                chunk_size,
-                impl.num_heads,
-                dtype=q.dtype,
-                device=q.device,
-            ),
-            attn_logits=torch.empty(
-                chunk_size,
-                impl.num_heads,
-                1,
-                impl.kv_lora_rank + 1,
-                dtype=torch.float32,
-                device=q.device,
-            ),
-            # Preserve a possibly padded suffix head stride. merge_attn_states
-            # requires prefix/suffix output head strides to match exactly.
-            context_output=context_output_storage[..., : impl.v_head_dim],
-            block_table_rows=block_rows,
-            context_lens_rows=torch.empty(
-                chunk_size, dtype=context_lens.dtype, device=context_lens.device
-            ),
-            safe_context_lens_rows=torch.empty(
-                chunk_size, dtype=context_lens.dtype, device=context_lens.device
-            ),
-            empty_context_rows=torch.empty(
-                chunk_size, dtype=torch.bool, device=context_lens.device
-            ),
-        )
 
     @staticmethod
     def run(
@@ -202,33 +61,36 @@ class TritonPCPLatentPrefixEngine:
         w_uk_t: torch.Tensor,
         w_uv: torch.Tensor,
         k_scale: torch.Tensor,
-        workspace: PCPLatentPrefixWorkspace,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q_nope, q_pe = q.split(
             [impl.qk_nope_head_dim, impl.qk_rope_head_dim], dim=-1
         )
+        ql_nope = torch.bmm(q_nope.transpose(0, 1), w_uk_t).transpose(0, 1)
+        latent_q = torch.cat((ql_nope, q_pe), dim=-1)
+
         batch = q.shape[0]
-        latent_q = workspace.latent_q[:batch]
-        latent_q_nope = latent_q[..., : impl.kv_lora_rank]
-        torch.bmm(
-            q_nope.transpose(0, 1),
-            w_uk_t,
-            out=latent_q_nope.transpose(0, 1),
+        latent_out = torch.empty(
+            batch,
+            impl.num_heads,
+            impl.kv_lora_rank,
+            dtype=q.dtype,
+            device=q.device,
         )
-        latent_q[..., impl.kv_lora_rank :].copy_(q_pe)
-
-        latent_out = workspace.latent_out[:batch]
-        lse = workspace.lse[:batch]
-        attn_logits = workspace.attn_logits[:batch]
-        context_output = workspace.context_output[:batch]
-        safe_context_lens = workspace.safe_context_lens_rows[:batch]
-        empty_context = workspace.empty_context_rows[:batch]
-        torch.clamp(context_lens, min=1, out=safe_context_lens)
-        torch.eq(context_lens, 0, out=empty_context)
-
+        lse = torch.empty(batch, impl.num_heads, dtype=q.dtype, device=q.device)
+        attn_logits = torch.empty(
+            batch,
+            impl.num_heads,
+            1,
+            impl.kv_lora_rank + 1,
+            dtype=torch.float32,
+            device=q.device,
+        )
         cache = kv_c_and_k_pe_cache.unsqueeze(2)
         kv_c_cache = cache[..., : impl.kv_lora_rank]
         page_size = cache.size(1)
+
+        empty_context = context_lens == 0
+        safe_context_lens = context_lens.clamp_min(1)
         decode_attention_fwd(
             latent_q,
             cache,
@@ -247,6 +109,14 @@ class TritonPCPLatentPrefixEngine:
         )
         latent_out.masked_fill_(empty_context[:, None, None], 0)
         lse.masked_fill_(empty_context[:, None], float("-inf"))
+
+        context_output = torch.empty(
+            batch,
+            impl.num_heads,
+            impl.v_head_dim,
+            dtype=q.dtype,
+            device=q.device,
+        )
         torch.bmm(
             latent_out.transpose(0, 1),
             w_uv,
@@ -319,15 +189,12 @@ class PCPMLAImplMixin:
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
     ) -> None:
-        # Defense-in-depth only: the root fix represents an idle PCP rank as an
-        # empty local batch upstream, so forward_mha should not be dispatched for
-        # it. Keep this guard first so any future zero-row caller cannot fall
-        # through to a native MLA/FlashAttention backend.
         if q.shape[0] == 0:
             return
 
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
+
         if prefill_metadata.chunked_context is None:
             return super().forward_mha(
                 q,
@@ -339,11 +206,12 @@ class PCPMLAImplMixin:
                 output,
                 output_scale,
             )
+
         self._validate_pcp_latent_context_runtime(q, output_scale)
         assert prefill_metadata.prefill_backend is not None
         w_uk_t, w_uv = self._pcp_latent_context_weights()
 
-        # Local/new KV stays on the upstream-selected MLA prefill backend.
+        # Local/new KV follows the upstream-selected prefill backend.
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
@@ -366,78 +234,26 @@ class PCPMLAImplMixin:
         )
         suffix_output = suffix_output[..., : self.v_head_dim]
 
+        # Cached prefix uses the conservative fixed-size execution shape.
         chunked = prefill_metadata.chunked_context
+        query_lens = (
+            prefill_metadata.query_start_loc[1:]
+            - prefill_metadata.query_start_loc[:-1]
+        )
+        seq_ids = torch.arange(
+            attn_metadata.num_prefills, dtype=torch.long, device=q.device
+        )
+        query_to_seq = torch.repeat_interleave(
+            seq_ids, query_lens, output_size=q.shape[0]
+        )
         context_lens = chunked.context_lens
-        single_request = attn_metadata.num_prefills == 1
-        copied_block_table_width = (
-            0 if single_request else prefill_metadata.block_table.shape[1]
-        )
-        output_head_stride = suffix_output.stride(1)
-        chunk_size = choose_pcp_latent_query_chunk(
-            num_queries=q.shape[0],
-            num_heads=self.num_heads,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            v_head_dim=self.v_head_dim,
-            q_element_size=q.element_size(),
-            block_table_width=copied_block_table_width,
-            block_table_element_size=prefill_metadata.block_table.element_size(),
-            context_output_head_stride=output_head_stride,
-        )
-        workspace = self.pcp_prefix_engine.allocate_workspace(
-            self,
-            q,
-            prefill_metadata.block_table,
-            context_lens,
-            chunk_size,
-            copy_block_table_rows=not single_request,
-            output_head_stride=output_head_stride,
-        )
-
-        query_to_seq = None
-        if not single_request:
-            query_lens = (
-                prefill_metadata.query_start_loc[1:]
-                - prefill_metadata.query_start_loc[:-1]
-            )
-            seq_ids = torch.arange(
-                attn_metadata.num_prefills, dtype=torch.long, device=q.device
-            )
-            query_to_seq = torch.repeat_interleave(
-                seq_ids, query_lens, output_size=q.shape[0]
-            )
-
         final_output = output.view(-1, self.num_heads, self.v_head_dim)
-        for start in range(0, q.shape[0], chunk_size):
-            end = min(start + chunk_size, q.shape[0])
-            batch = end - start
-            context_lens_chunk = workspace.context_lens_rows[:batch]
 
-            if single_request:
-                # decode_attention_fwd honors block-table stride(0); use a
-                # stride-zero view instead of copying the page table for every Q.
-                block_table_chunk = prefill_metadata.block_table[:1].expand(batch, -1)
-                # Its seq_lens input is indexed as a dense vector, so materialize
-                # that scalar into the reusable physical buffer.
-                context_lens_chunk.copy_(context_lens[:1].expand(batch))
-            else:
-                assert query_to_seq is not None
-                assert workspace.block_table_rows is not None
-                seq_idx = query_to_seq[start:end]
-                block_table_chunk = workspace.block_table_rows[:batch]
-                torch.index_select(
-                    prefill_metadata.block_table,
-                    0,
-                    seq_idx,
-                    out=block_table_chunk,
-                )
-                torch.index_select(
-                    context_lens,
-                    0,
-                    seq_idx,
-                    out=context_lens_chunk,
-                )
-
+        for start in range(0, q.shape[0], _PCP_LATENT_CONTEXT_QUERY_CHUNK):
+            end = min(start + _PCP_LATENT_CONTEXT_QUERY_CHUNK, q.shape[0])
+            seq_idx = query_to_seq[start:end]
+            block_table_chunk = prefill_metadata.block_table.index_select(0, seq_idx)
+            context_lens_chunk = context_lens.index_select(0, seq_idx)
             context_output, context_lse = self.pcp_prefix_engine.run(
                 self,
                 q[start:end],
@@ -447,7 +263,6 @@ class PCPMLAImplMixin:
                 w_uk_t,
                 w_uv,
                 k_scale,
-                workspace,
             )
             merge_attn_states(
                 output=final_output[start:end],
