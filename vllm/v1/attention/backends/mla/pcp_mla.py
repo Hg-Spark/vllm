@@ -13,7 +13,6 @@ from functools import cache
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
@@ -25,6 +24,11 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 logger = init_logger(__name__)
+
+# FlashInfer documents 128 MiB as the recommended workspace for
+# BatchMLAPagedAttentionWrapper. Keep a single module-shared allocation instead
+# of inheriting vLLM's larger general FlashInfer workspace (394 MiB by default).
+_PCP_FLASHINFER_MLA_WORKSPACE_BYTES = 128 * 1024 * 1024
 
 
 def split_unquantized_mla_up_weights(
@@ -103,9 +107,10 @@ class _FlashInferLatentPrefixRuntime:
         page_size: int,
         scale: float,
     ) -> None:
-        workspace_bytes = int(envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE)
         self.workspace = torch.empty(
-            workspace_bytes, dtype=torch.uint8, device=device
+            _PCP_FLASHINFER_MLA_WORKSPACE_BYTES,
+            dtype=torch.uint8,
+            device=device,
         )
         wrapper_cls = _flashinfer_mla_wrapper_cls()
         self.wrapper = wrapper_cls(
@@ -239,7 +244,7 @@ class FlashInferPCPLatentPrefixEngine:
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         block_table_row: torch.Tensor,
-        context_len_row: torch.Tensor,
+        context_len: int,
         w_uk_t: torch.Tensor,
         w_uv: torch.Tensor,
         *,
@@ -252,11 +257,6 @@ class FlashInferPCPLatentPrefixEngine:
             raise ValueError(
                 "PCP latent-prefix requires one canonical block-table row, "
                 f"got shape={tuple(block_table_row.shape)}"
-            )
-        if context_len_row.numel() != 1:
-            raise ValueError(
-                "PCP latent-prefix requires one canonical context length, "
-                f"got shape={tuple(context_len_row.shape)}"
             )
         if kv_c_and_k_pe_cache.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError(
@@ -276,7 +276,6 @@ class FlashInferPCPLatentPrefixEngine:
         ql_nope = torch.bmm(q_nope.transpose(0, 1), w_uk_t).transpose(0, 1)
 
         page_size = kv_c_and_k_pe_cache.shape[1]
-        context_len = int(context_len_row.reshape(-1)[0].item())
         if context_len < 0:
             raise ValueError(
                 "cached-prefix context length must be >= 0, "
@@ -478,8 +477,9 @@ class PCPMLAImplMixin:
             if prefill_metadata.block_table.shape[0] < 1:
                 raise NotImplementedError("cached-prefix block table has no rows")
             chunked = prefill_metadata.chunked_context
-            if chunked.context_lens.shape[0] < 1:
-                raise NotImplementedError("cached-prefix context_lens has no rows")
+            if not chunked.seq_tot:
+                raise NotImplementedError("cached-prefix context has no chunks")
+            context_len = sum(chunked.seq_tot)
             w_uk_t, w_uv = self._pcp_latent_context_weights()
         except (AssertionError, NotImplementedError, ValueError) as exc:
             return self._pcp_fallback_forward(
@@ -538,18 +538,18 @@ class PCPMLAImplMixin:
                 output_scale,
             )
 
-        # Single-request PCP exposes one canonical page-table row and one cached
-        # prefix length. FlashInfer consumes the whole local query span at once;
-        # its internal planner owns split-K / incremental-prefill scheduling.
+        # Single-request PCP exposes one canonical page-table row. The complete
+        # cached-prefix length comes from CPU-side chunk metadata, avoiding a
+        # per-layer GPU context_lens.item() synchronization. FlashInfer consumes
+        # the whole local query span and owns its split-K/prefill scheduling.
         block_table_row = prefill_metadata.block_table[:1]
-        context_len_row = chunked.context_lens[:1]
         try:
             context_output, context_lse = self.pcp_prefix_engine.run(
                 self,
                 q,
                 kv_c_and_k_pe_cache,
                 block_table_row,
-                context_len_row,
+                context_len,
                 w_uk_t,
                 w_uv,
                 plan_key=prefill_metadata,
