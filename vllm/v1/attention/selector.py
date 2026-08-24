@@ -193,18 +193,6 @@ def _cached_get_attn_backend(
         )
     backend = resolve_obj_by_qualname(attention_cls)
 
-    # PCP wraps whichever dense MLA backend the normal platform selector chose.
-    # Local prefill and decode remain native to that backend; only cached-prefix
-    # chunked context is redirected to the common latent-prefix engine.
-    if (
-        attn_selector_config.use_pcp
-        and attn_selector_config.use_mla
-        and not attn_selector_config.use_sparse
-    ):
-        from vllm.v1.attention.backends.mla.pcp_mla import get_pcp_mla_backend
-
-        backend = get_pcp_mla_backend(backend)
-
     # Adjust kv cache layout if the selected backend requires a specific one
     required_layout = backend.get_required_kv_cache_layout()
     if required_layout is not None:
