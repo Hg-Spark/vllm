@@ -8,7 +8,11 @@ import torch
 
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import ParallelConfig, get_current_vllm_config
+from vllm.config import (
+    ParallelConfig,
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
 from vllm.distributed import (
     get_dp_group,
     get_pcp_group,
@@ -37,6 +41,7 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.pcp_policy import resolve_pcp_moe_size
 
 logger = init_logger(__name__)
 
@@ -53,6 +58,11 @@ def make_parallel_config(
     )
     dp_size_ = dp_size if dp_size is not None else get_dp_group().world_size
     pcp_size_ = pcp_size if pcp_size is not None else get_pcp_group().world_size
+
+    current = get_current_vllm_config_or_none()
+    if current is not None:
+        pcp_size_ = resolve_pcp_moe_size(current, pcp_size_)
+
     sp_size = tp_size_ if is_sequence_parallel else 1
 
     moe_parallel_config = FusedMoEParallelConfig.make(
