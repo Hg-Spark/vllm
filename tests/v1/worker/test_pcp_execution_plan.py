@@ -8,10 +8,7 @@ import torch
 
 import vllm.v1.worker.gpu.pcp_execution as pcp_execution
 from vllm.v1.worker.gpu.pcp_execution import ExperimentalPCPManager
-from vllm.v1.worker.gpu.pcp_weighted_partition import (
-    PCPLogicalTopology,
-    WeightedDualChunkPCPManager,
-)
+from vllm.v1.worker.gpu.pcp_weighted_partition import WeightedDualChunkPCPManager
 
 
 def _block_tables() -> SimpleNamespace:
@@ -61,7 +58,6 @@ def test_batch_plan_separates_actual_model_and_collective_width(monkeypatch) -> 
         device=torch.device("cpu"),
         block_tables=_block_tables(),
         partition_weights=(2.0, 1.0),
-        topology=PCPLogicalTopology.identity(2),
     )
 
     plan = manager._build_batch_plan(*_layout_inputs(4096))
@@ -81,7 +77,6 @@ def test_empty_owner_gets_exactly_one_dummy_model_row(monkeypatch) -> None:
         pcp_rank=3,
         device=torch.device("cpu"),
         block_tables=_block_tables(),
-        topology=PCPLogicalTopology.identity(4),
     )
 
     plan = manager._build_batch_plan(*_layout_inputs(1))

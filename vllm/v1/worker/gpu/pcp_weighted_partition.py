@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -92,68 +91,6 @@ def weighted_partition_lengths(
     )
 
 
-@dataclass(frozen=True)
-class PCPLogicalTopology:
-    """Logical PCP order mapped independently onto physical process ranks."""
-
-    logical_to_physical: tuple[int, ...]
-    physical_to_logical: tuple[int, ...]
-
-    @classmethod
-    def identity(cls, world_size: int) -> "PCPLogicalTopology":
-        if world_size <= 0:
-            raise ValueError(f"PCP world size must be positive, got {world_size}")
-        order = tuple(range(world_size))
-        return cls(order, order)
-
-    @classmethod
-    def from_logical_to_physical(
-        cls,
-        logical_to_physical: tuple[int, ...],
-        world_size: int,
-    ) -> "PCPLogicalTopology":
-        if len(logical_to_physical) != world_size:
-            raise ValueError(
-                "pcp_partition.logical_to_physical must contain exactly "
-                f"{world_size} ranks, got {logical_to_physical}"
-            )
-        if any(
-            not isinstance(rank, int) or isinstance(rank, bool)
-            for rank in logical_to_physical
-        ):
-            raise ValueError(
-                "pcp_partition.logical_to_physical must contain integer ranks, "
-                f"got {logical_to_physical}"
-            )
-        if set(logical_to_physical) != set(range(world_size)):
-            raise ValueError(
-                "pcp_partition.logical_to_physical must be a permutation of "
-                f"0..{world_size - 1}, got {logical_to_physical}"
-            )
-        inverse = [0] * world_size
-        for logical_rank, physical_rank in enumerate(logical_to_physical):
-            inverse[physical_rank] = logical_rank
-        return cls(logical_to_physical, tuple(inverse))
-
-    @property
-    def world_size(self) -> int:
-        return len(self.logical_to_physical)
-
-    def logical_rank(self, physical_rank: int) -> int:
-        if not 0 <= physical_rank < self.world_size:
-            raise ValueError(
-                f"invalid physical PCP rank {physical_rank} for {self.world_size} ranks"
-            )
-        return self.physical_to_logical[physical_rank]
-
-    def physical_rank(self, logical_rank: int) -> int:
-        if not 0 <= logical_rank < self.world_size:
-            raise ValueError(
-                f"invalid logical PCP rank {logical_rank} for {self.world_size} ranks"
-            )
-        return self.logical_to_physical[logical_rank]
-
-
 def _partition_config(additional_config: object) -> dict[str, object]:
     if not isinstance(additional_config, dict):
         raise ValueError("pcp_partition requires additional_config to be a JSON object")
@@ -188,56 +125,49 @@ def _parse_weights(
     return weights
 
 
-def parse_weighted_contiguous_partition(
+def _parse_partition_weights(
     additional_config: object,
     pcp_world_size: int,
+    *,
+    impl: str,
 ) -> tuple[float, ...]:
     partition = _partition_config(additional_config)
     unknown = set(partition) - {"impl", "weights"}
     if unknown:
         raise ValueError(f"unsupported pcp_partition keys: {sorted(unknown)}")
-    impl = partition.get("impl")
-    if impl != "weighted_contiguous":
+    configured_impl = partition.get("impl")
+    if configured_impl != impl:
         raise ValueError(
-            "pcp_partition.impl must be 'weighted_contiguous' to enable the "
-            f"experimental partition, got {impl!r}"
+            f"pcp_partition.impl must be {impl!r} to enable the experimental "
+            f"partition, got {configured_impl!r}"
         )
     return _parse_weights(partition, pcp_world_size)
+
+
+def parse_weighted_contiguous_partition(
+    additional_config: object,
+    pcp_world_size: int,
+) -> tuple[float, ...]:
+    return _parse_partition_weights(
+        additional_config,
+        pcp_world_size,
+        impl="weighted_contiguous",
+    )
 
 
 def parse_weighted_dual_chunk_partition(
     additional_config: object,
     pcp_world_size: int,
-) -> tuple[tuple[float, ...], PCPLogicalTopology]:
-    partition = _partition_config(additional_config)
-    unknown = set(partition) - {"impl", "weights", "logical_to_physical"}
-    if unknown:
-        raise ValueError(f"unsupported pcp_partition keys: {sorted(unknown)}")
-    impl = partition.get("impl")
-    if impl != "weighted_dual_chunk":
-        raise ValueError(
-            "pcp_partition.impl must be 'weighted_dual_chunk' to enable the "
-            f"experimental partition, got {impl!r}"
-        )
-
-    weights = _parse_weights(partition, pcp_world_size)
-    raw_order = partition.get("logical_to_physical")
-    if raw_order is None:
-        topology = PCPLogicalTopology.identity(pcp_world_size)
-    else:
-        if not isinstance(raw_order, (list, tuple)):
-            raise ValueError(
-                "pcp_partition.logical_to_physical must be a list or tuple of ranks"
-            )
-        topology = PCPLogicalTopology.from_logical_to_physical(
-            tuple(raw_order),
-            pcp_world_size,
-        )
-    return weights, topology
+) -> tuple[float, ...]:
+    return _parse_partition_weights(
+        additional_config,
+        pcp_world_size,
+        impl="weighted_dual_chunk",
+    )
 
 
-class WeightedContiguousPCPManager(ExperimentalPCPManager):
-    """Experimental PCP partition policy with one contiguous prefill slice per rank."""
+class _WeightedPCPManager(ExperimentalPCPManager):
+    """Shared weighted-partition setup for experimental PCP managers."""
 
     def __init__(
         self,
@@ -281,6 +211,27 @@ class WeightedContiguousPCPManager(ExperimentalPCPManager):
             else 1
         )
 
+    def _partition_lengths(
+        self,
+        query_len: int,
+        num_computed_tokens: int,
+        num_chunks: int,
+        weights: tuple[float, ...],
+    ) -> tuple[int, ...]:
+        alignment = self._page_alignment
+        if query_len < num_chunks * alignment:
+            alignment = 1
+        return weighted_partition_lengths(
+            query_len,
+            weights,
+            start_pos=num_computed_tokens,
+            alignment=alignment,
+        )
+
+
+class WeightedContiguousPCPManager(_WeightedPCPManager):
+    """One causal contiguous prefill slice per PCP group rank."""
+
     def _get_rank_segments(
         self,
         rank: int,
@@ -297,16 +248,12 @@ class WeightedContiguousPCPManager(ExperimentalPCPManager):
             if query_len == 0:
                 continue
             global_batch_start = int(query_start_loc_np[global_batch_req_idx])
-            chunk_indices: tuple[int, ...]
             if bool(is_prefilling[global_batch_req_idx]):
-                alignment = self._page_alignment
-                if query_len < num_chunks * alignment:
-                    alignment = 1
-                chunk_lengths = weighted_partition_lengths(
+                chunk_lengths = self._partition_lengths(
                     query_len,
+                    int(num_computed_tokens[global_batch_req_idx]),
+                    num_chunks,
                     self._partition_weights,
-                    start_pos=int(num_computed_tokens[global_batch_req_idx]),
-                    alignment=alignment,
                 )
                 chunk_offsets = _chunk_offsets(chunk_lengths)
                 chunk_indices = (rank,)
@@ -339,66 +286,16 @@ class WeightedContiguousPCPManager(ExperimentalPCPManager):
         )
 
 
-class WeightedDualChunkPCPManager(ExperimentalPCPManager):
-    """Weighted DualChunkSwap with logical order decoupled from physical ranks."""
+class WeightedDualChunkPCPManager(_WeightedPCPManager):
+    """Weighted DualChunkSwap indexed directly by PCP group rank."""
 
-    def __init__(
-        self,
-        pcp_world_size: int,
-        pcp_rank: int,
-        device: torch.device,
-        req_states: RequestState | None = None,
-        max_num_reqs: int | None = None,
-        max_num_tokens: int | None = None,
-        block_tables: BlockTables | None = None,
-        dcp_world_size: int = 1,
-        dcp_rank: int = 0,
-        cp_interleave: int = 1,
-        partition_weights: tuple[float, ...] | None = None,
-        topology: PCPLogicalTopology | None = None,
-    ) -> None:
-        super().__init__(
-            pcp_world_size=pcp_world_size,
-            pcp_rank=pcp_rank,
-            device=device,
-            req_states=req_states,
-            max_num_reqs=max_num_reqs,
-            max_num_tokens=max_num_tokens,
-            block_tables=block_tables,
-            dcp_world_size=dcp_world_size,
-            dcp_rank=dcp_rank,
-            cp_interleave=cp_interleave,
-        )
-        self._partition_weights = (
-            (1.0,) * pcp_world_size
-            if partition_weights is None
-            else partition_weights
-        )
-        if len(self._partition_weights) != pcp_world_size:
-            raise ValueError(
-                "PCP partition weights must match PCP world size: "
-                f"weights={self._partition_weights}, world_size={pcp_world_size}"
-            )
-        self._topology = topology or PCPLogicalTopology.identity(pcp_world_size)
-        if self._topology.world_size != pcp_world_size:
-            raise ValueError(
-                "PCP logical topology size must match PCP world size: "
-                f"topology={self._topology.world_size}, world_size={pcp_world_size}"
-            )
-        self._logical_weights = tuple(
-            self._partition_weights[self._topology.physical_rank(logical_rank)]
-            for logical_rank in range(pcp_world_size)
-        )
-        segment_weights = [0.0] * (2 * pcp_world_size)
-        for logical_rank, weight in enumerate(self._logical_weights):
-            segment_weights[logical_rank] = weight
-            segment_weights[-1 - logical_rank] = weight
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        segment_weights = [0.0] * (2 * self.pcp_world_size)
+        for rank, weight in enumerate(self._partition_weights):
+            segment_weights[rank] = weight
+            segment_weights[-1 - rank] = weight
         self._segment_weights = tuple(segment_weights)
-        self._page_alignment = (
-            math.lcm(*(int(size) for size in block_tables.kernel_block_sizes))
-            if block_tables is not None and block_tables.kernel_block_sizes
-            else 1
-        )
 
     def _get_rank_segments(
         self,
@@ -411,28 +308,20 @@ class WeightedDualChunkPCPManager(ExperimentalPCPManager):
         rank_segments = []
         rank_offset = 0
         num_chunks = 2 * self.pcp_world_size
-        logical_rank = self._topology.logical_rank(rank)
         for global_batch_req_idx, num_tokens in enumerate(num_scheduled_tokens):
             query_len = int(num_tokens)
             if query_len == 0:
                 continue
             global_batch_start = int(query_start_loc_np[global_batch_req_idx])
-            chunk_indices: tuple[int, ...]
             if bool(is_prefilling[global_batch_req_idx]):
-                alignment = self._page_alignment
-                if query_len < num_chunks * alignment:
-                    alignment = 1
-                chunk_lengths = weighted_partition_lengths(
+                chunk_lengths = self._partition_lengths(
                     query_len,
+                    int(num_computed_tokens[global_batch_req_idx]),
+                    num_chunks,
                     self._segment_weights,
-                    start_pos=int(num_computed_tokens[global_batch_req_idx]),
-                    alignment=alignment,
                 )
                 chunk_offsets = _chunk_offsets(chunk_lengths)
-                chunk_indices = (
-                    logical_rank,
-                    num_chunks - 1 - logical_rank,
-                )
+                chunk_indices = (rank, num_chunks - 1 - rank)
             else:
                 chunk_lengths = (query_len,)
                 chunk_offsets = (0,)
@@ -495,9 +384,9 @@ def build_experimental_pcp_manager(
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
     )
+
     partition = _partition_config(vllm_config.additional_config)
     impl = partition.get("impl")
-
     if impl == "weighted_contiguous":
         return WeightedContiguousPCPManager(
             **common,
@@ -506,39 +395,19 @@ def build_experimental_pcp_manager(
                 pcp_size,
             ),
         )
-
     if impl == "weighted_dual_chunk":
-        weights, topology = parse_weighted_dual_chunk_partition(
-            vllm_config.additional_config,
-            pcp_size,
-        )
         return WeightedDualChunkPCPManager(
             **common,
-            partition_weights=weights,
-            topology=topology,
+            partition_weights=parse_weighted_dual_chunk_partition(
+                vllm_config.additional_config,
+                pcp_size,
+            ),
         )
-
     raise ValueError(
         "unsupported pcp_partition.impl: "
         f"{impl!r}; expected 'weighted_contiguous' or 'weighted_dual_chunk'"
     )
 
 
-def build_weighted_contiguous_pcp_manager(
-    *,
-    vllm_config: VllmConfig,
-    device: torch.device,
-    req_states: RequestState,
-    block_tables: BlockTables,
-    pcp_rank: int,
-    dcp_rank: int,
-) -> PCPManager:
-    """Compatibility factory entry point; dispatches the explicit partition impl."""
-    return build_experimental_pcp_manager(
-        vllm_config=vllm_config,
-        device=device,
-        req_states=req_states,
-        block_tables=block_tables,
-        pcp_rank=pcp_rank,
-        dcp_rank=dcp_rank,
-    )
+# Keep the old factory symbol only because pcp_manager imports it lazily.
+build_weighted_contiguous_pcp_manager = build_experimental_pcp_manager
