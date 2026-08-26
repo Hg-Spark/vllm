@@ -57,7 +57,7 @@ def test_batch_plan_separates_actual_model_and_collective_width(monkeypatch) -> 
         pcp_rank=1,
         device=torch.device("cpu"),
         block_tables=_block_tables(),
-        partition_weights=(2.0, 1.0),
+        pcp_partition_weights=(2.0, 1.0),
     )
 
     plan = manager._build_batch_plan(*_layout_inputs(4096))
