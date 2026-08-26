@@ -141,7 +141,7 @@ def test_weighted_manager_uses_pcp_rank_as_causal_order() -> None:
         pcp_rank=0,
         device=torch.device("cpu"),
         block_tables=_block_tables(),
-        partition_weights=(2.0, 1.0),
+        pcp_partition_weights=(2.0, 1.0),
     )
     args = _layout_inputs()
 
