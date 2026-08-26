@@ -21,38 +21,30 @@ def _config(
     )
 
 
-def test_canonical_pcp_keeps_upstream_moe_pcp_size() -> None:
+def test_default_pcp_keeps_upstream_moe_pcp_size() -> None:
     config = _config({})
 
     assert not is_moe_isolated_pcp(config)
     assert resolve_pcp_moe_size(config, 4) == 4
 
 
-def test_unknown_partition_does_not_change_moe_topology() -> None:
-    config = _config({"pcp_partition": {"impl": "other"}})
+def test_unrelated_additional_config_does_not_change_moe_topology() -> None:
+    config = _config({"other_option": True})
 
     assert not is_moe_isolated_pcp(config)
     assert resolve_pcp_moe_size(config, 4) == 4
 
 
-@pytest.mark.parametrize(
-    "impl",
-    ["weighted_contiguous", "weighted_dual_chunk"],
-)
-def test_experimental_partition_removes_pcp_from_moe_topology(impl: str) -> None:
-    config = _config({"pcp_partition": {"impl": impl}})
+def test_partition_weights_remove_pcp_from_moe_topology() -> None:
+    config = _config({"pcp_partition_weights": [1.0, 1.0]})
 
     assert is_moe_isolated_pcp(config)
     assert resolve_pcp_moe_size(config, 4) == 1
 
 
-@pytest.mark.parametrize(
-    "impl",
-    ["weighted_contiguous", "weighted_dual_chunk"],
-)
-def test_experimental_partition_rejects_expert_parallel(impl: str) -> None:
+def test_partition_weights_reject_expert_parallel() -> None:
     config = _config(
-        {"pcp_partition": {"impl": impl}},
+        {"pcp_partition_weights": [1.0, 1.0]},
         enable_expert_parallel=True,
     )
 
