@@ -9,10 +9,8 @@ import torch
 
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.pcp_weighted_partition import (
-    WeightedContiguousPCPManager,
-    WeightedDualChunkPCPManager,
-    parse_weighted_contiguous_partition,
-    parse_weighted_dual_chunk_partition,
+    WeightedPCPManager,
+    parse_pcp_partition_weights,
     weighted_partition_lengths,
 )
 
@@ -83,68 +81,37 @@ def test_weighted_partition_aligns_continued_prefill_absolute_positions() -> Non
     )
 
 
-def test_contiguous_parser_requires_explicit_impl_and_valid_weights() -> None:
-    assert parse_weighted_contiguous_partition(
-        {"pcp_partition": {"impl": "weighted_contiguous"}}, 2
-    ) == (1.0, 1.0)
-    assert parse_weighted_contiguous_partition(
-        {
-            "pcp_partition": {
-                "impl": "weighted_contiguous",
-                "weights": [1.25, 0.75],
-            }
-        },
+def test_partition_weights_parser_uses_top_level_key() -> None:
+    assert parse_pcp_partition_weights({}, 2) == (1.0, 1.0)
+    assert parse_pcp_partition_weights({"other_option": True}, 2) == (1.0, 1.0)
+    assert parse_pcp_partition_weights(
+        {"pcp_partition_weights": [1.25, 0.75]},
         2,
     ) == (1.25, 0.75)
 
-    with pytest.raises(ValueError, match="impl must be 'weighted_contiguous'"):
-        parse_weighted_contiguous_partition(
-            {"pcp_partition": {"weights": [1.0, 1.0]}},
-            2,
-        )
+
+def test_partition_weights_parser_validates_only_owned_value() -> None:
+    assert parse_pcp_partition_weights(
+        {
+            "pcp_partition_weights": [1.0, 1.0],
+            "future_option": {"enabled": True},
+        },
+        2,
+    ) == (1.0, 1.0)
+
     with pytest.raises(ValueError, match="requires 2 positive values"):
-        parse_weighted_contiguous_partition(
-            {
-                "pcp_partition": {
-                    "impl": "weighted_contiguous",
-                    "weights": [1.0],
-                }
-            },
+        parse_pcp_partition_weights(
+            {"pcp_partition_weights": [1.0]},
             2,
         )
     with pytest.raises(ValueError, match="finite positive"):
-        parse_weighted_contiguous_partition(
-            {
-                "pcp_partition": {
-                    "impl": "weighted_contiguous",
-                    "weights": [1.0, 0.0],
-                }
-            },
+        parse_pcp_partition_weights(
+            {"pcp_partition_weights": [1.0, 0.0]},
             2,
         )
-
-
-def test_dual_chunk_parser_uses_pcp_rank_weights_directly() -> None:
-    assert parse_weighted_dual_chunk_partition(
-        {
-            "pcp_partition": {
-                "impl": "weighted_dual_chunk",
-                "weights": [1.0, 2.0, 3.0, 4.0],
-            }
-        },
-        4,
-    ) == (1.0, 2.0, 3.0, 4.0)
-
-
-def test_removed_logical_order_config_fails_fast() -> None:
-    with pytest.raises(ValueError, match="unsupported pcp_partition keys"):
-        parse_weighted_dual_chunk_partition(
-            {
-                "pcp_partition": {
-                    "impl": "weighted_dual_chunk",
-                    "logical_to_physical": [1, 0],
-                }
-            },
+    with pytest.raises(ValueError, match="must be numeric"):
+        parse_pcp_partition_weights(
+            {"pcp_partition_weights": [1.0, "bad"]},
             2,
         )
 
@@ -168,8 +135,8 @@ def test_baseline_pcp_manager_keeps_dual_chunk_swap() -> None:
     ]
 
 
-def test_weighted_contiguous_uses_pcp_rank_as_causal_order() -> None:
-    manager = WeightedContiguousPCPManager(
+def test_weighted_manager_uses_pcp_rank_as_causal_order() -> None:
+    manager = WeightedPCPManager(
         pcp_world_size=2,
         pcp_rank=0,
         device=torch.device("cpu"),
@@ -191,8 +158,8 @@ def test_weighted_contiguous_uses_pcp_rank_as_causal_order() -> None:
     assert rank0[0].global_batch_slice.stop % 128 == 0
 
 
-def test_equal_weight_contiguous_prefill_has_no_overlap_or_gap() -> None:
-    manager = WeightedContiguousPCPManager(
+def test_equal_weight_prefill_has_no_overlap_or_gap() -> None:
+    manager = WeightedPCPManager(
         pcp_world_size=2,
         pcp_rank=0,
         device=torch.device("cpu"),
@@ -210,8 +177,8 @@ def test_equal_weight_contiguous_prefill_has_no_overlap_or_gap() -> None:
     ] == [slice(2048, 4096)]
 
 
-def test_short_contiguous_prefill_falls_back_to_token_alignment() -> None:
-    manager = WeightedContiguousPCPManager(
+def test_short_prefill_falls_back_to_token_alignment() -> None:
+    manager = WeightedPCPManager(
         pcp_world_size=2,
         pcp_rank=0,
         device=torch.device("cpu"),
@@ -229,67 +196,8 @@ def test_short_contiguous_prefill_falls_back_to_token_alignment() -> None:
     ] == [slice(1, 2)]
 
 
-def test_weighted_dual_chunk_matches_rank_ordered_weighted_layout() -> None:
-    manager = WeightedDualChunkPCPManager(
-        pcp_world_size=2,
-        pcp_rank=0,
-        device=torch.device("cpu"),
-        block_tables=_block_tables(),
-        partition_weights=(2.0, 1.0),
-    )
-    args = _layout_inputs()
-
-    rank0 = manager._get_rank_segments(0, *args)
-    rank1 = manager._get_rank_segments(1, *args)
-
-    assert _global_slices(rank0) == [(0, 1408), (2688, 4096)]
-    assert _global_slices(rank1) == [(1408, 2048), (2048, 2688)]
-    assert sum(segment.num_tokens for segment in rank0) == 2816
-    assert sum(segment.num_tokens for segment in rank1) == 1280
-    assert all(boundary % 128 == 0 for boundary in (1408, 2048, 2688))
-
-
-def test_dual_chunk_segment_weights_follow_pcp_rank_order() -> None:
-    manager = WeightedDualChunkPCPManager(
-        pcp_world_size=4,
-        pcp_rank=0,
-        device=torch.device("cpu"),
-        block_tables=_block_tables(),
-        partition_weights=(1.0, 2.0, 3.0, 4.0),
-    )
-    assert manager._segment_weights == (
-        1.0,
-        2.0,
-        3.0,
-        4.0,
-        4.0,
-        3.0,
-        2.0,
-        1.0,
-    )
-
-
-def test_short_dual_chunk_prefill_falls_back_to_token_alignment() -> None:
-    manager = WeightedDualChunkPCPManager(
-        pcp_world_size=2,
-        pcp_rank=0,
-        device=torch.device("cpu"),
-        block_tables=_block_tables(),
-    )
-    args = _layout_inputs(num_tokens=2)
-
-    assert [
-        segment.global_batch_slice
-        for segment in manager._get_rank_segments(0, *args)
-    ] == [slice(0, 1)]
-    assert [
-        segment.global_batch_slice
-        for segment in manager._get_rank_segments(1, *args)
-    ] == [slice(1, 2)]
-
-
-def test_dual_chunk_decode_remains_replicated_on_pcp_ranks() -> None:
-    manager = WeightedDualChunkPCPManager(
+def test_decode_remains_replicated_on_pcp_ranks() -> None:
+    manager = WeightedPCPManager(
         pcp_world_size=2,
         pcp_rank=0,
         device=torch.device("cpu"),
