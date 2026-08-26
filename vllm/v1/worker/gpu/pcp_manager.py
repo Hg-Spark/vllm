@@ -669,10 +669,10 @@ def maybe_build_pcp_manager(
     additional_config = vllm_config.additional_config
     if isinstance(additional_config, dict) and "pcp_partition" in additional_config:
         from vllm.v1.worker.gpu.pcp_weighted_partition import (
-            build_weighted_contiguous_pcp_manager,
+            build_experimental_pcp_manager,
         )
 
-        return build_weighted_contiguous_pcp_manager(
+        return build_experimental_pcp_manager(
             vllm_config=vllm_config,
             device=device,
             req_states=req_states,

@@ -407,7 +407,3 @@ def build_experimental_pcp_manager(
         "unsupported pcp_partition.impl: "
         f"{impl!r}; expected 'weighted_contiguous' or 'weighted_dual_chunk'"
     )
-
-
-# Keep the old factory symbol only because pcp_manager imports it lazily.
-build_weighted_contiguous_pcp_manager = build_experimental_pcp_manager
