@@ -666,6 +666,21 @@ def maybe_build_pcp_manager(
     dcp_size = parallel_config.decode_context_parallel_size
     dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
 
+    additional_config = vllm_config.additional_config
+    if isinstance(additional_config, dict) and "pcp_partition" in additional_config:
+        from vllm.v1.worker.gpu.pcp_weighted_partition import (
+            build_weighted_contiguous_pcp_manager,
+        )
+
+        return build_weighted_contiguous_pcp_manager(
+            vllm_config=vllm_config,
+            device=device,
+            req_states=req_states,
+            block_tables=block_tables,
+            pcp_rank=pcp_rank,
+            dcp_rank=dcp_rank,
+        )
+
     return PCPManager(
         pcp_world_size=pcp_size,
         pcp_rank=pcp_rank,
