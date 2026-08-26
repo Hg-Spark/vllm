@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Execution contract for experimental PCP partition policies.
+"""Execution contract for weighted PCP partitioning.
 
-Experimental PCP separates three widths that canonical PCP historically folds
-into one value:
+Weighted PCP separates three widths that canonical PCP historically folds into
+one value:
 
 * actual_num_tokens: semantic tokens owned by this PCP rank;
 * model_num_tokens: rows passed through model forward (one dummy row only when
@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class PCPBatchPlan:
-    """One-step execution and collective layout for experimental PCP."""
+    """One-step execution and collective layout for weighted PCP."""
 
     segments_by_rank: tuple[tuple[RankSegment, ...], ...]
     per_rank_num_tokens: tuple[int, ...]
@@ -54,13 +54,12 @@ class PCPBatchPlan:
         return self.actual_num_tokens == 0 and self.model_num_tokens == 1
 
 
-class ExperimentalPCPManager(PCPManager):
-    """PCP execution contract for opt-in experimental partition policies.
+class PCPExecutionManager(PCPManager):
+    """Execution contract for weighted contiguous PCP partitioning.
 
     Partition subclasses only decide token ownership through
     ``_get_rank_segments``. This class materializes the local InputBatch and
-    owns the communication layout, keeping canonical ``PCPManager`` behavior
-    unchanged when no experimental ``pcp_partition`` is configured.
+    owns the communication layout used by the weighted PCP path.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -327,7 +326,7 @@ class ExperimentalPCPManager(PCPManager):
             dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_local_reqs]
 
         logger.debug(
-            "Experimental PCP batch: rank=%d actual_tokens=%d model_tokens=%d "
+            "Weighted PCP batch: rank=%d actual_tokens=%d model_tokens=%d "
             "collective_width=%d dummy_row=%s per_rank_tokens=%s",
             self.pcp_rank,
             plan.actual_num_tokens,
@@ -382,7 +381,7 @@ class ExperimentalPCPManager(PCPManager):
     ) -> torch.Tensor:
         plan = self._batch_plan
         if plan is None:
-            raise RuntimeError("experimental PCP slot mapping requested without a batch plan")
+            raise RuntimeError("PCP slot mapping requested without a batch plan")
         num_collective_tokens = plan.collective_global_idx.shape[0]
         if self._gathered_kv_slot_mappings is None:
             self._gathered_kv_slot_mappings = global_batch_slot_mappings.new_empty(
