@@ -6,10 +6,9 @@ import math
 import numpy as np
 import torch
 
-from vllm.config import VllmConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.pcp_execution import ExperimentalPCPManager
-from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
+from vllm.v1.worker.gpu.pcp_execution import PCPExecutionManager
+from vllm.v1.worker.gpu.pcp_manager import RankSegment
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -91,83 +90,42 @@ def weighted_partition_lengths(
     )
 
 
-def _partition_config(additional_config: object) -> dict[str, object]:
-    if not isinstance(additional_config, dict):
-        raise ValueError("pcp_partition requires additional_config to be a JSON object")
-    partition = additional_config.get("pcp_partition")
-    if not isinstance(partition, dict):
-        raise ValueError("pcp_partition must be a JSON object")
-    return partition
-
-
-def _parse_weights(
-    partition: dict[str, object],
+def parse_pcp_partition_weights(
+    additional_config: object,
     pcp_world_size: int,
 ) -> tuple[float, ...]:
-    raw = partition.get("weights")
+    """Read the optional top-level PCP rank-weight array.
+
+    PCP owns only ``pcp_partition_weights``. Other additional-config keys are
+    ignored so unrelated or future configuration does not become a PCP error.
+    """
+    default = (1.0,) * pcp_world_size
+    if not isinstance(additional_config, dict):
+        return default
+
+    raw = additional_config.get("pcp_partition_weights")
     if raw is None:
-        return (1.0,) * pcp_world_size
+        return default
     if not isinstance(raw, (list, tuple)) or len(raw) != pcp_world_size:
         got = len(raw) if isinstance(raw, (list, tuple)) else type(raw).__name__
         raise ValueError(
-            f"pcp_partition.weights requires {pcp_world_size} positive values, "
+            f"pcp_partition_weights requires {pcp_world_size} positive values, "
             f"got {got}: {raw}"
         )
     try:
         weights = tuple(float(value) for value in raw)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"pcp_partition.weights must be numeric: {raw}") from exc
+        raise ValueError(f"pcp_partition_weights must be numeric: {raw}") from exc
     if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
         raise ValueError(
-            "pcp_partition.weights must contain finite positive values: "
+            "pcp_partition_weights must contain finite positive values: "
             f"{weights}"
         )
     return weights
 
 
-def _parse_partition_weights(
-    additional_config: object,
-    pcp_world_size: int,
-    *,
-    impl: str,
-) -> tuple[float, ...]:
-    partition = _partition_config(additional_config)
-    unknown = set(partition) - {"impl", "weights"}
-    if unknown:
-        raise ValueError(f"unsupported pcp_partition keys: {sorted(unknown)}")
-    configured_impl = partition.get("impl")
-    if configured_impl != impl:
-        raise ValueError(
-            f"pcp_partition.impl must be {impl!r} to enable the experimental "
-            f"partition, got {configured_impl!r}"
-        )
-    return _parse_weights(partition, pcp_world_size)
-
-
-def parse_weighted_contiguous_partition(
-    additional_config: object,
-    pcp_world_size: int,
-) -> tuple[float, ...]:
-    return _parse_partition_weights(
-        additional_config,
-        pcp_world_size,
-        impl="weighted_contiguous",
-    )
-
-
-def parse_weighted_dual_chunk_partition(
-    additional_config: object,
-    pcp_world_size: int,
-) -> tuple[float, ...]:
-    return _parse_partition_weights(
-        additional_config,
-        pcp_world_size,
-        impl="weighted_dual_chunk",
-    )
-
-
-class _WeightedPCPManager(ExperimentalPCPManager):
-    """Shared weighted-partition setup for experimental PCP managers."""
+class WeightedPCPManager(PCPExecutionManager):
+    """One causal contiguous prefill slice per PCP rank with optional weights."""
 
     def __init__(
         self,
@@ -215,23 +173,17 @@ class _WeightedPCPManager(ExperimentalPCPManager):
         self,
         query_len: int,
         num_computed_tokens: int,
-        num_chunks: int,
-        weights: tuple[float, ...],
     ) -> tuple[int, ...]:
         alignment = self._page_alignment
-        if query_len < num_chunks * alignment:
+        if query_len < self.pcp_world_size * alignment:
             alignment = 1
         return weighted_partition_lengths(
             query_len,
-            weights,
+            self._partition_weights,
             start_pos=num_computed_tokens,
             alignment=alignment,
         )
 
-
-class WeightedContiguousPCPManager(_WeightedPCPManager):
-    """One causal contiguous prefill slice per PCP group rank."""
-
     def _get_rank_segments(
         self,
         rank: int,
@@ -242,7 +194,6 @@ class WeightedContiguousPCPManager(_WeightedPCPManager):
     ) -> list[RankSegment]:
         rank_segments = []
         rank_offset = 0
-        num_chunks = self.pcp_world_size
         for global_batch_req_idx, num_tokens in enumerate(num_scheduled_tokens):
             query_len = int(num_tokens)
             if query_len == 0:
@@ -252,76 +203,9 @@ class WeightedContiguousPCPManager(_WeightedPCPManager):
                 chunk_lengths = self._partition_lengths(
                     query_len,
                     int(num_computed_tokens[global_batch_req_idx]),
-                    num_chunks,
-                    self._partition_weights,
                 )
                 chunk_offsets = _chunk_offsets(chunk_lengths)
                 chunk_indices = (rank,)
-            else:
-                chunk_lengths = (query_len,)
-                chunk_offsets = (0,)
-                chunk_indices = (0,)
-
-            for chunk_idx in chunk_indices:
-                chunk_offset = chunk_offsets[chunk_idx]
-                chunk_len = chunk_lengths[chunk_idx]
-                if chunk_len <= 0:
-                    continue
-                chunk_start = global_batch_start + chunk_offset
-                rank_segments.append(
-                    RankSegment(
-                        global_batch_req_idx=global_batch_req_idx,
-                        global_batch_slice=slice(chunk_start, chunk_start + chunk_len),
-                        rank_local_batch_slice=slice(
-                            rank_offset, rank_offset + chunk_len
-                        ),
-                    )
-                )
-                rank_offset += chunk_len
-        return self._reorder_segments(
-            rank_segments,
-            num_computed_tokens,
-            is_prefilling,
-            query_start_loc_np,
-        )
-
-
-class WeightedDualChunkPCPManager(_WeightedPCPManager):
-    """Weighted DualChunkSwap indexed directly by PCP group rank."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        segment_weights = [0.0] * (2 * self.pcp_world_size)
-        for rank, weight in enumerate(self._partition_weights):
-            segment_weights[rank] = weight
-            segment_weights[-1 - rank] = weight
-        self._segment_weights = tuple(segment_weights)
-
-    def _get_rank_segments(
-        self,
-        rank: int,
-        num_scheduled_tokens: np.ndarray,
-        num_computed_tokens: np.ndarray,
-        is_prefilling: np.ndarray,
-        query_start_loc_np: np.ndarray,
-    ) -> list[RankSegment]:
-        rank_segments = []
-        rank_offset = 0
-        num_chunks = 2 * self.pcp_world_size
-        for global_batch_req_idx, num_tokens in enumerate(num_scheduled_tokens):
-            query_len = int(num_tokens)
-            if query_len == 0:
-                continue
-            global_batch_start = int(query_start_loc_np[global_batch_req_idx])
-            if bool(is_prefilling[global_batch_req_idx]):
-                chunk_lengths = self._partition_lengths(
-                    query_len,
-                    int(num_computed_tokens[global_batch_req_idx]),
-                    num_chunks,
-                    self._segment_weights,
-                )
-                chunk_offsets = _chunk_offsets(chunk_lengths)
-                chunk_indices = (rank, num_chunks - 1 - rank)
             else:
                 chunk_lengths = (query_len,)
                 chunk_offsets = (0,)
@@ -358,52 +242,3 @@ def _chunk_offsets(chunk_lengths: tuple[int, ...]) -> tuple[int, ...]:
         offsets.append(running)
         running += chunk_len
     return tuple(offsets)
-
-
-def build_experimental_pcp_manager(
-    *,
-    vllm_config: VllmConfig,
-    device: torch.device,
-    req_states: RequestState,
-    block_tables: BlockTables,
-    pcp_rank: int,
-    dcp_rank: int,
-) -> PCPManager:
-    parallel_config = vllm_config.parallel_config
-    pcp_size = parallel_config.prefill_context_parallel_size
-    dcp_size = parallel_config.decode_context_parallel_size
-    common = dict(
-        pcp_world_size=pcp_size,
-        pcp_rank=pcp_rank,
-        device=device,
-        req_states=req_states,
-        max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
-        max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
-        block_tables=block_tables,
-        dcp_world_size=dcp_size,
-        dcp_rank=dcp_rank,
-        cp_interleave=parallel_config.cp_kv_cache_interleave_size,
-    )
-
-    partition = _partition_config(vllm_config.additional_config)
-    impl = partition.get("impl")
-    if impl == "weighted_contiguous":
-        return WeightedContiguousPCPManager(
-            **common,
-            partition_weights=parse_weighted_contiguous_partition(
-                vllm_config.additional_config,
-                pcp_size,
-            ),
-        )
-    if impl == "weighted_dual_chunk":
-        return WeightedDualChunkPCPManager(
-            **common,
-            partition_weights=parse_weighted_dual_chunk_partition(
-                vllm_config.additional_config,
-                pcp_size,
-            ),
-        )
-    raise ValueError(
-        "unsupported pcp_partition.impl: "
-        f"{impl!r}; expected 'weighted_contiguous' or 'weighted_dual_chunk'"
-    )
