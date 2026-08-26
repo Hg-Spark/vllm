@@ -12,7 +12,10 @@ if TYPE_CHECKING:
 def is_moe_isolated_pcp(vllm_config: "VllmConfig") -> bool:
     """Whether PCP uses the isolated weighted partition execution path."""
     additional_config = vllm_config.additional_config
-    return isinstance(additional_config, dict) and "pcp_partition_weights" in additional_config
+    return (
+        isinstance(additional_config, dict)
+        and "pcp_partition_weights" in additional_config
+    )
 
 
 def resolve_pcp_moe_size(vllm_config: "VllmConfig", default_size: int) -> int:
