@@ -667,18 +667,30 @@ def maybe_build_pcp_manager(
     dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
 
     additional_config = vllm_config.additional_config
-    if isinstance(additional_config, dict) and "pcp_partition" in additional_config:
+    if (
+        isinstance(additional_config, dict)
+        and "pcp_partition_weights" in additional_config
+    ):
         from vllm.v1.worker.gpu.pcp_weighted_partition import (
-            build_experimental_pcp_manager,
+            WeightedPCPManager,
+            parse_pcp_partition_weights,
         )
 
-        return build_experimental_pcp_manager(
-            vllm_config=vllm_config,
+        return WeightedPCPManager(
+            pcp_world_size=pcp_size,
+            pcp_rank=pcp_rank,
             device=device,
             req_states=req_states,
+            max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
+            max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
             block_tables=block_tables,
-            pcp_rank=pcp_rank,
+            dcp_world_size=dcp_size,
             dcp_rank=dcp_rank,
+            cp_interleave=parallel_config.cp_kv_cache_interleave_size,
+            partition_weights=parse_pcp_partition_weights(
+                additional_config,
+                pcp_size,
+            ),
         )
 
     return PCPManager(
