@@ -7,8 +7,8 @@ import numpy as np
 import torch
 
 import vllm.v1.worker.gpu.pcp_execution as pcp_execution
-from vllm.v1.worker.gpu.pcp_execution import ExperimentalPCPManager
-from vllm.v1.worker.gpu.pcp_weighted_partition import WeightedDualChunkPCPManager
+from vllm.v1.worker.gpu.pcp_execution import PCPExecutionManager
+from vllm.v1.worker.gpu.pcp_weighted_partition import WeightedPCPManager
 
 
 def _block_tables() -> SimpleNamespace:
@@ -40,19 +40,19 @@ def _copy_to_cpu(
     return out
 
 
-def test_weighted_manager_uses_experimental_execution_contract() -> None:
-    manager = WeightedDualChunkPCPManager(
+def test_weighted_manager_uses_pcp_execution_contract() -> None:
+    manager = WeightedPCPManager(
         pcp_world_size=2,
         pcp_rank=0,
         device=torch.device("cpu"),
         block_tables=_block_tables(),
     )
-    assert isinstance(manager, ExperimentalPCPManager)
+    assert isinstance(manager, PCPExecutionManager)
 
 
 def test_batch_plan_separates_actual_model_and_collective_width(monkeypatch) -> None:
     monkeypatch.setattr(pcp_execution, "async_copy_to_gpu", _copy_to_cpu)
-    manager = WeightedDualChunkPCPManager(
+    manager = WeightedPCPManager(
         pcp_world_size=2,
         pcp_rank=1,
         device=torch.device("cpu"),
@@ -62,17 +62,17 @@ def test_batch_plan_separates_actual_model_and_collective_width(monkeypatch) -> 
 
     plan = manager._build_batch_plan(*_layout_inputs(4096))
 
-    assert plan.per_rank_num_tokens == (2816, 1280)
-    assert plan.actual_num_tokens == 1280
-    assert plan.model_num_tokens == 1280
-    assert plan.collective_width == 2816
+    assert plan.per_rank_num_tokens == (2688, 1408)
+    assert plan.actual_num_tokens == 1408
+    assert plan.model_num_tokens == 1408
+    assert plan.collective_width == 2688
     assert not plan.uses_dummy_execution_row
-    assert plan.collective_global_idx.numel() == 2 * 2816
+    assert plan.collective_global_idx.numel() == 2 * 2688
 
 
 def test_empty_owner_gets_exactly_one_dummy_model_row(monkeypatch) -> None:
     monkeypatch.setattr(pcp_execution, "async_copy_to_gpu", _copy_to_cpu)
-    manager = WeightedDualChunkPCPManager(
+    manager = WeightedPCPManager(
         pcp_world_size=4,
         pcp_rank=3,
         device=torch.device("cpu"),
