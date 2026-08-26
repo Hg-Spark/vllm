@@ -687,7 +687,7 @@ def maybe_build_pcp_manager(
             dcp_world_size=dcp_size,
             dcp_rank=dcp_rank,
             cp_interleave=parallel_config.cp_kv_cache_interleave_size,
-            partition_weights=parse_pcp_partition_weights(
+            pcp_partition_weights=parse_pcp_partition_weights(
                 additional_config,
                 pcp_size,
             ),
