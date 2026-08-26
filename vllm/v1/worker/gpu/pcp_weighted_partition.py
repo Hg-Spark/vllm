@@ -14,7 +14,7 @@ from vllm.v1.worker.gpu.states import RequestState
 
 def weighted_partition_lengths(
     num_tokens: int,
-    weights: tuple[float, ...],
+    pcp_partition_weights: tuple[float, ...],
     *,
     start_pos: int = 0,
     alignment: int = 1,
@@ -22,20 +22,23 @@ def weighted_partition_lengths(
     """Partition tokens with cumulative weighted, optionally page-aligned cuts."""
     if num_tokens < 0:
         raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
-    if not weights:
+    if not pcp_partition_weights:
         raise ValueError("weighted PCP partition requires at least one weight")
     if alignment <= 0:
         raise ValueError(f"alignment must be positive, got {alignment}")
 
-    total_weight = sum(weights)
+    total_weight = sum(pcp_partition_weights)
     if not math.isfinite(total_weight) or total_weight <= 0.0:
-        raise ValueError(f"invalid PCP load weights: {weights}")
-    num_segments = len(weights)
+        raise ValueError(f"invalid PCP load weights: {pcp_partition_weights}")
+    num_segments = len(pcp_partition_weights)
     if num_tokens == 0:
         return (0,) * num_segments
 
     if alignment == 1:
-        ideal = [num_tokens * weight / total_weight for weight in weights]
+        ideal = [
+            num_tokens * weight / total_weight
+            for weight in pcp_partition_weights
+        ]
         lengths = [math.floor(value) for value in ideal]
         remainder = num_tokens - sum(lengths)
         order = sorted(
@@ -53,7 +56,7 @@ def weighted_partition_lengths(
     boundaries = [0]
     cumulative_weight = 0.0
     for segment in range(num_segments - 1):
-        cumulative_weight += weights[segment]
+        cumulative_weight += pcp_partition_weights[segment]
         ideal_rel = num_tokens * cumulative_weight / total_weight
         ideal_abs = start_pos + ideal_rel
 
@@ -113,15 +116,18 @@ def parse_pcp_partition_weights(
             f"got {got}: {raw}"
         )
     try:
-        weights = tuple(float(value) for value in raw)
+        pcp_partition_weights = tuple(float(value) for value in raw)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"pcp_partition_weights must be numeric: {raw}") from exc
-    if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
+    if any(
+        not math.isfinite(weight) or weight <= 0
+        for weight in pcp_partition_weights
+    ):
         raise ValueError(
             "pcp_partition_weights must contain finite positive values: "
-            f"{weights}"
+            f"{pcp_partition_weights}"
         )
-    return weights
+    return pcp_partition_weights
 
 
 class WeightedPCPManager(PCPExecutionManager):
@@ -139,7 +145,7 @@ class WeightedPCPManager(PCPExecutionManager):
         dcp_world_size: int = 1,
         dcp_rank: int = 0,
         cp_interleave: int = 1,
-        partition_weights: tuple[float, ...] | None = None,
+        pcp_partition_weights: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__(
             pcp_world_size=pcp_world_size,
@@ -153,15 +159,15 @@ class WeightedPCPManager(PCPExecutionManager):
             dcp_rank=dcp_rank,
             cp_interleave=cp_interleave,
         )
-        self._partition_weights = (
+        self._pcp_partition_weights = (
             (1.0,) * pcp_world_size
-            if partition_weights is None
-            else partition_weights
+            if pcp_partition_weights is None
+            else pcp_partition_weights
         )
-        if len(self._partition_weights) != pcp_world_size:
+        if len(self._pcp_partition_weights) != pcp_world_size:
             raise ValueError(
                 "PCP partition weights must match PCP world size: "
-                f"weights={self._partition_weights}, world_size={pcp_world_size}"
+                f"weights={self._pcp_partition_weights}, world_size={pcp_world_size}"
             )
         self._page_alignment = (
             math.lcm(*(int(size) for size in block_tables.kernel_block_sizes))
@@ -179,7 +185,7 @@ class WeightedPCPManager(PCPExecutionManager):
             alignment = 1
         return weighted_partition_lengths(
             query_len,
-            self._partition_weights,
+            self._pcp_partition_weights,
             start_pos=num_computed_tokens,
             alignment=alignment,
         )
