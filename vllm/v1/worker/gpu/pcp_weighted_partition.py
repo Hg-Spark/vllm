@@ -9,6 +9,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.pcp_execution import ExperimentalPCPManager
 from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -235,7 +236,7 @@ def parse_weighted_dual_chunk_partition(
     return weights, topology
 
 
-class WeightedContiguousPCPManager(PCPManager):
+class WeightedContiguousPCPManager(ExperimentalPCPManager):
     """Experimental PCP partition policy with one contiguous prefill slice per rank."""
 
     def __init__(
@@ -338,7 +339,7 @@ class WeightedContiguousPCPManager(PCPManager):
         )
 
 
-class WeightedDualChunkPCPManager(PCPManager):
+class WeightedDualChunkPCPManager(ExperimentalPCPManager):
     """Weighted DualChunkSwap with logical order decoupled from physical ranks."""
 
     def __init__(
