@@ -79,7 +79,7 @@ class EPLBConfig:
     """
     log_balancedness_interval: int = Field(default=1, gt=0)
     """
-    Interval for logging balancedness.
+    Interval for logging the balancedness.
     """
     use_async: bool = True
     """
@@ -127,8 +127,8 @@ class ParallelConfig:
     """Number of ranks that split prefill sequence computation. PCP expands
     the process world size but does not increase the KV-cache shard count."""
     data_parallel_size: int = Field(default=1, ge=1)
-    """Number of data parallel groups. MoE layers are sharded across tensor
-    and data parallel ranks; PCP remains an independent context axis."""
+    """Number of data parallel groups. MoE layers will be sharded according to
+    the product of the tensor, prefill-context, and data parallel sizes."""
     data_parallel_size_local: int = Field(default=1, ge=0)
     """Number of local data parallel groups. A value of 0 is a sentinel used by
     the engine-args layer to signal that data parallelism was specified
@@ -498,10 +498,18 @@ class ParallelConfig:
                 )
             if not self.enable_expert_parallel:
                 raise ValueError("enable_expert_parallel must be True to use EPLB.")
-            if self.tensor_parallel_size * self.data_parallel_size <= 1:
+            # The EP group spans the TP x PCP x DP ranks. EPLB therefore needs
+            # TP, PCP, or DP > 1.
+            if (
+                self.tensor_parallel_size
+                * self.prefill_context_parallel_size
+                * self.data_parallel_size
+                <= 1
+            ):
                 raise ValueError(
-                    "EPLB requires tensor or data parallelism, "
+                    "EPLB requires tensor, prefill-context, or data parallelism, "
                     f"but got TP={self.tensor_parallel_size}, "
+                    f"PCP={self.prefill_context_parallel_size}, "
                     f"DP={self.data_parallel_size}."
                 )
         else:
@@ -613,10 +621,13 @@ class ParallelConfig:
     def stateless_init_dp_group(
         self, return_store: bool = False
     ) -> ProcessGroup | tuple[ProcessGroup, Store]:
-        # NOTE: In high-concurrency scenarios multiple processes can pick the same
-        # (currently free) port through a race condition when calling get_open_port().
-        # To make the initialization more robust we retry a few times with a fresh
-        # port whenever this specific error is observed.
+        # NOTE: In high-concurrency scenarios multiple processes
+        # can pick the same (currently free) port through a race
+        # condition when calling `get_open_port()`. When the first
+        # process binds the port the others will subsequently fail
+        # with `torch.distributed.DistNetworkError: EADDRINUSE`.
+        # To make the initialization more robust we retry a few times
+        # with a fresh port whenever this specific error is observed.
         from torch.distributed import DistNetworkError
 
         from vllm.distributed.utils import (
@@ -677,7 +688,11 @@ class ParallelConfig:
 
     @property
     def use_all2all(self) -> bool:
-        return self.data_parallel_size > 1 or self.use_sequence_parallel_moe
+        return (
+            self.data_parallel_size > 1
+            or self.use_sequence_parallel_moe
+            or (self.enable_expert_parallel and self.prefill_context_parallel_size > 1)
+        )
 
     @property
     def use_batched_dp_moe(self) -> bool:
