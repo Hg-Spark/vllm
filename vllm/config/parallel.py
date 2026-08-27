@@ -87,7 +87,7 @@ class EPLBConfig:
     """
 
     policy: EPLBPolicyOption = "default"
-    """The policy type for expert parallel load balancing (EPLB)."""
+    """The policy type for expert load balancing (EPLB)."""
 
     communicator: EPLBCommunicatorBackend | None = None
     """
@@ -127,8 +127,8 @@ class ParallelConfig:
     """Number of ranks that split prefill sequence computation. PCP expands
     the process world size but does not increase the KV-cache shard count."""
     data_parallel_size: int = Field(default=1, ge=1)
-    """Number of data parallel groups. MoE layers will be sharded according to
-    the product of the tensor, prefill-context, and data parallel sizes."""
+    """Number of data parallel groups. MoE layers are sharded according to
+    tensor and data parallel topology; PCP remains an independent context axis."""
     data_parallel_size_local: int = Field(default=1, ge=0)
     """Number of local data parallel groups. A value of 0 is a sentinel used by
     the engine-args layer to signal that data parallelism was specified
@@ -220,9 +220,9 @@ class ParallelConfig:
     single batch."""
     dbo_prefill_token_threshold: int = Field(default=512, ge=0)  # TODO(lucas): tune
     """The threshold for dual batch overlap for batches that contain one or more
-    prefills. If the number of tokens in the request is greater than this
-    threshold, microbatching will be used. Otherwise, the request will be
-    processed in a single batch."""
+    prefills. If the number of tokens in the request is greater than this threshold,
+    microbatching will be used. Otherwise, the request will be processed in a
+    single batch."""
 
     disable_nccl_for_dp_synchronization: bool | None = None
     """Forces the dp synchronization logic in vllm/v1/worker/dp_utils.py 
@@ -238,7 +238,7 @@ class ParallelConfig:
     """Ray runtime environment to pass to distributed workers."""
 
     placement_group: PlacementGroup | None = None
-    """ray distributed model workers placement group."""
+    """ray distributed workers placement group."""
 
     distributed_executor_backend: (
         str | DistributedExecutorBackend | type[Executor] | None
@@ -253,32 +253,29 @@ class ParallelConfig:
 
     Note:
         [TPU](https://docs.vllm.ai/projects/tpu/en/latest/) platform only supports Ray
-        for distributed inference.
     """
 
     worker_cls: str = "auto"
-    """The full name of the worker class to use. If "auto", the worker class
-    will be determined based on the platform."""
+    """The full name of the worker class will be determined based on the platform."""
     sd_worker_cls: str = "auto"
     """The full name of the worker class to use for speculative decoding.
     If "auto", the worker class will be determined based on the platform."""
     worker_extension_cls: str = ""
-    """The full name of the worker extension class to use. The worker extension
-    class is dynamically inherited by the worker class. This is used to inject
-    new attributes and methods to the worker class for use in collective_rpc
-    calls."""
+    """The full name of the worker extension class is dynamically inherited by
+    the worker class. This is used to inject new attributes and methods for use
+    in collective_rpc calls."""
     master_addr: str = "127.0.0.1"
-    """distributed master address for multi-node distributed 
-    inference when distributed_executor_backend is mp."""
+    """distributed master address for multi-node distributed inference when
+    distributed_executor_backend is mp."""
     master_port: int = 29501
-    """distributed master port for multi-node distributed 
-    inference when distributed_executor_backend is mp."""
+    """distributed master port for multi-node distributed inference when
+    distributed_executor_backend is mp."""
     node_rank: int = Field(default=0, ge=0)
-    """distributed node rank for multi-node distributed
-    inference when distributed_executor_backend is mp."""
+    """distributed node rank for multi-node distributed inference when
+    distributed_executor_backend is mp."""
     nnodes: int = Field(default=1, ge=1)
-    """num of nodes for multi-node distributed
-    inference when distributed_executor_backend is mp."""
+    """num of nodes for multi-node distributed inference when
+    distributed_executor_backend is mp."""
     numa_bind: bool = False
     """Enable NUMA binding for GPU worker subprocesses.
 
@@ -498,18 +495,11 @@ class ParallelConfig:
                 )
             if not self.enable_expert_parallel:
                 raise ValueError("enable_expert_parallel must be True to use EPLB.")
-            # The EP group spans the TP x PCP x DP ranks. EPLB therefore needs
-            # TP, PCP, or DP > 1.
-            if (
-                self.tensor_parallel_size
-                * self.prefill_context_parallel_size
-                * self.data_parallel_size
-                <= 1
-            ):
+            # PCP is an execution axis, not an expert-parallel axis.
+            if self.tensor_parallel_size * self.data_parallel_size <= 1:
                 raise ValueError(
-                    "EPLB requires tensor, prefill-context, or data parallelism, "
+                    "EPLB requires tensor or data parallelism, "
                     f"but got TP={self.tensor_parallel_size}, "
-                    f"PCP={self.prefill_context_parallel_size}, "
                     f"DP={self.data_parallel_size}."
                 )
         else:
@@ -654,7 +644,7 @@ class ParallelConfig:
                 if "EADDRINUSE" in str(e):
                     logger.warning("Address already in use. Retrying with a new port.")
                     last_exc = e
-                    continue  # try again with a new port
+                    continue  # try again with a fresh port
                 raise e
 
         # If we get here all retries have failed.
@@ -688,11 +678,7 @@ class ParallelConfig:
 
     @property
     def use_all2all(self) -> bool:
-        return (
-            self.data_parallel_size > 1
-            or self.use_sequence_parallel_moe
-            or (self.enable_expert_parallel and self.prefill_context_parallel_size > 1)
-        )
+        return self.data_parallel_size > 1 or self.use_sequence_parallel_moe
 
     @property
     def use_batched_dp_moe(self) -> bool:
@@ -879,9 +865,7 @@ class ParallelConfig:
             if not self.enable_elastic_ep:
                 if not self._data_parallel_master_port_list:
                     self._data_parallel_master_port_list = get_open_ports_list(5)
-                self.data_parallel_master_port = (
-                    self._data_parallel_master_port_list.pop()
-                )
+                self.data_parallel_master_port = self._data_parallel_master_port_list.pop()
 
             if not (0 <= self.data_parallel_rank < self.data_parallel_size):
                 raise ValueError(
@@ -950,7 +934,7 @@ class ParallelConfig:
                         if get_current_placement_group():
                             backend = "ray"
             self.distributed_executor_backend = backend
-            logger.debug("Defaulting to use %s for distributed inference", backend)
+            logger.debug("Defaulting to use %s distributed inference", backend)
 
         if self.distributed_executor_backend is None and self.world_size == 1:
             self.distributed_executor_backend = "uni"
@@ -974,7 +958,7 @@ class ParallelConfig:
             # Prefer NIXL when available: zero-copy RDMA reads, compatible
             # with both async EPLB and elastic EP (deferred remote setup).
             # Fallbacks: pynccl for elastic EP (stateless groups need it),
-            # torch_gloo for static EP.  torch_nccl is avoided because NCCL
+            # torch_gloo for static EP. torch_nccl is avoided because NCCL
             # is incompatible with async EPLB (multi-stream conflicts) and
             # batched isend/irecv hangs under high load.
             # See https://github.com/pytorch/pytorch/issues/174288
