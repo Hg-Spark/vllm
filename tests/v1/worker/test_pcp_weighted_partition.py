@@ -81,16 +81,9 @@ def test_weighted_partition_aligns_continued_prefill_absolute_positions() -> Non
     )
 
 
-def test_partition_weights_parser_uses_nested_partition_config() -> None:
+def test_partition_weights_parser_uses_top_level_key() -> None:
     assert parse_pcp_partition_weights({}, 2) == (1.0, 1.0)
     assert parse_pcp_partition_weights({"other_option": True}, 2) == (1.0, 1.0)
-    assert parse_pcp_partition_weights(
-        {"weights": [1.25, 0.75]},
-        2,
-    ) == (1.25, 0.75)
-
-
-def test_partition_weights_parser_keeps_legacy_direct_parse_compatibility() -> None:
     assert parse_pcp_partition_weights(
         {"pcp_partition_weights": [1.25, 0.75]},
         2,
@@ -100,25 +93,25 @@ def test_partition_weights_parser_keeps_legacy_direct_parse_compatibility() -> N
 def test_partition_weights_parser_validates_only_owned_value() -> None:
     assert parse_pcp_partition_weights(
         {
-            "weights": [1.0, 1.0],
+            "pcp_partition_weights": [1.0, 1.0],
             "future_option": {"enabled": True},
         },
         2,
     ) == (1.0, 1.0)
 
-    with pytest.raises(ValueError, match="require 2 positive values"):
+    with pytest.raises(ValueError, match="requires 2 positive values"):
         parse_pcp_partition_weights(
-            {"weights": [1.0]},
+            {"pcp_partition_weights": [1.0]},
             2,
         )
     with pytest.raises(ValueError, match="finite positive"):
         parse_pcp_partition_weights(
-            {"weights": [1.0, 0.0]},
+            {"pcp_partition_weights": [1.0, 0.0]},
             2,
         )
     with pytest.raises(ValueError, match="must be numeric"):
         parse_pcp_partition_weights(
-            {"weights": [1.0, "bad"]},
+            {"pcp_partition_weights": [1.0, "bad"]},
             2,
         )
 

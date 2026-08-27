@@ -667,25 +667,10 @@ def maybe_build_pcp_manager(
     dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
 
     additional_config = vllm_config.additional_config
-    partition_config = None
-    if isinstance(additional_config, dict):
-        partition_config = additional_config.get("pcp_partition")
-        if (
-            partition_config is None
-            and "pcp_partition_weights" in additional_config
-        ):
-            raise ValueError(
-                "pcp_partition_weights no longer selects the contiguous PCP "
-                "implementation; use additional_config "
-                "{'pcp_partition': {'weights': [...]}}"
-            )
-
-    if partition_config is not None:
-        if not isinstance(partition_config, dict):
-            raise ValueError(
-                "pcp_partition must be a mapping, for example "
-                "{'weights': [1, 1]}"
-            )
+    if (
+        isinstance(additional_config, dict)
+        and "pcp_partition_weights" in additional_config
+    ):
         from vllm.v1.worker.gpu.pcp_weighted_partition import (
             WeightedPCPManager,
             parse_pcp_partition_weights,
@@ -703,7 +688,7 @@ def maybe_build_pcp_manager(
             dcp_rank=dcp_rank,
             cp_interleave=parallel_config.cp_kv_cache_interleave_size,
             pcp_partition_weights=parse_pcp_partition_weights(
-                partition_config,
+                additional_config,
                 pcp_size,
             ),
         )

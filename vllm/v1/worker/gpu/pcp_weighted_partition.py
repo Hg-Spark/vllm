@@ -35,7 +35,10 @@ def weighted_partition_lengths(
         return (0,) * num_segments
 
     if alignment == 1:
-        ideal = [num_tokens * weight / total_weight for weight in pcp_partition_weights]
+        ideal = [
+            num_tokens * weight / total_weight
+            for weight in pcp_partition_weights
+        ]
         lengths = [math.floor(value) for value in ideal]
         remainder = num_tokens - sum(lengths)
         order = sorted(
@@ -91,44 +94,37 @@ def weighted_partition_lengths(
 
 
 def parse_pcp_partition_weights(
-    partition_config: object,
+    additional_config: object,
     pcp_world_size: int,
 ) -> tuple[float, ...]:
-    """Parse weights owned by the contiguous PCP partition implementation.
+    """Read the optional top-level PCP rank-weight array.
 
-    The canonical shape is ``additional_config["pcp_partition"]`` and this
-    function receives that nested mapping directly, for example
-    ``{"weights": [1, 1]}``.  The legacy top-level
-    ``pcp_partition_weights`` key is accepted here only for callers that parse
-    weights directly; manager selection no longer depends on that key.
+    PCP owns only ``pcp_partition_weights``. Other additional-config keys are
+    ignored so unrelated or future configuration does not become a PCP error.
     """
     default = (1.0,) * pcp_world_size
-    if not isinstance(partition_config, dict):
+    if not isinstance(additional_config, dict):
         return default
 
-    if "weights" in partition_config:
-        raw = partition_config.get("weights")
-    else:
-        raw = partition_config.get("pcp_partition_weights")
-
+    raw = additional_config.get("pcp_partition_weights")
     if raw is None:
         return default
     if not isinstance(raw, (list, tuple)) or len(raw) != pcp_world_size:
         got = len(raw) if isinstance(raw, (list, tuple)) else type(raw).__name__
         raise ValueError(
-            f"PCP partition weights require {pcp_world_size} positive values, "
+            f"pcp_partition_weights requires {pcp_world_size} positive values, "
             f"got {got}: {raw}"
         )
     try:
         pcp_partition_weights = tuple(float(value) for value in raw)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"PCP partition weights must be numeric: {raw}") from exc
+        raise ValueError(f"pcp_partition_weights must be numeric: {raw}") from exc
     if any(
         not math.isfinite(weight) or weight <= 0
         for weight in pcp_partition_weights
     ):
         raise ValueError(
-            "PCP partition weights must contain finite positive values: "
+            "pcp_partition_weights must contain finite positive values: "
             f"{pcp_partition_weights}"
         )
     return pcp_partition_weights
