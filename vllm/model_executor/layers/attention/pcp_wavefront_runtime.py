@@ -13,10 +13,27 @@ import torch.distributed as dist
 from vllm.distributed.parallel_state import get_pcp_group
 
 
-# One outstanding layer is enough for the target wavefront:
-# producer Layer L+1 || consumer Layer L. Waiting before posting the next layer
-# also bounds source-tensor lifetime without a separate acknowledgement channel.
-_MAX_OUTSTANDING_LAYERS = 1
+_MAX_OUTSTANDING_LAYERS_ENV = "VLLM_PCP_WAVEFRONT_MAX_OUTSTANDING_LAYERS"
+
+
+def _read_max_outstanding_layers() -> int:
+    raw = os.getenv(_MAX_OUTSTANDING_LAYERS_ENV, "1")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{_MAX_OUTSTANDING_LAYERS_ENV} must be a positive integer, got {raw!r}"
+        ) from exc
+    if value < 1:
+        raise RuntimeError(
+            f"{_MAX_OUTSTANDING_LAYERS_ENV} must be >= 1, got {value}"
+        )
+    return value
+
+
+# Controls how many layer transfers rank0 may keep in flight before the next
+# handoff waits for send credit. The default preserves the original depth of 1.
+_MAX_OUTSTANDING_LAYERS = _read_max_outstanding_layers()
 _pending_sends: deque[tuple[int, list[Any], tuple[torch.Tensor, ...]]] = deque()
 _send_layer_seq = 0
 _recv_layer_seq = 0
