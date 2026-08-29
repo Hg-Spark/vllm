@@ -131,7 +131,7 @@ def parse_pcp_partition_weights(
 
 
 class WeightedPCPManager(PCPExecutionManager):
-    """One causal contiguous prefill slice per PCP rank with optional weights."""
+    """Causal contiguous prefill slices with decode owned by the last PCP rank."""
 
     def __init__(
         self,
@@ -213,6 +213,8 @@ class WeightedPCPManager(PCPExecutionManager):
                 chunk_offsets = _chunk_offsets(chunk_lengths)
                 chunk_indices = (rank,)
             else:
+                if rank != self.pcp_world_size - 1:
+                    continue
                 chunk_lengths = (query_len,)
                 chunk_offsets = (0,)
                 chunk_indices = (0,)

@@ -196,7 +196,7 @@ def test_short_prefill_falls_back_to_token_alignment() -> None:
     ] == [slice(1, 2)]
 
 
-def test_decode_remains_replicated_on_pcp_ranks() -> None:
+def test_decode_is_owned_only_by_last_pcp_rank() -> None:
     manager = WeightedPCPManager(
         pcp_world_size=2,
         pcp_rank=0,
@@ -205,6 +205,6 @@ def test_decode_remains_replicated_on_pcp_ranks() -> None:
     )
     args = _layout_inputs(num_tokens=1, is_prefilling=False)
 
-    for pcp_rank in range(2):
-        segments = manager._get_rank_segments(pcp_rank, *args)
-        assert [segment.global_batch_slice for segment in segments] == [slice(0, 1)]
+    assert manager._get_rank_segments(0, *args) == []
+    rank1_segments = manager._get_rank_segments(1, *args)
+    assert [segment.global_batch_slice for segment in rank1_segments] == [slice(0, 1)]

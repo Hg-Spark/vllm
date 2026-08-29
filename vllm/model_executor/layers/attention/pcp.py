@@ -16,7 +16,7 @@ def _stage_prefill_for_collective(
     local_width = tensor.shape[0]
     if local_width > collective_width:
         raise RuntimeError(
-            "PCP local prefill width exceeds collective slab: "
+            "PCP local cache-input width exceeds collective slab: "
             f"{local_width} > {collective_width}"
         )
     if local_width == collective_width:
@@ -32,12 +32,14 @@ def _gather_prefill_cache_inputs(
     slot_mapping: torch.Tensor,
     num_decode_tokens: int,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-    """Keep replicated decode local and gather fixed-width staged prefills.
+    """Gather fixed-width slabs for rank-owned PCP cache inputs.
 
-    Experimental PCP may execute a different number of real model rows on each
-    rank. ``slot_mapping`` retains the equal-width collective layout, so its
-    width is the communication ABI while ``tensors`` carry only real rows (or
-    one dummy row on a truly empty rank). Padding is introduced only here.
+    Wavefront PCP gives every semantic token exactly one execution owner. The
+    slot mapping already uses the same rank-major collective layout, including
+    PAD slots for unused rows. Gather each rank-local model slab as-is so ranks
+    with different decode ownership still execute an identical collective ABI.
+    ``num_decode_tokens`` is retained for call-site compatibility during the
+    staged migration to one-way layer P2P.
     """
     model_num_tokens = tensors[0].shape[0]
     assert all(tensor.shape[0] == model_num_tokens for tensor in tensors)
@@ -51,49 +53,14 @@ def _gather_prefill_cache_inputs(
             f"numel={slot_mapping.numel()}, pcp_size={pcp_size}"
         )
     collective_width = slot_mapping.numel() // pcp_size
-    if collective_width < num_decode_tokens:
-        raise RuntimeError(
-            "PCP collective width is smaller than replicated decode width: "
-            f"{collective_width} < {num_decode_tokens}"
-        )
 
-    collective_prefill_width = collective_width - num_decode_tokens
-    local_prefill_width = model_num_tokens - num_decode_tokens
-
-    if collective_prefill_width == 0:
-        if local_prefill_width != 0:
-            raise RuntimeError(
-                "PCP model produced prefill rows for a decode-only collective: "
-                f"local_prefill_width={local_prefill_width}"
-            )
-        return tensors, slot_mapping[:num_decode_tokens]
-
-    staged_prefills = tuple(
-        _stage_prefill_for_collective(
-            tensor[num_decode_tokens:],
-            collective_prefill_width,
-        )
-        for tensor in tensors
+    staged_inputs = tuple(
+        _stage_prefill_for_collective(tensor, collective_width) for tensor in tensors
     )
-    gathered_prefills = tuple(
-        pcp_group.all_gather(staged, dim=0) for staged in staged_prefills
+    gathered_inputs = tuple(
+        pcp_group.all_gather(staged, dim=0) for staged in staged_inputs
     )
-
-    rank_slot_mappings = slot_mapping.view(pcp_size, collective_width)
-    if num_decode_tokens == 0:
-        return gathered_prefills, rank_slot_mappings.flatten()
-
-    cache_inputs = tuple(
-        torch.cat((tensor[:num_decode_tokens], gathered_prefill), dim=0)
-        for tensor, gathered_prefill in zip(tensors, gathered_prefills)
-    )
-    cache_slot_mapping = torch.cat(
-        (
-            rank_slot_mappings[0, :num_decode_tokens],
-            rank_slot_mappings[:, num_decode_tokens:].flatten(),
-        )
-    )
-    return cache_inputs, cache_slot_mapping
+    return gathered_inputs, slot_mapping
 
 
 def maybe_gather_mla_latent_cache_inputs(

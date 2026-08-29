@@ -18,11 +18,15 @@ def _block_tables() -> SimpleNamespace:
     )
 
 
-def _layout_inputs(num_tokens: int) -> tuple[np.ndarray, ...]:
+def _layout_inputs(
+    num_tokens: int,
+    *,
+    is_prefilling: bool = True,
+) -> tuple[np.ndarray, ...]:
     return (
         np.asarray([num_tokens], dtype=np.int32),
         np.asarray([0], dtype=np.int32),
-        np.asarray([True], dtype=np.bool_),
+        np.asarray([is_prefilling], dtype=np.bool_),
         np.asarray([0, num_tokens], dtype=np.int32),
     )
 
@@ -87,3 +91,42 @@ def test_empty_owner_gets_exactly_one_dummy_model_row(monkeypatch) -> None:
     assert plan.collective_width == 1
     assert plan.uses_dummy_execution_row
     assert not bool(plan.kv_write_mask[3].item())
+
+
+def test_decode_plan_is_owned_by_last_rank(monkeypatch) -> None:
+    monkeypatch.setattr(pcp_execution, "async_copy_to_gpu", _copy_to_cpu)
+
+    rank0 = WeightedPCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        block_tables=_block_tables(),
+    )
+    rank1 = WeightedPCPManager(
+        pcp_world_size=2,
+        pcp_rank=1,
+        device=torch.device("cpu"),
+        block_tables=_block_tables(),
+    )
+
+    rank0_plan = rank0._build_batch_plan(
+        *_layout_inputs(3, is_prefilling=False)
+    )
+    rank1_plan = rank1._build_batch_plan(
+        *_layout_inputs(3, is_prefilling=False)
+    )
+
+    assert rank0_plan.per_rank_num_tokens == (0, 3)
+    assert rank0_plan.actual_num_tokens == 0
+    assert rank0_plan.model_num_tokens == 1
+    assert rank0_plan.uses_dummy_execution_row
+
+    assert rank1_plan.per_rank_num_tokens == (0, 3)
+    assert rank1_plan.actual_num_tokens == 3
+    assert rank1_plan.model_num_tokens == 3
+    assert not rank1_plan.uses_dummy_execution_row
+
+    rank0_slab = rank1_plan.kv_write_mask[: rank1_plan.collective_width]
+    rank1_slab = rank1_plan.kv_write_mask[rank1_plan.collective_width :]
+    assert not bool(rank0_slab.any().item())
+    assert bool(rank1_slab.all().item())

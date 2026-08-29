@@ -119,10 +119,6 @@ class PCPExecutionManager(PCPManager):
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
-                # Decode is replicated in model execution. One slot mapping is
-                # enough for cache insertion because PCP KV caches are replicated.
-                if not bool(is_prefilling[segment.global_batch_req_idx]) and pcp_rank != 0:
-                    continue
                 kv_write_mask[collective_slice] = True
                 hidden_restore_idx[segment.global_batch_slice] = np.arange(
                     collective_slice.start,
