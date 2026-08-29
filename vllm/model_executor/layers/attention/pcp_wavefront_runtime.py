@@ -72,10 +72,16 @@ def post_layer_transfer(payload: Sequence[torch.Tensor]) -> None:
     retained_tensors = tuple(payload)
     dst = pcp_group.ranks[1]
     with _nvtx_range(f"pcp_wavefront.send_post.layer_seq_{layer_seq}"):
-        send_works = [
-            dist.isend(tensor, dst=dst, group=pcp_group.device_group)
+        send_ops = [
+            dist.P2POp(
+                dist.isend,
+                tensor,
+                dst,
+                group=pcp_group.device_group,
+            )
             for tensor in retained_tensors
         ]
+        send_works = dist.batch_isend_irecv(send_ops)
     _pending_sends.append((layer_seq, send_works, retained_tensors))
 
 
@@ -96,10 +102,16 @@ def recv_layer_payload(
     recv_tensors = tuple(torch.empty_like(template) for template in recv_templates)
     src = pcp_group.ranks[0]
     with _nvtx_range(f"pcp_wavefront.recv_post.layer_seq_{layer_seq}"):
-        recv_works = [
-            dist.irecv(tensor, src=src, group=pcp_group.device_group)
+        recv_ops = [
+            dist.P2POp(
+                dist.irecv,
+                tensor,
+                src,
+                group=pcp_group.device_group,
+            )
             for tensor in recv_tensors
         ]
+        recv_works = dist.batch_isend_irecv(recv_ops)
     with _nvtx_range(f"pcp_wavefront.recv_wait.layer_seq_{layer_seq}"):
         for work in recv_works:
             work.wait()
