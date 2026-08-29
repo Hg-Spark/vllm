@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.pcp_execution import PCPExecutionManager
+from vllm.v1.worker.gpu.pcp_execution import PCPExecutionPlanner
 from vllm.v1.worker.gpu.pcp_manager import RankSegment
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -130,7 +130,7 @@ def parse_pcp_partition_weights(
     return pcp_partition_weights
 
 
-class WeightedPCPManager(PCPExecutionManager):
+class WeightedPCPManager(PCPExecutionPlanner):
     """Causal contiguous prefill slices with decode owned by the last PCP rank."""
 
     def __init__(

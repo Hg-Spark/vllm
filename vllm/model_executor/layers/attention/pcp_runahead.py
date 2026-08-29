@@ -43,20 +43,20 @@ def _nvtx_mark(name: str) -> None:
 
 
 def _wait_oldest_send() -> None:
-    _layer_seq, works, tensors = _pending_sends.popleft()
-    for work in works:
+    _layer_seq, send_works, retained_tensors = _pending_sends.popleft()
+    for work in send_works:
         work.wait()
     # Keep source storage alive through work.wait().
-    del tensors
+    del retained_tensors
 
 
-def post_layer_send(tensors: Sequence[torch.Tensor]) -> None:
+def post_layer_transfer(payload: Sequence[torch.Tensor]) -> None:
     """Post one full-layer rank0->rank1 transfer and return immediately."""
     global _send_layer_seq
 
     pcp_group = get_pcp_group()
     if pcp_group.world_size != 2 or pcp_group.rank_in_group != 0:
-        raise RuntimeError("post_layer_send must run on PCP=2 rank0")
+        raise RuntimeError("post_layer_transfer must run on PCP=2 rank0")
 
     while len(_pending_sends) >= _MAX_OUTSTANDING_LAYERS:
         pending_layer_seq = _pending_sends[0][0]
@@ -69,37 +69,39 @@ def post_layer_send(tensors: Sequence[torch.Tensor]) -> None:
     _send_layer_seq += 1
     _nvtx_mark(f"pcp_wavefront.rank0.layer_seq_{layer_seq}.handoff")
 
-    retained = tuple(tensors)
+    retained_tensors = tuple(payload)
     dst = pcp_group.ranks[1]
     with _nvtx_range(f"pcp_wavefront.send_post.layer_seq_{layer_seq}"):
-        works = [
+        send_works = [
             dist.isend(tensor, dst=dst, group=pcp_group.device_group)
-            for tensor in retained
+            for tensor in retained_tensors
         ]
-    _pending_sends.append((layer_seq, works, retained))
+    _pending_sends.append((layer_seq, send_works, retained_tensors))
 
 
-def recv_layer_like(templates: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+def recv_layer_payload(
+    recv_templates: Sequence[torch.Tensor],
+) -> tuple[torch.Tensor, ...]:
     """Receive one full-layer rank0 payload into buffers shaped like templates."""
     global _recv_layer_seq
 
     pcp_group = get_pcp_group()
     if pcp_group.world_size != 2 or pcp_group.rank_in_group != 1:
-        raise RuntimeError("recv_layer_like must run on PCP=2 rank1")
+        raise RuntimeError("recv_layer_payload must run on PCP=2 rank1")
 
     layer_seq = _recv_layer_seq
     _recv_layer_seq += 1
     _nvtx_mark(f"pcp_wavefront.rank1.layer_seq_{layer_seq}.recv_begin")
 
-    recv_tensors = tuple(torch.empty_like(template) for template in templates)
+    recv_tensors = tuple(torch.empty_like(template) for template in recv_templates)
     src = pcp_group.ranks[0]
     with _nvtx_range(f"pcp_wavefront.recv_post.layer_seq_{layer_seq}"):
-        works = [
+        recv_works = [
             dist.irecv(tensor, src=src, group=pcp_group.device_group)
             for tensor in recv_tensors
         ]
     with _nvtx_range(f"pcp_wavefront.recv_wait.layer_seq_{layer_seq}"):
-        for work in works:
+        for work in recv_works:
             work.wait()
     _nvtx_mark(f"pcp_wavefront.rank1.layer_seq_{layer_seq}.recv_ready")
     return recv_tensors

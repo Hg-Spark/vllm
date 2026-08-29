@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu.pcp_execution as pcp_execution
-from vllm.v1.worker.gpu.pcp_runahead_plan import build_pcp_runahead_plan
+from vllm.v1.worker.gpu.pcp_runahead_plan import build_pcp_wavefront_plan
 from vllm.v1.worker.gpu.pcp_weighted_partition import WeightedPCPManager
 
 
@@ -42,7 +42,7 @@ def _layout_inputs(
     )
 
 
-def test_runahead_plan_selects_rank0_valid_prefix_slots(monkeypatch) -> None:
+def test_wavefront_plan_selects_rank0_valid_prefix_slots(monkeypatch) -> None:
     monkeypatch.setattr(pcp_execution, "async_copy_to_gpu", _copy_to_cpu)
     manager = WeightedPCPManager(
         pcp_world_size=2,
@@ -54,7 +54,7 @@ def test_runahead_plan_selects_rank0_valid_prefix_slots(monkeypatch) -> None:
         *_layout_inputs(5, is_prefilling=True)
     )
     assert batch_plan.per_rank_num_tokens == (3, 2)
-    assert batch_plan.collective_width == 3
+    assert batch_plan.rank_slab_width == 3
 
     # Two cache groups, rank-major fixed-width layout:
     # rank0 [10, 11, 12] | rank1 [20, 21, PAD]
@@ -63,7 +63,7 @@ def test_runahead_plan_selects_rank0_valid_prefix_slots(monkeypatch) -> None:
         dtype=torch.int64,
     )
 
-    plan = build_pcp_runahead_plan(batch_plan, gathered_slots)
+    plan = build_pcp_wavefront_plan(batch_plan, gathered_slots)
 
     assert plan.producer_rank == 0
     assert plan.consumer_rank == 1
@@ -72,7 +72,7 @@ def test_runahead_plan_selects_rank0_valid_prefix_slots(monkeypatch) -> None:
     assert torch.equal(plan.slot_mapping_for_group(1), torch.tensor([30, 31, 32]))
 
 
-def test_decode_only_runahead_plan_has_no_remote_prefix(monkeypatch) -> None:
+def test_decode_only_wavefront_plan_has_no_remote_prefix(monkeypatch) -> None:
     monkeypatch.setattr(pcp_execution, "async_copy_to_gpu", _copy_to_cpu)
     manager = WeightedPCPManager(
         pcp_world_size=2,
@@ -86,13 +86,13 @@ def test_decode_only_runahead_plan_has_no_remote_prefix(monkeypatch) -> None:
     assert batch_plan.per_rank_num_tokens == (0, 2)
 
     gathered_slots = torch.tensor([[-1, -1, 50, 51]], dtype=torch.int64)
-    plan = build_pcp_runahead_plan(batch_plan, gathered_slots)
+    plan = build_pcp_wavefront_plan(batch_plan, gathered_slots)
 
     assert plan.num_remote_tokens == 0
     assert plan.remote_slot_mappings.shape == (1, 0)
 
 
-def test_runahead_plan_rejects_non_pcp2(monkeypatch) -> None:
+def test_wavefront_plan_rejects_non_pcp2(monkeypatch) -> None:
     monkeypatch.setattr(pcp_execution, "async_copy_to_gpu", _copy_to_cpu)
     manager = WeightedPCPManager(
         pcp_world_size=4,
@@ -106,4 +106,4 @@ def test_runahead_plan_rejects_non_pcp2(monkeypatch) -> None:
     gathered_slots = torch.arange(4, dtype=torch.int64).view(1, 4)
 
     with pytest.raises(NotImplementedError, match="PCP=2"):
-        build_pcp_runahead_plan(batch_plan, gathered_slots)
+        build_pcp_wavefront_plan(batch_plan, gathered_slots)

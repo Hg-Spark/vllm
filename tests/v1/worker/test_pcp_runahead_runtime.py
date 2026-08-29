@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-import vllm.model_executor.layers.attention.pcp_runahead as runahead
+import vllm.model_executor.layers.attention.pcp_runahead as wavefront
 
 
 class _Work:
@@ -25,7 +25,7 @@ def test_second_layer_waits_for_previous_send_credit(monkeypatch) -> None:
     )
     works: list[_Work] = []
 
-    monkeypatch.setattr(runahead, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(wavefront, "get_pcp_group", lambda: group)
 
     def fake_isend(tensor, dst, group):
         del tensor, dst, group
@@ -33,17 +33,17 @@ def test_second_layer_waits_for_previous_send_credit(monkeypatch) -> None:
         works.append(work)
         return work
 
-    monkeypatch.setattr(runahead.dist, "isend", fake_isend)
-    runahead.flush_pending_sends()
+    monkeypatch.setattr(wavefront.dist, "isend", fake_isend)
+    wavefront.flush_pending_sends()
 
-    runahead.post_layer_send((torch.zeros(2), torch.zeros(2)))
+    wavefront.post_layer_transfer((torch.zeros(2), torch.zeros(2)))
     assert [work.wait_count for work in works] == [0, 0]
 
-    runahead.post_layer_send((torch.ones(2), torch.ones(2)))
+    wavefront.post_layer_transfer((torch.ones(2), torch.ones(2)))
     assert [work.wait_count for work in works[:2]] == [1, 1]
     assert [work.wait_count for work in works[2:]] == [0, 0]
 
-    runahead.flush_pending_sends()
+    wavefront.flush_pending_sends()
     assert [work.wait_count for work in works[2:]] == [1, 1]
 
 
@@ -56,7 +56,7 @@ def test_consumer_waits_for_full_layer_receive(monkeypatch) -> None:
     )
     works: list[_Work] = []
 
-    monkeypatch.setattr(runahead, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(wavefront, "get_pcp_group", lambda: group)
 
     def fake_irecv(tensor, src, group):
         del tensor, src, group
@@ -64,9 +64,11 @@ def test_consumer_waits_for_full_layer_receive(monkeypatch) -> None:
         works.append(work)
         return work
 
-    monkeypatch.setattr(runahead.dist, "irecv", fake_irecv)
+    monkeypatch.setattr(wavefront.dist, "irecv", fake_irecv)
 
-    received = runahead.recv_layer_like((torch.empty(3, 4), torch.empty(3, 2)))
+    received = wavefront.recv_layer_payload(
+        (torch.empty(3, 4), torch.empty(3, 2))
+    )
 
     assert received[0].shape == (3, 4)
     assert received[1].shape == (3, 2)

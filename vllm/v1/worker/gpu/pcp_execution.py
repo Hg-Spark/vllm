@@ -6,14 +6,13 @@
 Weighted PCP separates three widths that canonical PCP historically folds into
 one value:
 
-* actual_num_tokens: semantic tokens owned by this PCP rank;
-* model_num_tokens: rows passed through model forward (one dummy row only when
-  actual_num_tokens is zero);
-* collective_width: equal-width PCP communication slab.
+* owned_num_tokens: semantic tokens owned by this PCP rank;
+* model_num_rows: rows passed through model forward (one dummy row only when
+  owned_num_tokens is zero);
+* rank_slab_width: fixed-width per-rank communication slab.
 
 This keeps imbalance padding out of Transformer compute while preserving the
-fixed-shape collective ABI used by the current MLA cache exchange and final
-hidden-state restore.
+fixed-shape slab ABI used by MLA cache transfer and final hidden-state restore.
 """
 
 from dataclasses import dataclass, replace
@@ -37,25 +36,25 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class PCPBatchPlan:
-    """One-step execution and collective layout for weighted PCP."""
+    """One-step execution and communication-slab layout for weighted PCP."""
 
     segments_by_rank: tuple[tuple[RankSegment, ...], ...]
     per_rank_num_tokens: tuple[int, ...]
     local_segments: tuple[RankSegment, ...]
-    actual_num_tokens: int
-    model_num_tokens: int
-    collective_width: int
-    collective_global_idx: torch.Tensor
+    owned_num_tokens: int
+    model_num_rows: int
+    rank_slab_width: int
+    slab_global_idx: torch.Tensor
     kv_write_mask: torch.Tensor
     hidden_restore_idx: torch.Tensor
 
     @property
     def uses_dummy_execution_row(self) -> bool:
-        return self.actual_num_tokens == 0 and self.model_num_tokens == 1
+        return self.owned_num_tokens == 0 and self.model_num_rows == 1
 
 
-class PCPExecutionManager(PCPManager):
-    """Execution contract for weighted contiguous PCP partitioning.
+class PCPExecutionPlanner(PCPManager):
+    """Plan execution and communication layout for weighted contiguous PCP.
 
     Partition subclasses only decide token ownership through
     ``_get_rank_segments``. This class materializes the local InputBatch and
@@ -92,37 +91,39 @@ class PCPExecutionManager(PCPManager):
             segments_by_rank.append(segments)
             per_rank_num_tokens.append(sum(segment.num_tokens for segment in segments))
 
-        collective_width = max(per_rank_num_tokens, default=0)
-        actual_num_tokens = per_rank_num_tokens[self.pcp_rank]
+        rank_slab_width = max(per_rank_num_tokens, default=0)
+        owned_num_tokens = per_rank_num_tokens[self.pcp_rank]
         # Keep exactly one compatibility row only for a truly empty owner. It is
         # marked padding and never enters KV writes, hidden restore, logits, or
         # RequestState accounting.
-        model_num_tokens = (
-            actual_num_tokens if actual_num_tokens > 0 else (1 if collective_width > 0 else 0)
+        model_num_rows = (
+            owned_num_tokens
+            if owned_num_tokens > 0
+            else (1 if rank_slab_width > 0 else 0)
         )
 
         global_num_tokens = int(query_start_loc_np[-1])
         hidden_restore_idx = np.empty(global_num_tokens, dtype=np.int64)
-        num_collective_tokens = collective_width * self.pcp_world_size
-        collective_global_idx = np.zeros(num_collective_tokens, dtype=np.int64)
-        kv_write_mask = np.zeros(num_collective_tokens, dtype=np.bool_)
+        num_slab_rows = rank_slab_width * self.pcp_world_size
+        slab_global_idx = np.zeros(num_slab_rows, dtype=np.int64)
+        kv_write_mask = np.zeros(num_slab_rows, dtype=np.bool_)
 
         for pcp_rank, segments in enumerate(segments_by_rank):
-            rank_offset = pcp_rank * collective_width
+            rank_offset = pcp_rank * rank_slab_width
             for segment in segments:
-                collective_slice = slice(
+                slab_slice = slice(
                     rank_offset + segment.rank_local_batch_slice.start,
                     rank_offset + segment.rank_local_batch_slice.stop,
                 )
-                collective_global_idx[collective_slice] = np.arange(
+                slab_global_idx[slab_slice] = np.arange(
                     segment.global_batch_slice.start,
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
-                kv_write_mask[collective_slice] = True
+                kv_write_mask[slab_slice] = True
                 hidden_restore_idx[segment.global_batch_slice] = np.arange(
-                    collective_slice.start,
-                    collective_slice.stop,
+                    slab_slice.start,
+                    slab_slice.stop,
                     dtype=np.int64,
                 )
 
@@ -130,11 +131,11 @@ class PCPExecutionManager(PCPManager):
             segments_by_rank=tuple(segments_by_rank),
             per_rank_num_tokens=tuple(per_rank_num_tokens),
             local_segments=segments_by_rank[self.pcp_rank],
-            actual_num_tokens=actual_num_tokens,
-            model_num_tokens=model_num_tokens,
-            collective_width=collective_width,
-            collective_global_idx=async_copy_to_gpu(
-                collective_global_idx,
+            owned_num_tokens=owned_num_tokens,
+            model_num_rows=model_num_rows,
+            rank_slab_width=rank_slab_width,
+            slab_global_idx=async_copy_to_gpu(
+                slab_global_idx,
                 device=self.device,
             ),
             kv_write_mask=async_copy_to_gpu(kv_write_mask, device=self.device),
@@ -185,10 +186,10 @@ class PCPExecutionManager(PCPManager):
                 "PCP local request count exceeds the MRV2 input buffer size: "
                 f"{num_local_reqs} > {input_buffers.max_num_reqs}."
             )
-        if plan.model_num_tokens > input_buffers.max_num_tokens:
+        if plan.model_num_rows > input_buffers.max_num_tokens:
             raise RuntimeError(
-                "PCP local model token count exceeds the MRV2 input buffer size: "
-                f"{plan.model_num_tokens} > {input_buffers.max_num_tokens}."
+                "PCP local model row count exceeds the MRV2 input buffer size: "
+                f"{plan.model_num_rows} > {input_buffers.max_num_tokens}."
             )
 
         local_to_global_batch_req_idx_np = np.fromiter(
@@ -219,18 +220,18 @@ class PCPExecutionManager(PCPManager):
             for global_batch_req_idx in local_to_global_batch_req_idx_np
         ]
 
-        if plan.actual_num_tokens > 0:
-            rank_start = self.pcp_rank * plan.collective_width
-            local_input_idx = plan.collective_global_idx[
-                rank_start : rank_start + plan.actual_num_tokens
+        if plan.owned_num_tokens > 0:
+            rank_start = self.pcp_rank * plan.rank_slab_width
+            local_input_idx = plan.slab_global_idx[
+                rank_start : rank_start + plan.owned_num_tokens
             ]
             torch.index_select(
                 global_batch.input_ids,
                 0,
                 local_input_idx,
-                out=input_buffers.input_ids[: plan.actual_num_tokens],
+                out=input_buffers.input_ids[: plan.owned_num_tokens],
             )
-        elif plan.model_num_tokens == 1:
+        elif plan.model_num_rows == 1:
             input_buffers.input_ids[:1].zero_()
 
         local_query_start_loc_np = np.empty(
@@ -240,7 +241,7 @@ class PCPExecutionManager(PCPManager):
         local_query_start_loc_np[0] = 0
         local_query_start_loc_out = local_query_start_loc_np[1 : num_local_reqs + 1]
         np.cumsum(local_num_scheduled_tokens, out=local_query_start_loc_out)
-        local_query_start_loc_np[num_local_reqs + 1 :] = plan.actual_num_tokens
+        local_query_start_loc_np[num_local_reqs + 1 :] = plan.owned_num_tokens
         async_copy_to_gpu(local_query_start_loc_np, out=input_buffers.query_start_loc)
         local_query_start_loc = input_buffers.query_start_loc[: num_local_reqs + 1]
 
@@ -260,15 +261,15 @@ class PCPExecutionManager(PCPManager):
         )
         seq_lens = input_buffers.seq_lens[:num_local_reqs]
 
-        is_padding = input_buffers.is_padding[: plan.model_num_tokens]
-        if plan.actual_num_tokens > 0:
+        is_padding = input_buffers.is_padding[: plan.model_num_rows]
+        if plan.owned_num_tokens > 0:
             is_padding.fill_(False)
-        elif plan.model_num_tokens == 1:
+        elif plan.model_num_rows == 1:
             is_padding.fill_(True)
             input_buffers.input_ids[:1].zero_()
             input_buffers.positions[:1].zero_()
 
-        total_num_logits = num_local_reqs if plan.actual_num_tokens > 0 else 0
+        total_num_logits = num_local_reqs if plan.owned_num_tokens > 0 else 0
         if total_num_logits > 0:
             cu_num_logits_np = np.arange(num_local_reqs + 1, dtype=np.int32)
             cu_num_logits = torch.arange(
@@ -322,12 +323,12 @@ class PCPExecutionManager(PCPManager):
             dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_local_reqs]
 
         logger.debug(
-            "Weighted PCP batch: rank=%d actual_tokens=%d model_tokens=%d "
-            "collective_width=%d dummy_row=%s per_rank_tokens=%s",
+            "Weighted PCP batch: rank=%d owned_tokens=%d model_rows=%d "
+            "rank_slab_width=%d dummy_row=%s per_rank_tokens=%s",
             self.pcp_rank,
-            plan.actual_num_tokens,
-            plan.model_num_tokens,
-            plan.collective_width,
+            plan.owned_num_tokens,
+            plan.model_num_rows,
+            plan.rank_slab_width,
             plan.uses_dummy_execution_row,
             plan.per_rank_num_tokens,
         )
@@ -346,8 +347,8 @@ class PCPExecutionManager(PCPManager):
                 device=self.device,
             ),
             num_scheduled_tokens=local_num_scheduled_tokens,
-            num_tokens=plan.actual_num_tokens,
-            num_tokens_after_padding=plan.model_num_tokens,
+            num_tokens=plan.owned_num_tokens,
+            num_tokens_after_padding=plan.model_num_rows,
             num_draft_tokens=0,
             num_draft_tokens_per_req=None,
             query_start_loc=local_query_start_loc,
@@ -362,8 +363,8 @@ class PCPExecutionManager(PCPManager):
             max_seq_len_np=global_batch.max_seq_len_np[local_to_global_batch_req_idx_np]
             if global_batch.max_seq_len_np is not None
             else None,
-            input_ids=input_buffers.input_ids[: plan.model_num_tokens],
-            positions=input_buffers.positions[: plan.model_num_tokens],
+            input_ids=input_buffers.input_ids[: plan.model_num_rows],
+            positions=input_buffers.positions[: plan.model_num_rows],
             is_padding=is_padding,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
@@ -378,21 +379,19 @@ class PCPExecutionManager(PCPManager):
         plan = self._batch_plan
         if plan is None:
             raise RuntimeError("PCP slot mapping requested without a batch plan")
-        num_collective_tokens = plan.collective_global_idx.shape[0]
+        num_slab_rows = plan.slab_global_idx.shape[0]
         if self._gathered_kv_slot_mappings is None:
             self._gathered_kv_slot_mappings = global_batch_slot_mappings.new_empty(
                 global_batch_slot_mappings.shape[0],
-                num_collective_tokens,
+                num_slab_rows,
             )
-        gathered_kv_slot_mappings = self._gathered_kv_slot_mappings[
-            :, :num_collective_tokens
-        ]
-        if num_collective_tokens == 0:
+        gathered_kv_slot_mappings = self._gathered_kv_slot_mappings[:, :num_slab_rows]
+        if num_slab_rows == 0:
             return gathered_kv_slot_mappings
         torch.index_select(
             global_batch_slot_mappings,
             1,
-            plan.collective_global_idx,
+            plan.slab_global_idx,
             out=gathered_kv_slot_mappings,
         )
         torch.where(
@@ -407,27 +406,27 @@ class PCPExecutionManager(PCPManager):
         plan = self._batch_plan
         if plan is None:
             return hidden_states
-        if plan.collective_width == 0:
+        if plan.rank_slab_width == 0:
             return hidden_states[:0]
-        if hidden_states.shape[0] < plan.actual_num_tokens:
+        if hidden_states.shape[0] < plan.owned_num_tokens:
             raise RuntimeError(
-                "PCP hidden-state rows are smaller than actual token ownership: "
-                f"{hidden_states.shape[0]} < {plan.actual_num_tokens}"
+                "PCP hidden-state rows are smaller than owned token count: "
+                f"{hidden_states.shape[0]} < {plan.owned_num_tokens}"
             )
 
         if (
-            plan.actual_num_tokens == plan.collective_width
-            and hidden_states.shape[0] == plan.collective_width
+            plan.owned_num_tokens == plan.rank_slab_width
+            and hidden_states.shape[0] == plan.rank_slab_width
         ):
-            collective_hidden_states = hidden_states
+            slab_hidden_states = hidden_states
         else:
-            collective_hidden_states = hidden_states.new_zeros(
-                (plan.collective_width, *hidden_states.shape[1:])
+            slab_hidden_states = hidden_states.new_zeros(
+                (plan.rank_slab_width, *hidden_states.shape[1:])
             )
-            if plan.actual_num_tokens > 0:
-                collective_hidden_states[: plan.actual_num_tokens].copy_(
-                    hidden_states[: plan.actual_num_tokens]
+            if plan.owned_num_tokens > 0:
+                slab_hidden_states[: plan.owned_num_tokens].copy_(
+                    hidden_states[: plan.owned_num_tokens]
                 )
 
-        gathered = get_pcp_group().all_gather(collective_hidden_states, dim=0)
+        gathered = get_pcp_group().all_gather(slab_hidden_states, dim=0)
         return gathered[plan.hidden_restore_idx]
