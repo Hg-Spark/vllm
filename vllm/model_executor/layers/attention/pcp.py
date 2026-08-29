@@ -6,7 +6,7 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_tp_group,
 )
-from vllm.model_executor.layers.attention.pcp_runahead import (
+from vllm.model_executor.layers.attention.pcp_wavefront_runtime import (
     post_layer_transfer,
     recv_layer_payload,
 )
@@ -135,10 +135,6 @@ def maybe_transfer_mla_cache_inputs(
     )
     cache_k_pe = cache_k_pe_flat.view(-1, *k_pe.shape[1:])
     return cache_kv_c, cache_k_pe, cache_slot_mapping
-
-
-# Compatibility alias for existing MLA attention call sites.
-maybe_gather_mla_latent_cache_inputs = maybe_transfer_mla_cache_inputs
 
 
 def maybe_gather_indexer_k(

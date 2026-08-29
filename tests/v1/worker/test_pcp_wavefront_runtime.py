@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-import vllm.model_executor.layers.attention.pcp_runahead as wavefront
+import vllm.model_executor.layers.attention.pcp_wavefront_runtime as wavefront
 
 
 class _Work:

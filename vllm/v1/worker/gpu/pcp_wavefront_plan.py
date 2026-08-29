@@ -28,28 +28,26 @@ class PCPWavefrontPlan:
 
 def build_pcp_wavefront_plan(
     batch_plan: PCPBatchPlan,
-    gathered_slot_mappings: torch.Tensor,
+    slab_slot_mappings: torch.Tensor,
 ) -> PCPWavefrontPlan:
     """Build rank0-prefix -> rank1 slot placement from the current step layout."""
     if len(batch_plan.per_rank_num_tokens) != 2:
         raise NotImplementedError("PCP wavefront currently requires PCP=2.")
-    if gathered_slot_mappings.ndim != 2:
-        raise ValueError(
-            "PCP gathered slot mappings must be cache-group-major 2D tensor."
-        )
+    if slab_slot_mappings.ndim != 2:
+        raise ValueError("PCP slab slot mappings must be cache-group-major 2D tensor.")
 
     expected_width = batch_plan.rank_slab_width * 2
-    if gathered_slot_mappings.shape[1] != expected_width:
+    if slab_slot_mappings.shape[1] != expected_width:
         raise ValueError(
-            "PCP gathered slot width does not match the batch plan: "
-            f"{gathered_slot_mappings.shape[1]} != {expected_width}"
+            "PCP slab slot width does not match the batch plan: "
+            f"{slab_slot_mappings.shape[1]} != {expected_width}"
         )
 
     # Wavefront decode ownership is rank1-only, so every semantic row owned by
     # rank0 is a prefill row. Rank-local rows occupy the beginning of rank0's
     # fixed-width rank slab in exactly the order emitted by rank0.
     num_remote_tokens = batch_plan.per_rank_num_tokens[0]
-    remote_slot_mappings = gathered_slot_mappings[:, :num_remote_tokens]
+    remote_slot_mappings = slab_slot_mappings[:, :num_remote_tokens]
 
     return PCPWavefrontPlan(
         producer_rank=0,
