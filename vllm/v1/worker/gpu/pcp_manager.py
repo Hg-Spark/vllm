@@ -8,6 +8,7 @@ import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.pcp_runahead import flush_pending_sends
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
@@ -614,6 +615,8 @@ class PCPManager:
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, InputBatch]:
+        if self.pcp_rank == 0:
+            flush_pending_sends()
         assert self._global_batch is not None
         return self.restore_hidden_states(hidden_states), self._global_batch
 

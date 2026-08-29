@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
-import torch.distributed as dist
 
 from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_tp_group,
+)
+from vllm.model_executor.layers.attention.pcp_runahead import (
+    post_layer_send,
+    recv_layer_like,
 )
 
 
@@ -35,12 +38,9 @@ def _exchange_mla_cache_inputs(
     """Exchange one full layer of MLA cache inputs from rank0 to rank1.
 
     Communication uses the existing fixed-width rank slabs. Rank0 computes only
-    its real prefix rows, pads the transport slab, and sends the complete layer
-    payload once. Rank1 receives rank0's slab and writes it together with its
-    local rows. PAD slots make transport padding semantically inert.
-
-    This stage is intentionally synchronous. A later wavefront stage keeps the
-    rank0 send outstanding while rank0 continues local attention/FFN.
+    its real prefix rows, pads the transport slab, posts the complete layer
+    payload, then immediately returns to local cache update/attention. Rank1
+    consumes rank0's slab before entering attention for that layer.
     """
     model_num_tokens = tensors[0].shape[0]
     assert all(tensor.shape[0] == model_num_tokens for tensor in tensors)
@@ -69,29 +69,17 @@ def _exchange_mla_cache_inputs(
             _stage_prefill_for_collective(tensor, collective_width)
             for tensor in tensors
         )
-        dst = pcp_group.ranks[1]
-        works = [
-            dist.isend(tensor, dst=dst, group=pcp_group.device_group)
-            for tensor in staged_inputs
-        ]
-        for work in works:
-            work.wait()
+        post_layer_send(staged_inputs)
         local_slots = rank_slot_mappings[0, :model_num_tokens]
         return tensors, local_slots
 
     if rank != 1:
         raise RuntimeError(f"Unexpected PCP rank for PCP=2 wavefront: {rank}")
 
-    recv_inputs = tuple(
+    recv_templates = tuple(
         tensor.new_empty((collective_width, *tensor.shape[1:])) for tensor in tensors
     )
-    src = pcp_group.ranks[0]
-    works = [
-        dist.irecv(tensor, src=src, group=pcp_group.device_group)
-        for tensor in recv_inputs
-    ]
-    for work in works:
-        work.wait()
+    recv_inputs = recv_layer_like(recv_templates)
 
     local_slots = rank_slot_mappings[1, :model_num_tokens]
     cache_inputs = tuple(

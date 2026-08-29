@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 import vllm.v1.worker.gpu.pcp_execution as pcp_execution
+import vllm.v1.worker.gpu.pcp_manager as pcp_manager
 from vllm.v1.worker.gpu.pcp_execution import PCPExecutionManager
 from vllm.v1.worker.gpu.pcp_weighted_partition import WeightedPCPManager
 
@@ -130,3 +131,27 @@ def test_decode_plan_is_owned_by_last_rank(monkeypatch) -> None:
     rank1_slab = rank1_plan.kv_write_mask[rank1_plan.collective_width :]
     assert not bool(rank0_slab.any().item())
     assert bool(rank1_slab.all().item())
+
+
+def test_rank0_flushes_pending_sends_before_sampling(monkeypatch) -> None:
+    flush_calls = 0
+
+    def fake_flush() -> None:
+        nonlocal flush_calls
+        flush_calls += 1
+
+    monkeypatch.setattr(pcp_manager, "flush_pending_sends", fake_flush)
+    manager = pcp_manager.PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+    )
+    global_batch = SimpleNamespace()
+    manager._global_batch = global_batch
+    hidden_states = torch.zeros(1, 2)
+
+    restored_hidden_states, restored_batch = manager.restore_for_sampling(hidden_states)
+
+    assert flush_calls == 1
+    assert restored_hidden_states is hidden_states
+    assert restored_batch is global_batch
