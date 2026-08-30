@@ -57,8 +57,6 @@ def compute_plan_fingerprint(
     Driver-only changes are not part of the key; the free-memory gate at
     apply time bounds the residual risk.
     """
-    # Imported here (as VllmConfig.compute_hash does) to avoid a cycle with
-    # the top-level vllm package.
     from vllm import __version__ as vllm_version
 
     capability = current_platform.get_device_capability()
@@ -79,17 +77,12 @@ def compute_plan_fingerprint(
 
 
 def _plan_path(fingerprint: str) -> str:
-    """Plans are regenerable derived state, so they live under the standard
-    vLLM cache root (like the torch.compile cache) and relocate with
-    ``VLLM_CACHE_ROOT`` instead of needing a location knob of their own."""
-    # VLLM_CACHE_ROOT is already user-expanded by envs.py.
     return os.path.join(
         envs.VLLM_CACHE_ROOT, "startup_plan", f"startup_plan_{fingerprint}.json"
     )
 
 
 def _load_plan(fingerprint: str) -> dict | None:
-    """Load a plan for this fingerprint; None if absent or unreadable."""
     path = _plan_path(fingerprint)
     try:
         with open(path) as f:
@@ -110,13 +103,6 @@ def _load_plan(fingerprint: str) -> dict | None:
 def _applicable_kv_cache_memory_bytes(
     plan: dict, current_free_memory: int
 ) -> int | None:
-    """The apply-time OOM-safety gate.
-
-    The recorded value is only valid if the device has at least as much
-    free memory now as when the plan was measured (co-tenants, leaked
-    allocations, or MIG changes all reduce it). Outside that envelope,
-    return None and let the caller re-profile.
-    """
     kv_bytes = plan.get("kv_cache_memory_bytes")
     baseline = plan.get("free_memory_baseline")
     if not isinstance(kv_bytes, int) or not isinstance(baseline, int):
@@ -140,9 +126,9 @@ def _prepare_pcp_profile_run(worker: "Worker") -> None:
 
     Memory profiling runs before the PCP manager and KV cache are initialized,
     so the normal batch partitioner cannot reduce the dummy forward. Install the
-    PCP MLP/MoE memory microbatch wrappers early, then wrap exactly one
-    ``profile_run`` call with a temporary rank-local token budget. The global
-    scheduler/model-runner limit is restored even if profiling raises.
+    PCP tile/FFN wrappers early, then wrap exactly one ``profile_run`` call with
+    a temporary rank-local token budget. The global scheduler/model-runner limit
+    is restored even if profiling raises.
     """
     parallel_config = worker.vllm_config.parallel_config
     pcp_size = parallel_config.prefill_context_parallel_size
@@ -153,11 +139,9 @@ def _prepare_pcp_profile_run(worker: "Worker") -> None:
     if not isinstance(additional_config, dict):
         return
 
-    from vllm.v1.worker.gpu.pcp_microbatch import (
-        configure_pcp_memory_microbatching,
-    )
+    from vllm.v1.worker.gpu.pcp_tile import configure_pcp_tiling
 
-    microbatch_size = configure_pcp_memory_microbatching(worker.vllm_config)
+    tile_size = configure_pcp_tiling(worker.vllm_config)
 
     # The Wavefront execution planner is selected only when explicit weighted
     # partitioning is configured. Keep legacy PCP profiling unchanged.
@@ -175,7 +159,6 @@ def _prepare_pcp_profile_run(worker: "Worker") -> None:
     pcp_rank = get_pcp_group().rank_in_group
     weights = parse_pcp_partition_weights(additional_config, pcp_size)
     per_rank_tokens = weighted_partition_lengths(global_num_tokens, weights)
-    # PCPExecutionPlanner uses one padding-only model row for an empty owner.
     profile_num_tokens = max(1, per_rank_tokens[pcp_rank])
 
     original_profile_run = runner.profile_run
@@ -192,12 +175,12 @@ def _prepare_pcp_profile_run(worker: "Worker") -> None:
     runner.profile_run = profile_run_once
     logger.info(
         "Prepared PCP-aware startup profile: rank=%d global_tokens=%d "
-        "profile_tokens=%d per_rank_tokens=%s microbatch_size=%d",
+        "profile_tokens=%d per_rank_tokens=%s tile_size=%d",
         pcp_rank,
         global_num_tokens,
         profile_num_tokens,
         per_rank_tokens,
-        microbatch_size,
+        tile_size,
     )
 
 
