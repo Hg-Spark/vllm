@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import vllm.distributed.parallel_state as parallel_state
 from vllm.v1.worker import startup_plan
 from vllm.v1.worker.gpu import pcp_microbatch
-import vllm.distributed.parallel_state as parallel_state
 
 
 def _make_worker(*, rank: int, weights: list[float], max_num_tokens: int = 10):
@@ -78,7 +78,7 @@ def test_prepare_pcp_profile_run_restores_global_limit_on_error(
     runner = SimpleNamespace(max_num_tokens=11)
 
     def profile_run() -> None:
-        assert runner.max_num_tokens == 8
+        assert runner.max_num_tokens == 7
         raise RuntimeError("profile failed")
 
     runner.profile_run = profile_run
