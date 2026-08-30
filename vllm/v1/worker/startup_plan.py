@@ -18,8 +18,9 @@ falls back to full profiling, so a stale plan costs nothing and is never
 trusted.
 
 Weighted PCP also uses this startup hook to make the one-shot model profile
-match rank-local execution. The scheduler's global token budget is preserved;
-only the profile call temporarily sees the rows owned by the current PCP rank.
+cover each rank's causal prefix. The scheduler's global token budget is
+preserved; only the profile call temporarily sees the cumulative token budget
+visible to the current PCP rank.
 """
 
 import hashlib
@@ -121,14 +122,36 @@ def _applicable_kv_cache_memory_bytes(
     return kv_bytes
 
 
+def _pcp_causal_profile_tokens(
+    per_rank_tokens: tuple[int, ...], pcp_rank: int
+) -> int:
+    """Return the cumulative causal context visible to one PCP rank.
+
+    PCP partitions a causal prefill into ordered contiguous segments. Rank r
+    computes its local segment while attending to every earlier segment, so its
+    profile must cover ``sum(lengths[: r + 1])`` rather than only its local
+    segment length. For PCP=2 this makes rank1 profile the full global context.
+    """
+    if not 0 <= pcp_rank < len(per_rank_tokens):
+        raise ValueError(
+            f"Invalid PCP rank {pcp_rank} for {len(per_rank_tokens)} partitions"
+        )
+    return max(1, sum(per_rank_tokens[: pcp_rank + 1]))
+
+
 def _prepare_pcp_profile_run(worker: "Worker") -> None:
-    """Make the next profile call mirror weighted PCP rank-local execution.
+    """Make the next profile call cover weighted PCP causal rank execution.
 
     Memory profiling runs before the PCP manager and KV cache are initialized,
-    so the normal batch partitioner cannot reduce the dummy forward. Install the
-    PCP tile/FFN wrappers early, then wrap exactly one ``profile_run`` call with
-    a temporary rank-local token budget. The global scheduler/model-runner limit
-    is restored even if profiling raises.
+    so the normal batch partitioner cannot model each rank's causal prefix.
+    Install the PCP tile/FFN wrappers early, then wrap exactly one
+    ``profile_run`` call with the cumulative token budget visible to this rank.
+    The global scheduler/model-runner limit is restored even if profiling
+    raises.
+
+    This single scalar is a conservative proxy: it covers the rank's causal
+    context even though the real Wavefront path may have fewer rank-local query
+    rows than context rows.
     """
     parallel_config = worker.vllm_config.parallel_config
     pcp_size = parallel_config.prefill_context_parallel_size
@@ -159,13 +182,13 @@ def _prepare_pcp_profile_run(worker: "Worker") -> None:
     pcp_rank = get_pcp_group().rank_in_group
     weights = parse_pcp_partition_weights(additional_config, pcp_size)
     per_rank_tokens = weighted_partition_lengths(global_num_tokens, weights)
-    profile_num_tokens = max(1, per_rank_tokens[pcp_rank])
+    causal_profile_tokens = _pcp_causal_profile_tokens(per_rank_tokens, pcp_rank)
 
     original_profile_run = runner.profile_run
 
     def profile_run_once() -> None:
         previous_max_num_tokens = runner.max_num_tokens
-        runner.max_num_tokens = profile_num_tokens
+        runner.max_num_tokens = causal_profile_tokens
         try:
             original_profile_run()
         finally:
@@ -175,10 +198,12 @@ def _prepare_pcp_profile_run(worker: "Worker") -> None:
     runner.profile_run = profile_run_once
     logger.info(
         "Prepared PCP-aware startup profile: rank=%d global_tokens=%d "
-        "profile_tokens=%d per_rank_tokens=%s tile_size=%d",
+        "local_tokens=%d causal_profile_tokens=%d per_rank_tokens=%s "
+        "tile_size=%d",
         pcp_rank,
         global_num_tokens,
-        profile_num_tokens,
+        per_rank_tokens[pcp_rank],
+        causal_profile_tokens,
         per_rank_tokens,
         tile_size,
     )
