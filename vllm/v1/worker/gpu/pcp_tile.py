@@ -188,13 +188,13 @@ def _supports_tiled_mla(
     if int(getattr(metadata, "num_prefills", 0) or 0) <= 0:
         return False
 
-    # Weighted PCP ranks may own different row counts. The shared slab width
-    # guarantees both peers choose the same tile/full-layer protocol.
+    # Every supported prefill uses the tile protocol. Short prefills are a
+    # single tile rather than falling back to a separate layer-level protocol.
     return _transport_rows(
         wrapper.mla_attn,
         slot_mapping,
         num_tokens,
-    ) > tile_size
+    ) > 0
 
 
 def _run_tiled_mla(
