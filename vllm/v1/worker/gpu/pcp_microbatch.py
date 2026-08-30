@@ -623,7 +623,6 @@ def configure_pcp_memory_microbatching(vllm_config: VllmConfig) -> int:
             plan is None
             or self.use_mha
             or self.use_sequence_parallel_moe
-            or self.self_attn.mla_attn.calculate_kv_scales
         ):
             return original_deepseek_decoder_forward(
                 self,
@@ -690,7 +689,7 @@ def configure_pcp_memory_microbatching(vllm_config: VllmConfig) -> int:
         llama_4_scaling: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         plan = _get_attention_microbatch_plan()
-        if plan is None or self.self_attn.mla_attn.calculate_kv_scales:
+        if plan is None:
             return original_glm_decoder_forward(
                 self,
                 positions,
