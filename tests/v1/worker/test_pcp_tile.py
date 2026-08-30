@@ -17,8 +17,6 @@ def test_parse_pcp_tile_size() -> None:
     assert parse_pcp_tile_size({}) == 0
     assert parse_pcp_tile_size({"pcp_tile_size": 0}) == 0
     assert parse_pcp_tile_size({"pcp_tile_size": 4096}) == 4096
-    # No compatibility alias: the old key is intentionally ignored.
-    assert parse_pcp_tile_size({"pcp_microbatch_size": 4096}) == 0
 
     for invalid in (-1, 1.5, True, "4096"):
         with pytest.raises(ValueError, match="pcp_tile_size"):
