@@ -9,9 +9,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
 )
 from vllm.model_executor.layers.attention.pcp_wavefront_runtime import (
-    post_layer_transfer,
     post_tile_transfer,
-    recv_layer_payload,
     recv_tile_payload_into,
 )
 
@@ -58,7 +56,13 @@ def _transfer_mla_cache_inputs(
     tensors: tuple[torch.Tensor, ...],
     slot_mapping: torch.Tensor,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-    """Baseline full-layer rank0->rank1 MLA cache handoff."""
+    """Fallback PCP MLA cache handoff using the unified tile protocol.
+
+    This path intentionally represents the complete rank slab as one tile.
+    Dense prefill normally uses ``iter_tiled_mla_cache_inputs``; this fallback
+    remains for decode or unsupported outer-MLA paths without reintroducing a
+    second layer-level transport/credit mechanism.
+    """
     model_num_rows = tensors[0].shape[0]
     assert all(tensor.shape[0] == model_num_rows for tensor in tensors)
 
@@ -84,15 +88,15 @@ def _transfer_mla_cache_inputs(
         send_payload = tuple(
             _pad_to_rank_slab(tensor, rank_slab_width) for tensor in tensors
         )
-        post_layer_transfer(send_payload)
+        post_tile_transfer(send_payload)
         return tensors, rank_slot_mappings[0, :model_num_rows]
     if rank != 1:
         raise RuntimeError(f"Unexpected PCP rank for PCP=2 wavefront: {rank}")
 
-    recv_templates = tuple(
+    remote_inputs = tuple(
         tensor.new_empty((rank_slab_width, *tensor.shape[1:])) for tensor in tensors
     )
-    remote_inputs = recv_layer_payload(recv_templates)
+    recv_tile_payload_into(remote_inputs)
     local_slots = rank_slot_mappings[1, :model_num_rows]
     cache_inputs = tuple(
         torch.cat((remote, local), dim=0)
@@ -220,7 +224,6 @@ def maybe_transfer_mla_cache_inputs(
     if not use_pcp or num_decode_tokens is None:
         return kv_c_normed, k_pe, slot_mapping
     assert slot_mapping is not None
-    num_rows = kv_c_normed.shape[0]
     k_pe_flat = k_pe.flatten(1)
     (cache_kv_c, cache_k_pe_flat), cache_slot_mapping = _transfer_mla_cache_inputs(
         (kv_c_normed, k_pe_flat), slot_mapping
