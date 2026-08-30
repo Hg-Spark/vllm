@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""PCP memory microbatching for MLA and token-wise feed-forward sublayers.
+"""PCP memory microbatching for MLA and token-wise decoder work.
 
-Wavefront communication remains a full-layer rank0->rank1 latent handoff.
-Within each rank, expanded MLA query/attention/output work and MLP/MoE work can
-run in bounded token microbatches to cap transient GPU memory.
+Wavefront communication remains a full-layer rank0->rank1 compressed-latent
+handoff. Within each rank, expanded MLA query/attention/output work plus the
+post-attention norm and feed-forward sublayer run as one bounded token
+microbatch pipeline to cap transient GPU memory.
 """
 
 from collections.abc import Callable
@@ -34,6 +35,20 @@ class PCPAttentionMicrobatchPlan:
 
     slices: tuple[slice, ...]
     attn_metadata: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class PCPMLAMicrobatchState:
+    """Full-layer compressed MLA state consumed one query MB at a time."""
+
+    wrapper: Any
+    positions: torch.Tensor
+    hidden_states: torch.Tensor
+    llama_4_scaling: torch.Tensor | None
+    plan: PCPAttentionMicrobatchPlan
+    q_c: torch.Tensor
+    kv_c_normed: torch.Tensor
+    k_pe: torch.Tensor
 
 
 def parse_pcp_microbatch_size(additional_config: object) -> int:
@@ -232,7 +247,9 @@ def _local_pcp_slot_mappings(
     """Extract this rank's real rows from the full two-rank PCP slot slab."""
     pcp_group = get_pcp_group()
     if pcp_group.world_size != 2:
-        raise NotImplementedError("PCP attention microbatching currently requires PCP=2.")
+        raise NotImplementedError(
+            "PCP attention microbatching currently requires PCP=2."
+        )
     if slot_mappings.shape[1] % 2 != 0:
         raise RuntimeError(
             "PCP slot mappings do not contain two equal rank slabs: "
@@ -300,6 +317,18 @@ def _attach_attention_microbatch_plan(
     return full_attn_metadata
 
 
+def _get_attention_microbatch_plan() -> PCPAttentionMicrobatchPlan | None:
+    attn_metadata = get_forward_context().attn_metadata
+    if not isinstance(attn_metadata, dict):
+        return None
+    plan = attn_metadata.get(_ATTN_PLAN_KEY)
+    if plan is None:
+        return None
+    if not isinstance(plan, PCPAttentionMicrobatchPlan):
+        raise RuntimeError("Invalid PCP attention microbatch plan in forward context.")
+    return plan
+
+
 def _slice_scaling(
     scaling: torch.Tensor | None,
     token_slice: slice,
@@ -312,14 +341,7 @@ def _slice_scaling(
     return scaling
 
 
-def _run_mla_microbatches(
-    wrapper: Any,
-    positions: torch.Tensor,
-    hidden_states: torch.Tensor,
-    llama_4_scaling: torch.Tensor | None,
-    plan: PCPAttentionMicrobatchPlan,
-) -> torch.Tensor:
-    """Run full compressed latent preparation followed by bounded MLA MBs."""
+def _validate_mla_wrapper(wrapper: Any, plan: PCPAttentionMicrobatchPlan) -> None:
     if wrapper.q_lora_rank is None:
         raise NotImplementedError(
             "PCP MLA microbatching currently requires q_lora_rank to be set."
@@ -332,10 +354,23 @@ def _run_mla_microbatches(
         raise NotImplementedError(
             "PCP MLA microbatching does not support DCP Q replication yet."
         )
+    if not plan.slices:
+        raise RuntimeError("PCP attention microbatch plan is empty.")
+
+
+def _prepare_mla_microbatch_state(
+    wrapper: Any,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    llama_4_scaling: torch.Tensor | None,
+    plan: PCPAttentionMicrobatchPlan,
+) -> PCPMLAMicrobatchState:
+    """Build full compressed latent state and stage this layer in KV cache once."""
+    _validate_mla_wrapper(wrapper, plan)
 
     mla_attn = wrapper.mla_attn
     num_tokens = hidden_states.shape[0]
-    if not plan.slices or plan.slices[-1].stop != num_tokens:
+    if plan.slices[-1].stop != num_tokens:
         raise RuntimeError(
             "PCP attention microbatch plan does not cover the rank-local batch."
         )
@@ -344,13 +379,14 @@ def _run_mla_microbatches(
     assert wrapper.q_a_layernorm is not None
     assert wrapper.q_b_proj is not None
 
-    # Phase A: keep only compressed resident state for the full local layer.
+    # Phase A is intentionally full-rank-local: compressed latent creation and
+    # communication remain layer-granularity in the current wavefront protocol.
     qkv_lora = wrapper.fused_qkv_a_proj(hidden_states)[0]
-    q_c, kv_lora = qkv_lora.split(
+    q_c_view, kv_lora = qkv_lora.split(
         [wrapper.q_lora_rank, wrapper.kv_lora_rank + wrapper.qk_rope_head_dim],
         dim=-1,
     )
-    q_c = wrapper.q_a_layernorm(q_c)
+    q_c = wrapper.q_a_layernorm(q_c_view)
     kv_c, k_pe = kv_lora.split(
         [wrapper.kv_lora_rank, wrapper.qk_rope_head_dim], dim=-1
     )
@@ -359,11 +395,10 @@ def _run_mla_microbatches(
 
     if wrapper.rotary_emb is not None:
         k_pe, _ = wrapper.rotary_emb(positions, k_pe, None)
-        # k_pe may otherwise keep the fused qkv_lora storage alive.
-        k_pe = k_pe.clone()
+    # Always break the view into fused_qkv_a_proj storage. Otherwise keeping
+    # k_pe resident through the MB loop can pin the whole fused projection.
+    k_pe = k_pe.clone()
 
-    # Stage the complete compressed layer in KV cache once. The existing PCP
-    # transport remains full-layer and can overlap rank0's subsequent local work.
     forward_context = get_forward_context()
     full_metadata_raw = forward_context.attn_metadata
     if not isinstance(full_metadata_raw, dict):
@@ -394,57 +429,147 @@ def _run_mla_microbatches(
         mla_attn.kv_cache_dtype,
         mla_attn._k_scale,
     )
+
+    # q_c / kv_c_normed / k_pe are the only full-layer MLA intermediates needed
+    # after staging. The large fused A-projection storage is now releasable.
     del kv_for_cache, kpe_for_cache, cache_slot_mapping
-    del qkv_lora, kv_lora, kv_c
+    del qkv_lora, q_c_view, kv_lora, kv_c
 
-    output = hidden_states.new_empty((num_tokens, wrapper.hidden_size))
-    for token_slice, mb_metadata_dict in zip(plan.slices, plan.attn_metadata):
-        q = wrapper.q_b_proj(q_c[token_slice])[0]
-        q = q.view(-1, wrapper.num_heads, wrapper.qk_head_dim)
+    return PCPMLAMicrobatchState(
+        wrapper=wrapper,
+        positions=positions,
+        hidden_states=hidden_states,
+        llama_4_scaling=llama_4_scaling,
+        plan=plan,
+        q_c=q_c,
+        kv_c_normed=kv_c_normed,
+        k_pe=k_pe,
+    )
 
-        if wrapper.rotary_emb is not None:
-            q_pe = q[..., wrapper.qk_nope_head_dim :]
-            q_pe_rot, _ = wrapper.rotary_emb(
-                positions[token_slice], q_pe, None
-            )
-            q_pe.copy_(q_pe_rot)
 
-        scaling = _slice_scaling(llama_4_scaling, token_slice, num_tokens)
-        if scaling is not None:
-            q *= scaling
+def _run_mla_microbatch(
+    state: PCPMLAMicrobatchState,
+    token_slice: slice,
+    mb_metadata_dict: dict[str, Any],
+) -> torch.Tensor:
+    """Run expanded MLA work for one rank-local query microbatch."""
+    wrapper = state.wrapper
+    mla_attn = wrapper.mla_attn
 
-        mb_metadata = mb_metadata_dict[mla_attn.layer_name]
-        mb_output_shape = (
-            q.shape[0],
-            wrapper.num_heads * wrapper.v_head_dim,
+    q = wrapper.q_b_proj(state.q_c[token_slice])[0]
+    q = q.view(-1, wrapper.num_heads, wrapper.qk_head_dim)
+
+    if wrapper.rotary_emb is not None:
+        q_pe = q[..., wrapper.qk_nope_head_dim :]
+        q_pe_rot, _ = wrapper.rotary_emb(
+            state.positions[token_slice], q_pe, None
         )
-        attn_out = torch.empty(
-            mb_output_shape,
-            dtype=q.dtype,
-            device=q.device,
-        )
-        mla_attn.forward_impl(
-            q,
-            kv_c_normed[token_slice],
-            k_pe[token_slice],
-            mla_attn.kv_cache,
-            mb_metadata,
-            output=attn_out,
-        )
+        q_pe.copy_(q_pe_rot)
 
-        if wrapper.g_proj is not None:
-            attn_out = (
-                attn_out
-                * wrapper.g_proj(hidden_states[token_slice])[0].sigmoid()
-            )
-        chunk_output = wrapper.o_proj(attn_out)[0]
-        output[token_slice].copy_(chunk_output)
+    scaling = _slice_scaling(
+        state.llama_4_scaling,
+        token_slice,
+        state.hidden_states.shape[0],
+    )
+    if scaling is not None:
+        q *= scaling
 
+    mb_metadata = mb_metadata_dict[mla_attn.layer_name]
+    attn_out = torch.empty(
+        (q.shape[0], wrapper.num_heads * wrapper.v_head_dim),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    mla_attn.forward_impl(
+        q,
+        state.kv_c_normed[token_slice],
+        state.k_pe[token_slice],
+        mla_attn.kv_cache,
+        mb_metadata,
+        output=attn_out,
+    )
+
+    if wrapper.g_proj is not None:
+        attn_out = (
+            attn_out
+            * wrapper.g_proj(state.hidden_states[token_slice])[0].sigmoid()
+        )
+    return wrapper.o_proj(attn_out)[0]
+
+
+def _run_mla_microbatches(
+    wrapper: Any,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    llama_4_scaling: torch.Tensor | None,
+    plan: PCPAttentionMicrobatchPlan,
+) -> torch.Tensor:
+    """Fallback MLA-only path retaining the wrapper's full-output contract."""
+    state = _prepare_mla_microbatch_state(
+        wrapper,
+        positions,
+        hidden_states,
+        llama_4_scaling,
+        plan,
+    )
+    output = hidden_states.new_empty((hidden_states.shape[0], wrapper.hidden_size))
+    for token_slice, mb_metadata_dict in zip(
+        plan.slices, plan.attn_metadata, strict=True
+    ):
+        output[token_slice].copy_(
+            _run_mla_microbatch(state, token_slice, mb_metadata_dict)
+        )
     return output
 
 
+def _run_decoder_microbatch_pipeline(
+    plan: PCPAttentionMicrobatchPlan,
+    hidden_buffer: torch.Tensor,
+    residual: torch.Tensor,
+    attention_forward: Callable[[slice, dict[str, Any]], torch.Tensor],
+    post_attention_layernorm: Callable[
+        [torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
+    ],
+    mlp_forward: Callable[[torch.Tensor], torch.Tensor],
+    before_norm: Callable[
+        [torch.Tensor, torch.Tensor, slice], tuple[torch.Tensor, torch.Tensor]
+    ]
+    | None = None,
+    after_mlp: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse attention -> post-LN -> FFN into one MB lifecycle.
+
+    ``hidden_buffer`` is the full normalized attention input. Full latent
+    preparation has already consumed it, so after a microbatch's attention (and
+    optional g_proj) finishes, that processed slice is dead. Reuse the same
+    buffer for the layer's final output instead of allocating another [T, H]
+    tensor. ``residual`` is likewise updated slice-by-slice in place.
+    """
+    for token_slice, mb_metadata_dict in zip(
+        plan.slices, plan.attn_metadata, strict=True
+    ):
+        attn_mb = attention_forward(token_slice, mb_metadata_dict)
+        residual_mb = residual[token_slice]
+        if before_norm is not None:
+            attn_mb, residual_mb = before_norm(
+                attn_mb, residual_mb, token_slice
+            )
+
+        hidden_mb, residual_out_mb = post_attention_layernorm(
+            attn_mb, residual_mb
+        )
+        hidden_mb = mlp_forward(hidden_mb)
+        if after_mlp is not None:
+            hidden_mb = after_mlp(hidden_mb)
+
+        hidden_buffer[token_slice].copy_(hidden_mb)
+        residual[token_slice].copy_(residual_out_mb)
+
+    return hidden_buffer, residual
+
+
 def configure_pcp_memory_microbatching(vllm_config: VllmConfig) -> int:
-    """Validate the knob and install the PCP layer-local memory wrappers."""
+    """Validate the knob and install PCP layer-local memory wrappers."""
     global _PATCHED
 
     microbatch_size = parse_pcp_microbatch_size(vllm_config.additional_config)
@@ -452,18 +577,19 @@ def configure_pcp_memory_microbatching(vllm_config: VllmConfig) -> int:
     if microbatch_size == 0 or _PATCHED:
         return microbatch_size
 
-    # Patch model classes rather than duplicating model-specific decoder loops.
-    # GLM-4.7-Flash inherits the DeepSeek MLA attention class, but its MLP/MoE
-    # classes come from glm4_moe and need their own feed-forward wrappers.
     from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
     from vllm.model_executor.models.deepseek_v2 import (
+        DeepseekV2DecoderLayer,
         DeepseekV2MLP,
         DeepseekV2MoE,
     )
     from vllm.model_executor.models.glm4_moe import Glm4MoE, Glm4MoeMLP
+    from vllm.model_executor.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer
     from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
     original_mla_forward = MultiHeadLatentAttentionWrapper.forward
+    original_deepseek_decoder_forward = DeepseekV2DecoderLayer.forward
+    original_glm_decoder_forward = Glm4MoeLiteDecoderLayer.forward
     original_deepseek_mlp_forward = DeepseekV2MLP.forward
     original_deepseek_moe_forward = DeepseekV2MoE.forward
     original_glm_mlp_forward = Glm4MoeMLP.forward
@@ -476,22 +602,132 @@ def configure_pcp_memory_microbatching(vllm_config: VllmConfig) -> int:
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
-        plan = (
-            attn_metadata.get(_ATTN_PLAN_KEY)
-            if isinstance(attn_metadata, dict)
-            else None
-        )
+        plan = _get_attention_microbatch_plan()
         if plan is None or self.mla_attn.calculate_kv_scales:
             return original_mla_forward(
                 self, positions, hidden_states, llama_4_scaling
             )
-        assert isinstance(plan, PCPAttentionMicrobatchPlan)
         return _run_mla_microbatches(
             self, positions, hidden_states, llama_4_scaling, plan
         )
 
+    def deepseek_decoder_forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        plan = _get_attention_microbatch_plan()
+        if (
+            plan is None
+            or self.use_mha
+            or self.use_sequence_parallel_moe
+            or self.self_attn.mla_attn.calculate_kv_scales
+        ):
+            return original_deepseek_decoder_forward(
+                self,
+                positions,
+                hidden_states,
+                residual,
+                llama_4_scaling,
+            )
+
+        # Preserve the original full input-norm semantics. Everything after
+        # full compressed-latent staging is then consumed MB-by-MB.
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual
+            )
+
+        state = _prepare_mla_microbatch_state(
+            self.self_attn.mla_attn,
+            positions,
+            hidden_states,
+            llama_4_scaling,
+            plan,
+        )
+        inv_routed_scale = 1.0 / self.routed_scaling_factor
+
+        def before_norm(
+            attn_mb: torch.Tensor,
+            residual_mb: torch.Tensor,
+            _token_slice: slice,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if attn_mb.dtype == torch.float16:
+                # Match DeepseekV2DecoderLayer's FP16 overflow handling.
+                attn_mb *= inv_routed_scale
+                if self.layer_idx == 0:
+                    residual_mb *= inv_routed_scale
+            return attn_mb, residual_mb
+
+        def after_mlp(hidden_mb: torch.Tensor) -> torch.Tensor:
+            if isinstance(self.mlp, DeepseekV2MLP) and hidden_mb.dtype == torch.float16:
+                hidden_mb *= inv_routed_scale
+            return hidden_mb
+
+        return _run_decoder_microbatch_pipeline(
+            plan,
+            state.hidden_states,
+            residual,
+            lambda token_slice, mb_metadata: _run_mla_microbatch(
+                state, token_slice, mb_metadata
+            ),
+            self.post_attention_layernorm,
+            self.mlp,
+            before_norm=before_norm,
+            after_mlp=after_mlp,
+        )
+
+    def glm_decoder_forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        plan = _get_attention_microbatch_plan()
+        if plan is None or self.self_attn.mla_attn.calculate_kv_scales:
+            return original_glm_decoder_forward(
+                self,
+                positions,
+                hidden_states,
+                residual,
+                llama_4_scaling,
+            )
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual
+            )
+
+        state = _prepare_mla_microbatch_state(
+            self.self_attn.mla_attn,
+            positions,
+            hidden_states,
+            llama_4_scaling,
+            plan,
+        )
+        return _run_decoder_microbatch_pipeline(
+            plan,
+            state.hidden_states,
+            residual,
+            lambda token_slice, mb_metadata: _run_mla_microbatch(
+                state, token_slice, mb_metadata
+            ),
+            self.post_attention_layernorm,
+            self.mlp,
+        )
+
+    # Keep the class-level FFN wrappers for any supported MLA model that does
+    # not use the two decoder classes above. In the fused decoder path each call
+    # is already <= microbatch_size, so these wrappers fall through once.
     def deepseek_mlp_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return run_tokenwise_microbatches(
             lambda chunk: original_deepseek_mlp_forward(self, chunk),
@@ -569,6 +805,8 @@ def configure_pcp_memory_microbatching(vllm_config: VllmConfig) -> int:
         )
 
     MultiHeadLatentAttentionWrapper.forward = mla_forward
+    DeepseekV2DecoderLayer.forward = deepseek_decoder_forward
+    Glm4MoeLiteDecoderLayer.forward = glm_decoder_forward
     DeepseekV2MLP.forward = deepseek_mlp_forward
     DeepseekV2MoE.forward = deepseek_moe_forward
     Glm4MoeMLP.forward = glm_mlp_forward
@@ -578,7 +816,7 @@ def configure_pcp_memory_microbatching(vllm_config: VllmConfig) -> int:
     _PATCHED = True
     logger.info(
         "Enabled PCP layer-local memory microbatching: size=%d "
-        "(full compressed MLA latent, microbatched Q/attention/o_proj + MLP/MoE)",
+        "(full compressed MLA latent, fused per-MB attention/post-norm/FFN)",
         microbatch_size,
     )
     return microbatch_size
