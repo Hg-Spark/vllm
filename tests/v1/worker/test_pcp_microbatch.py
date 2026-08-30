@@ -7,6 +7,8 @@ import torch
 
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_microbatch import (
+    PCPAttentionMicrobatchPlan,
+    _run_decoder_microbatch_pipeline,
     _slice_single_request_input_batch,
     microbatch_slices,
     parse_pcp_microbatch_size,
@@ -145,3 +147,54 @@ def test_attention_microbatch_slice_advances_causal_context() -> None:
     assert first.positions.tolist() == [5, 6, 7, 8]
     assert second.positions.tolist() == [9, 10, 11, 12]
     assert last.positions.tolist() == [13]
+
+
+def test_decoder_microbatch_pipeline_interleaves_and_reuses_hidden_buffer() -> None:
+    plan = PCPAttentionMicrobatchPlan(
+        slices=(slice(0, 2), slice(2, 4)),
+        attn_metadata=({"value": 1.0}, {"value": 3.0}),
+    )
+    hidden_buffer = torch.zeros(4, 2)
+    residual = torch.arange(8, dtype=torch.float32).view(4, 2)
+    original_residual = residual.clone()
+    hidden_ptr = hidden_buffer.data_ptr()
+    calls: list[str] = []
+
+    def attention_forward(
+        token_slice: slice,
+        metadata: dict[str, float],
+    ) -> torch.Tensor:
+        calls.append(f"attn{token_slice.start}")
+        rows = int(token_slice.stop) - int(token_slice.start)
+        return torch.full((rows, 2), metadata["value"])
+
+    def post_norm(
+        attention: torch.Tensor,
+        residual_mb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append("norm")
+        return attention + 2, residual_mb + 10
+
+    def mlp_forward(hidden_mb: torch.Tensor) -> torch.Tensor:
+        calls.append("mlp")
+        return hidden_mb * 4
+
+    output, output_residual = _run_decoder_microbatch_pipeline(
+        plan,
+        hidden_buffer,
+        residual,
+        attention_forward,
+        post_norm,
+        mlp_forward,
+    )
+
+    assert calls == ["attn0", "norm", "mlp", "attn2", "norm", "mlp"]
+    assert output.data_ptr() == hidden_ptr
+    assert output_residual.data_ptr() == residual.data_ptr()
+    assert torch.equal(
+        output,
+        torch.tensor(
+            [[12.0, 12.0], [12.0, 12.0], [20.0, 20.0], [20.0, 20.0]]
+        ),
+    )
+    assert torch.equal(output_residual, original_residual + 10)
