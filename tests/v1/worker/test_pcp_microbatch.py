@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_microbatch import (
+    _slice_single_request_input_batch,
     microbatch_slices,
     parse_pcp_microbatch_size,
     run_tokenwise_microbatches,
@@ -63,3 +66,82 @@ def test_disabled_microbatch_calls_sublayer_once() -> None:
 
     assert calls == 1
     assert torch.equal(output, torch.ones_like(hidden_states))
+
+
+def _make_single_request_input_batch(
+    *,
+    num_tokens: int,
+    num_computed_tokens: int,
+    prefill_len: int,
+) -> InputBatch:
+    positions = torch.arange(
+        num_computed_tokens,
+        num_computed_tokens + num_tokens,
+        dtype=torch.int64,
+    )
+    return InputBatch(
+        req_ids=["req"],
+        num_reqs=1,
+        num_reqs_after_padding=1,
+        idx_mapping=torch.tensor([0], dtype=torch.int32),
+        idx_mapping_np=np.array([0], dtype=np.int32),
+        expanded_idx_mapping=torch.tensor([0], dtype=torch.int32),
+        expanded_local_pos=torch.tensor([0], dtype=torch.int32),
+        num_scheduled_tokens=np.array([num_tokens], dtype=np.int32),
+        num_tokens=num_tokens,
+        num_tokens_after_padding=num_tokens,
+        num_draft_tokens=0,
+        num_draft_tokens_per_req=None,
+        query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int32),
+        query_start_loc_np=np.array([0, num_tokens], dtype=np.int32),
+        seq_lens=torch.tensor(
+            [num_computed_tokens + num_tokens], dtype=torch.int32
+        ),
+        seq_lens_cpu_upper_bound=torch.tensor(
+            [num_computed_tokens + num_tokens], dtype=torch.int32
+        ),
+        dcp_local_seq_lens=None,
+        num_computed_tokens_np=np.array([num_computed_tokens], dtype=np.int32),
+        prefill_len_np=np.array([prefill_len], dtype=np.int32),
+        num_computed_prefill_tokens_np=np.array(
+            [min(num_computed_tokens, prefill_len)], dtype=np.int32
+        ),
+        is_prefilling_np=np.array([num_computed_tokens < prefill_len], dtype=np.bool_),
+        max_seq_len_np=None,
+        input_ids=torch.arange(num_tokens, dtype=torch.int32),
+        positions=positions,
+        is_padding=torch.zeros(num_tokens, dtype=torch.bool),
+        logits_indices=torch.tensor([num_tokens - 1], dtype=torch.int64),
+        cu_num_logits=torch.tensor([0, 1], dtype=torch.int32),
+        cu_num_logits_np=np.array([0, 1], dtype=np.int32),
+        has_structured_output_reqs=False,
+        prompt_lens=None,
+    )
+
+
+def test_attention_microbatch_slice_advances_causal_context() -> None:
+    input_batch = _make_single_request_input_batch(
+        num_tokens=9,
+        num_computed_tokens=5,
+        prefill_len=32,
+    )
+
+    first = _slice_single_request_input_batch(input_batch, slice(0, 4))
+    second = _slice_single_request_input_batch(input_batch, slice(4, 8))
+    last = _slice_single_request_input_batch(input_batch, slice(8, 9))
+
+    assert first.query_start_loc_np.tolist() == [0, 4]
+    assert second.query_start_loc_np.tolist() == [0, 4]
+    assert last.query_start_loc_np.tolist() == [0, 1]
+
+    assert first.num_computed_tokens_np.tolist() == [5]
+    assert second.num_computed_tokens_np.tolist() == [9]
+    assert last.num_computed_tokens_np.tolist() == [13]
+
+    assert first.seq_lens.tolist() == [9]
+    assert second.seq_lens.tolist() == [13]
+    assert last.seq_lens.tolist() == [14]
+
+    assert first.positions.tolist() == [5, 6, 7, 8]
+    assert second.positions.tolist() == [9, 10, 11, 12]
+    assert last.positions.tolist() == [13]
