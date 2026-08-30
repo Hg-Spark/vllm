@@ -13,14 +13,14 @@ the torch.compile cache), keyed by a fingerprint of everything the value
 depends on, and later boots apply it automatically -- skipping the
 memory-profiling measurement and the CUDA-graph memory estimation pass --
 if and only if the fingerprint matches and the device has at least as much
-free memory as when the plan was recorded. On any mismatch the worker
-falls back to full profiling, so a stale plan costs nothing and is never
-trusted.
+free memory as when the plan was recorded. On any mismatch the worker falls
+back to full profiling, so a stale plan costs nothing and is never trusted.
 
 Weighted PCP also uses this startup hook to make the one-shot model profile
-cover each rank's causal prefix. The scheduler's global token budget is
-preserved; only the profile call temporarily sees the cumulative token budget
-visible to the current PCP rank.
+match rank-local activation shapes. The current profile still cannot model
+local query rows and causal context rows independently, so the model runner
+profiles only the rows owned by the current rank while the cumulative causal
+context is logged separately for diagnostics and future profile refinement.
 """
 
 import hashlib
@@ -125,13 +125,7 @@ def _applicable_kv_cache_memory_bytes(
 def _pcp_causal_profile_tokens(
     per_rank_tokens: tuple[int, ...], pcp_rank: int
 ) -> int:
-    """Return the cumulative causal context visible to one PCP rank.
-
-    PCP partitions a causal prefill into ordered contiguous segments. Rank r
-    computes its local segment while attending to every earlier segment, so its
-    profile must cover ``sum(lengths[: r + 1])`` rather than only its local
-    segment length. For PCP=2 this makes rank1 profile the full global context.
-    """
+    """Return the cumulative causal context visible to one PCP rank."""
     if not 0 <= pcp_rank < len(per_rank_tokens):
         raise ValueError(
             f"Invalid PCP rank {pcp_rank} for {len(per_rank_tokens)} partitions"
@@ -140,18 +134,14 @@ def _pcp_causal_profile_tokens(
 
 
 def _prepare_pcp_profile_run(worker: "Worker") -> None:
-    """Make the next profile call cover weighted PCP causal rank execution.
+    """Make the next profile call mirror weighted PCP local activation rows.
 
     Memory profiling runs before the PCP manager and KV cache are initialized,
-    so the normal batch partitioner cannot model each rank's causal prefix.
-    Install the PCP tile/FFN wrappers early, then wrap exactly one
-    ``profile_run`` call with the cumulative token budget visible to this rank.
-    The global scheduler/model-runner limit is restored even if profiling
-    raises.
-
-    This single scalar is a conservative proxy: it covers the rank's causal
-    context even though the real Wavefront path may have fewer rank-local query
-    rows than context rows.
+    so the normal batch partitioner cannot reduce the dummy forward. Install the
+    PCP tile/FFN wrappers early, then wrap exactly one ``profile_run`` call with
+    the token rows owned by this PCP rank. The cumulative causal context is
+    tracked separately because one ``runner.max_num_tokens`` scalar cannot
+    represent local query rows and context rows independently.
     """
     parallel_config = worker.vllm_config.parallel_config
     pcp_size = parallel_config.prefill_context_parallel_size
@@ -182,13 +172,14 @@ def _prepare_pcp_profile_run(worker: "Worker") -> None:
     pcp_rank = get_pcp_group().rank_in_group
     weights = parse_pcp_partition_weights(additional_config, pcp_size)
     per_rank_tokens = weighted_partition_lengths(global_num_tokens, weights)
-    causal_profile_tokens = _pcp_causal_profile_tokens(per_rank_tokens, pcp_rank)
+    local_profile_tokens = max(1, per_rank_tokens[pcp_rank])
+    causal_context_tokens = _pcp_causal_profile_tokens(per_rank_tokens, pcp_rank)
 
     original_profile_run = runner.profile_run
 
     def profile_run_once() -> None:
         previous_max_num_tokens = runner.max_num_tokens
-        runner.max_num_tokens = causal_profile_tokens
+        runner.max_num_tokens = local_profile_tokens
         try:
             original_profile_run()
         finally:
@@ -198,12 +189,12 @@ def _prepare_pcp_profile_run(worker: "Worker") -> None:
     runner.profile_run = profile_run_once
     logger.info(
         "Prepared PCP-aware startup profile: rank=%d global_tokens=%d "
-        "local_tokens=%d causal_profile_tokens=%d per_rank_tokens=%s "
-        "tile_size=%d",
+        "local_profile_tokens=%d causal_context_tokens=%d "
+        "per_rank_tokens=%s tile_size=%d",
         pcp_rank,
         global_num_tokens,
-        per_rank_tokens[pcp_rank],
-        causal_profile_tokens,
+        local_profile_tokens,
+        causal_context_tokens,
         per_rank_tokens,
         tile_size,
     )
