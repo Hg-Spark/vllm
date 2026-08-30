@@ -146,7 +146,7 @@ def iter_tiled_mla_cache_inputs(
         )
     rank_slots = slot_mapping.view(2, rank_slab_width)
     rank = pcp_group.rank_in_group
-    k_pe_flat = k_pe.reshape(num_rows, -1)
+    k_pe_flat = k_pe.flatten(1)
 
     if rank == 0:
         for start in range(0, rank_slab_width, tile_size):
@@ -221,7 +221,7 @@ def maybe_transfer_mla_cache_inputs(
         return kv_c_normed, k_pe, slot_mapping
     assert slot_mapping is not None
     num_rows = kv_c_normed.shape[0]
-    k_pe_flat = k_pe.reshape(num_rows, -1)
+    k_pe_flat = k_pe.flatten(1)
     (cache_kv_c, cache_k_pe_flat), cache_slot_mapping = _transfer_mla_cache_inputs(
         (kv_c_normed, k_pe_flat), slot_mapping
     )
