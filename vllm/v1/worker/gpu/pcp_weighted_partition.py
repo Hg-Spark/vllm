@@ -10,7 +10,7 @@ from vllm.config import get_current_vllm_config
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.pcp_execution import PCPExecutionPlanner
 from vllm.v1.worker.gpu.pcp_manager import RankSegment
-from vllm.v1.worker.gpu.pcp_microbatch import configure_pcp_memory_microbatching
+from vllm.v1.worker.gpu.pcp_tile import configure_pcp_tiling
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -99,11 +99,7 @@ def parse_pcp_partition_weights(
     additional_config: object,
     pcp_world_size: int,
 ) -> tuple[float, ...]:
-    """Read the optional top-level PCP rank-weight array.
-
-    PCP owns only ``pcp_partition_weights``. Other additional-config keys are
-    ignored so unrelated or future configuration does not become a PCP error.
-    """
+    """Read the optional top-level PCP rank-weight array."""
     default = (1.0,) * pcp_world_size
     if not isinstance(additional_config, dict):
         return default
@@ -161,9 +157,7 @@ class WeightedPCPManager(PCPExecutionPlanner):
             dcp_rank=dcp_rank,
             cp_interleave=cp_interleave,
         )
-        self._pcp_microbatch_size = configure_pcp_memory_microbatching(
-            get_current_vllm_config()
-        )
+        self._pcp_tile_size = configure_pcp_tiling(get_current_vllm_config())
         self._pcp_partition_weights = (
             (1.0,) * pcp_world_size
             if pcp_partition_weights is None
