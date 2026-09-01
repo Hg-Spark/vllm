@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+import vllm.model_executor.layers.attention.pcp_wavefront_runtime as wavefront
 import vllm.v1.worker.gpu.pcp_execution as pcp_execution
-import vllm.v1.worker.gpu.pcp_manager as pcp_manager
 from vllm.v1.worker.gpu.pcp_execution import PCPExecutionPlanner
 from vllm.v1.worker.gpu.pcp_weighted_partition import WeightedPCPManager
 
@@ -133,18 +133,19 @@ def test_decode_plan_is_owned_by_last_rank(monkeypatch) -> None:
     assert bool(rank1_slab.all().item())
 
 
-def test_rank0_flushes_pending_sends_before_sampling(monkeypatch) -> None:
+def test_weighted_rank0_flushes_pending_sends_before_sampling(monkeypatch) -> None:
     flush_calls = 0
 
     def fake_flush() -> None:
         nonlocal flush_calls
         flush_calls += 1
 
-    monkeypatch.setattr(pcp_manager, "flush_pending_sends", fake_flush)
-    manager = pcp_manager.PCPManager(
+    monkeypatch.setattr(wavefront, "flush_pending_sends", fake_flush)
+    manager = WeightedPCPManager(
         pcp_world_size=2,
         pcp_rank=0,
         device=torch.device("cpu"),
+        block_tables=_block_tables(),
     )
     global_batch = SimpleNamespace()
     manager._global_batch = global_batch

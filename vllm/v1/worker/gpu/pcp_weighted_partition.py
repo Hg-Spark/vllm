@@ -6,11 +6,9 @@ import math
 import numpy as np
 import torch
 
-from vllm.config import get_current_vllm_config
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.pcp_execution import PCPExecutionPlanner
 from vllm.v1.worker.gpu.pcp_manager import RankSegment
-from vllm.v1.worker.gpu.pcp_tile import configure_pcp_tiling
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -157,7 +155,6 @@ class WeightedPCPManager(PCPExecutionPlanner):
             dcp_rank=dcp_rank,
             cp_interleave=cp_interleave,
         )
-        self._pcp_tile_size = configure_pcp_tiling(get_current_vllm_config())
         self._pcp_partition_weights = (
             (1.0,) * pcp_world_size
             if pcp_partition_weights is None
@@ -173,6 +170,15 @@ class WeightedPCPManager(PCPExecutionPlanner):
             if block_tables is not None and block_tables.kernel_block_sizes
             else 1
         )
+
+    def restore_for_sampling(self, hidden_states: torch.Tensor):
+        if self.pcp_rank == 0:
+            from vllm.model_executor.layers.attention.pcp_wavefront_runtime import (
+                flush_pending_sends,
+            )
+
+            flush_pending_sends()
+        return super().restore_for_sampling(hidden_states)
 
     def _partition_lengths(
         self,

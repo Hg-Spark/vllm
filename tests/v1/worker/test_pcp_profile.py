@@ -6,8 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import vllm.distributed.parallel_state as parallel_state
-from vllm.v1.worker import startup_plan
-from vllm.v1.worker.gpu import pcp_microbatch
+from vllm.v1.worker.gpu import pcp_profile
 
 
 def _make_worker(*, rank: int, weights: list[float], max_num_tokens: int = 10):
@@ -21,10 +20,7 @@ def _make_worker(*, rank: int, weights: list[float], max_num_tokens: int = 10):
     parallel_config = SimpleNamespace(prefill_context_parallel_size=len(weights))
     vllm_config = SimpleNamespace(
         parallel_config=parallel_config,
-        additional_config={
-            "pcp_partition_weights": weights,
-            "pcp_microbatch_size": 4,
-        },
+        additional_config={"pcp_partition_weights": weights},
     )
     worker = SimpleNamespace(vllm_config=vllm_config, model_runner=runner)
     return worker, runner, profile_run, seen_profile_tokens, rank
@@ -49,19 +45,13 @@ def test_prepare_pcp_profile_run_uses_rank_local_tokens(
         rank=rank,
         weights=weights,
     )
-    configured: list[object] = []
-    monkeypatch.setattr(
-        pcp_microbatch,
-        "configure_pcp_memory_microbatching",
-        lambda config: configured.append(config) or 4,
-    )
     monkeypatch.setattr(
         parallel_state,
         "get_pcp_group",
         lambda: SimpleNamespace(rank_in_group=rank),
     )
 
-    startup_plan._prepare_pcp_profile_run(worker)
+    pcp_profile.maybe_prepare_pcp_profile_run(worker)
     assert runner.max_num_tokens == 10
 
     runner.profile_run()
@@ -69,7 +59,6 @@ def test_prepare_pcp_profile_run_uses_rank_local_tokens(
     assert seen_profile_tokens == [expected_tokens]
     assert runner.max_num_tokens == 10
     assert runner.profile_run is original_profile_run
-    assert configured == [worker.vllm_config]
 
 
 def test_prepare_pcp_profile_run_restores_global_limit_on_error(
@@ -85,17 +74,9 @@ def test_prepare_pcp_profile_run_restores_global_limit_on_error(
     worker = SimpleNamespace(
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(prefill_context_parallel_size=2),
-            additional_config={
-                "pcp_partition_weights": [1, 2],
-                "pcp_microbatch_size": 4,
-            },
+            additional_config={"pcp_partition_weights": [1, 2]},
         ),
         model_runner=runner,
-    )
-    monkeypatch.setattr(
-        pcp_microbatch,
-        "configure_pcp_memory_microbatching",
-        lambda config: 4,
     )
     monkeypatch.setattr(
         parallel_state,
@@ -103,7 +84,7 @@ def test_prepare_pcp_profile_run_restores_global_limit_on_error(
         lambda: SimpleNamespace(rank_in_group=1),
     )
 
-    startup_plan._prepare_pcp_profile_run(worker)
+    pcp_profile.maybe_prepare_pcp_profile_run(worker)
     with pytest.raises(RuntimeError, match="profile failed"):
         runner.profile_run()
 
@@ -111,9 +92,7 @@ def test_prepare_pcp_profile_run_restores_global_limit_on_error(
     assert runner.profile_run is profile_run
 
 
-def test_prepare_pcp_profile_run_keeps_legacy_pcp_profile_global(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_prepare_pcp_profile_run_keeps_legacy_pcp_profile_global() -> None:
     runner = SimpleNamespace(max_num_tokens=10)
     calls: list[int] = []
 
@@ -124,17 +103,12 @@ def test_prepare_pcp_profile_run_keeps_legacy_pcp_profile_global(
     worker = SimpleNamespace(
         vllm_config=SimpleNamespace(
             parallel_config=SimpleNamespace(prefill_context_parallel_size=2),
-            additional_config={"pcp_microbatch_size": 4},
+            additional_config={},
         ),
         model_runner=runner,
     )
-    monkeypatch.setattr(
-        pcp_microbatch,
-        "configure_pcp_memory_microbatching",
-        lambda config: 4,
-    )
 
-    startup_plan._prepare_pcp_profile_run(worker)
+    pcp_profile.maybe_prepare_pcp_profile_run(worker)
     runner.profile_run()
 
     assert calls == [10]

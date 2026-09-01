@@ -46,35 +46,6 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 from vllm.triton_utils import HAS_TRITON
 
-_base_fused_moe_parallel_make = FusedMoEParallelConfig.make
-
-
-def _make_pcp_local_moe_parallel_config(
-    tp_size_: int,
-    pcp_size_: int,
-    dp_size_: int,
-    sp_size_: int,
-    vllm_parallel_config,
-):
-    """Replicate MoE weights across PCP for the TP=DP=1, EP-off path."""
-    if (
-        pcp_size_ > 1
-        and tp_size_ == 1
-        and dp_size_ == 1
-        and not vllm_parallel_config.enable_expert_parallel
-    ):
-        pcp_size_ = 1
-    return _base_fused_moe_parallel_make(
-        tp_size_,
-        pcp_size_,
-        dp_size_,
-        sp_size_,
-        vllm_parallel_config,
-    )
-
-
-FusedMoEParallelConfig.make = staticmethod(_make_pcp_local_moe_parallel_config)
-
 _config: dict[str, Any] | None = None
 
 

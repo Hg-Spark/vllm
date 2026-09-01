@@ -53,6 +53,17 @@ def make_parallel_config(
     )
     dp_size_ = dp_size if dp_size is not None else get_dp_group().world_size
     pcp_size_ = pcp_size if pcp_size is not None else get_pcp_group().world_size
+
+    # PCP partitions the token/context dimension. For the local-MoE topology
+    # (TP=DP=1, EP disabled), it must not become a weight-parallel dimension.
+    if (
+        pcp_size_ > 1
+        and tp_size_ == 1
+        and dp_size_ == 1
+        and not parallel_config.enable_expert_parallel
+    ):
+        pcp_size_ = 1
+
     sp_size = tp_size_ if is_sequence_parallel else 1
 
     moe_parallel_config = FusedMoEParallelConfig.make(

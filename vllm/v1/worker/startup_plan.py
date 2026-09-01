@@ -16,10 +16,6 @@ if and only if the fingerprint matches and the device has at least as much
 free memory as when the plan was recorded. On any mismatch the worker
 falls back to full profiling, so a stale plan costs nothing and is never
 trusted.
-
-Weighted PCP also uses this startup hook to make the one-shot model profile
-match rank-local execution. The scheduler's global token budget is preserved;
-only the profile call temporarily sees the rows owned by the current PCP rank.
 """
 
 import hashlib
@@ -57,6 +53,8 @@ def compute_plan_fingerprint(
     Driver-only changes are not part of the key; the free-memory gate at
     apply time bounds the residual risk.
     """
+    # Imported here (as VllmConfig.compute_hash does) to avoid a cycle with
+    # the top-level vllm package.
     from vllm import __version__ as vllm_version
 
     capability = current_platform.get_device_capability()
@@ -77,12 +75,17 @@ def compute_plan_fingerprint(
 
 
 def _plan_path(fingerprint: str) -> str:
+    """Plans are regenerable derived state, so they live under the standard
+    vLLM cache root (like the torch.compile cache) and relocate with
+    ``VLLM_CACHE_ROOT`` instead of needing a location knob of their own."""
+    # VLLM_CACHE_ROOT is already user-expanded by envs.py.
     return os.path.join(
         envs.VLLM_CACHE_ROOT, "startup_plan", f"startup_plan_{fingerprint}.json"
     )
 
 
 def _load_plan(fingerprint: str) -> dict | None:
+    """Load a plan for this fingerprint; None if absent or unreadable."""
     path = _plan_path(fingerprint)
     try:
         with open(path) as f:
@@ -103,6 +106,13 @@ def _load_plan(fingerprint: str) -> dict | None:
 def _applicable_kv_cache_memory_bytes(
     plan: dict, current_free_memory: int
 ) -> int | None:
+    """The apply-time OOM-safety gate.
+
+    The recorded value is only valid if the device has at least as much
+    free memory now as when the plan was measured (co-tenants, leaked
+    allocations, or MIG changes all reduce it). Outside that envelope,
+    return None and let the caller re-profile.
+    """
     kv_bytes = plan.get("kv_cache_memory_bytes")
     baseline = plan.get("free_memory_baseline")
     if not isinstance(kv_bytes, int) or not isinstance(baseline, int):
@@ -121,79 +131,13 @@ def _applicable_kv_cache_memory_bytes(
     return kv_bytes
 
 
-def _prepare_pcp_profile_run(worker: "Worker") -> None:
-    """Make the next profile call mirror weighted PCP rank-local execution.
-
-    Memory profiling runs before the PCP manager and KV cache are initialized,
-    so the normal batch partitioner cannot reduce the dummy forward. Install the
-    PCP tile/FFN wrappers early, then wrap exactly one ``profile_run`` call with
-    a temporary rank-local token budget. The global scheduler/model-runner limit
-    is restored even if profiling raises.
-    """
-    parallel_config = worker.vllm_config.parallel_config
-    pcp_size = parallel_config.prefill_context_parallel_size
-    if pcp_size <= 1:
-        return
-
-    additional_config = worker.vllm_config.additional_config
-    if not isinstance(additional_config, dict):
-        return
-
-    from vllm.v1.worker.gpu.pcp_tile import configure_pcp_tiling
-
-    tile_size = configure_pcp_tiling(worker.vllm_config)
-
-    # The Wavefront execution planner is selected only when explicit weighted
-    # partitioning is configured. Keep legacy PCP profiling unchanged.
-    if "pcp_partition_weights" not in additional_config:
-        return
-
-    from vllm.distributed.parallel_state import get_pcp_group
-    from vllm.v1.worker.gpu.pcp_weighted_partition import (
-        parse_pcp_partition_weights,
-        weighted_partition_lengths,
-    )
-
-    runner = worker.model_runner
-    global_num_tokens = runner.max_num_tokens
-    pcp_rank = get_pcp_group().rank_in_group
-    weights = parse_pcp_partition_weights(additional_config, pcp_size)
-    per_rank_tokens = weighted_partition_lengths(global_num_tokens, weights)
-    profile_num_tokens = max(1, per_rank_tokens[pcp_rank])
-
-    original_profile_run = runner.profile_run
-
-    def profile_run_once() -> None:
-        previous_max_num_tokens = runner.max_num_tokens
-        runner.max_num_tokens = profile_num_tokens
-        try:
-            original_profile_run()
-        finally:
-            runner.max_num_tokens = previous_max_num_tokens
-            runner.profile_run = original_profile_run
-
-    runner.profile_run = profile_run_once
-    logger.info(
-        "Prepared PCP-aware startup profile: rank=%d global_tokens=%d "
-        "profile_tokens=%d per_rank_tokens=%s tile_size=%d",
-        pcp_rank,
-        global_num_tokens,
-        profile_num_tokens,
-        per_rank_tokens,
-        tile_size,
-    )
-
-
 def maybe_apply_startup_plan(worker: "Worker") -> None:
     """If enabled and ``--kv-cache-memory`` was not set explicitly, apply a
     persisted plan by setting ``worker.cache_config.kv_cache_memory_bytes``.
-    No-op unless ``VLLM_ENABLE_STARTUP_PLAN=1``.
+    No-op unless ``VLLM_ENABLE_STARTUP_PLAN=1``."""
+    from vllm.v1.worker.gpu.pcp_profile import maybe_prepare_pcp_profile_run
 
-    The PCP profile wrapper is prepared independently of startup-plan caching,
-    because ``determine_available_memory`` always invokes this hook immediately
-    before its one-shot model profile.
-    """
-    _prepare_pcp_profile_run(worker)
+    maybe_prepare_pcp_profile_run(worker)
 
     if (
         not envs.VLLM_ENABLE_STARTUP_PLAN
