@@ -171,14 +171,18 @@ class WeightedPCPManager(PCPExecutionPlanner):
             else 1
         )
 
-    def restore_for_sampling(self, hidden_states: torch.Tensor):
+    def restore_for_sampling(
+        self,
+        hidden_states: torch.Tensor,
+        force_full: bool = False,
+    ):
         if self.pcp_rank == 0:
             from vllm.model_executor.layers.attention.pcp_wavefront_runtime import (
                 flush_pending_sends,
             )
 
             flush_pending_sends()
-        return super().restore_for_sampling(hidden_states)
+        return super().restore_for_sampling(hidden_states, force_full=force_full)
 
     def _partition_lengths(
         self,
