@@ -652,6 +652,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            # The cache update is the last consumer in this scope. Rank0's
+            # async send retains source tensors until its P2P work completes.
+            del kv_for_cache, kpe_for_cache
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -2627,6 +2630,9 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             ),
             output_scale=output_scale,
         )
+        # Release expanded local K/V before chunked context K/V is
+        # projected. CUDA allocator reuse remains stream ordered.
+        del k, v, k_nope, kv_nope
 
         if has_context:
             assert prefill_metadata.chunked_context is not None
