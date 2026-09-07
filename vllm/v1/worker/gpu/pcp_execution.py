@@ -430,3 +430,55 @@ class PCPExecutionPlanner(PCPManager):
 
         gathered = get_pcp_group().all_gather(slab_hidden_states, dim=0)
         return gathered[plan.hidden_restore_idx]
+
+    def restore_selected_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        global_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Restore only selected global rows for the weighted slab layout."""
+        plan = self._batch_plan
+        if plan is None:
+            return hidden_states[global_indices]
+        if global_indices.numel() == 0 or plan.rank_slab_width == 0:
+            return hidden_states[:0]
+        if hidden_states.shape[0] < plan.owned_num_tokens:
+            raise RuntimeError(
+                "PCP hidden-state rows are smaller than owned token count: "
+                f"{hidden_states.shape[0]} < {plan.owned_num_tokens}"
+            )
+
+        selected_gather_idx = plan.hidden_restore_idx[global_indices]
+        owner_rank = torch.div(
+            selected_gather_idx,
+            plan.rank_slab_width,
+            rounding_mode="floor",
+        )
+        local_idx = torch.remainder(selected_gather_idx, plan.rank_slab_width)
+        num_selected = global_indices.numel()
+
+        # Every rank contributes one candidate per selected row so the collective
+        # shape stays fixed. Only the owner copy is later selected; clamp non-owner
+        # indices because imbalanced ranks can own fewer rows than rank_slab_width.
+        local_candidates = hidden_states.new_zeros(
+            (num_selected, *hidden_states.shape[1:])
+        )
+        if hidden_states.shape[0] > 0:
+            safe_idx = local_idx.clamp(max=hidden_states.shape[0] - 1)
+            candidate_rows = hidden_states[safe_idx]
+            owner_mask = owner_rank == self.pcp_rank
+            local_candidates.copy_(
+                torch.where(
+                    owner_mask.view(-1, *([1] * (hidden_states.ndim - 1))),
+                    candidate_rows,
+                    torch.zeros_like(candidate_rows),
+                )
+            )
+
+        gathered_candidates = get_pcp_group().all_gather(local_candidates, dim=0)
+        selected_rows = owner_rank * num_selected + torch.arange(
+            num_selected,
+            dtype=owner_rank.dtype,
+            device=owner_rank.device,
+        )
+        return gathered_candidates[selected_rows]
