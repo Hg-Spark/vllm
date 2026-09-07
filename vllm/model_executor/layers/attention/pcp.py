@@ -60,14 +60,13 @@ def _transfer_mla_cache_inputs(
             f"{model_num_rows} > {rank_slab_width}"
         )
 
-    rank_slot_mappings = slot_mapping.view(2, rank_slab_width)
     rank = pcp_group.rank_in_group
     if rank == 0:
         send_payload = tuple(
             _pad_to_rank_slab(tensor, rank_slab_width) for tensor in tensors
         )
         post_layer_transfer(send_payload)
-        return tensors, rank_slot_mappings[0, :model_num_rows]
+        return tensors, slot_mapping[:model_num_rows]
     if rank != 1:
         raise RuntimeError(f"Unexpected PCP rank for PCP=2 wavefront: {rank}")
 
@@ -85,10 +84,7 @@ def _transfer_mla_cache_inputs(
     for cache_input, local_input in zip(cache_inputs, tensors):
         cache_input[rank_slab_width:].copy_(local_input)
 
-    local_slots = rank_slot_mappings[1, :model_num_rows]
-    cache_slot_mapping = slot_mapping.new_empty(rank_slab_width + model_num_rows)
-    cache_slot_mapping[:rank_slab_width].copy_(rank_slot_mappings[0])
-    cache_slot_mapping[rank_slab_width:].copy_(local_slots)
+    cache_slot_mapping = slot_mapping[: rank_slab_width + model_num_rows]
     return cache_inputs, cache_slot_mapping
 
 
