@@ -610,12 +610,63 @@ class PCPManager:
         gathered = get_pcp_group().all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 
+    def restore_selected_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        global_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Restore only selected global-token rows from PCP-local hidden states.
+
+        ``_hidden_restore_idx`` maps every global token row to the flattened
+        padded all-gather layout. Compose it with ``global_indices`` first, then
+        all-gather only those candidate rows. Each rank materializes one
+        candidate row per requested global index; the owner-rank vector selects
+        the valid copy after the compact collective.
+        """
+        if self._hidden_restore_idx is None:
+            return hidden_states[global_indices]
+        if global_indices.numel() == 0:
+            return hidden_states[:0]
+
+        local_width = hidden_states.shape[0]
+        selected_gather_idx = self._hidden_restore_idx[global_indices]
+        owner_rank = torch.div(
+            selected_gather_idx,
+            local_width,
+            rounding_mode="floor",
+        )
+        local_idx = torch.remainder(selected_gather_idx, local_width)
+
+        local_candidates = hidden_states[local_idx]
+        gathered_candidates = get_pcp_group().all_gather(local_candidates, dim=0)
+        num_selected = global_indices.numel()
+        selected_rows = owner_rank * num_selected + torch.arange(
+            num_selected,
+            dtype=owner_rank.dtype,
+            device=owner_rank.device,
+        )
+        return gathered_candidates[selected_rows]
+
     def restore_for_sampling(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, InputBatch]:
         assert self._global_batch is not None
-        return self.restore_hidden_states(hidden_states), self._global_batch
+        global_batch = self._global_batch
+        selected_hidden_states = self.restore_selected_hidden_states(
+            hidden_states,
+            global_batch.logits_indices,
+        )
+        compact_logits_indices = torch.arange(
+            global_batch.logits_indices.numel(),
+            dtype=global_batch.logits_indices.dtype,
+            device=global_batch.logits_indices.device,
+        )
+        sampling_batch = replace(
+            global_batch,
+            logits_indices=compact_logits_indices,
+        )
+        return selected_hidden_states, sampling_batch
 
 
 def maybe_partition_pcp_batch(
