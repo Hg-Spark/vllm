@@ -6,6 +6,7 @@ import os
 from collections import deque
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -29,6 +30,13 @@ def _read_max_outstanding_layers() -> int:
             f"{_MAX_OUTSTANDING_LAYERS_ENV} must be >= 1, got {value}"
         )
     return value
+
+
+@dataclass
+class PendingLayerReceive:
+    layer_seq: int
+    recv_tensors: tuple[torch.Tensor, ...]
+    recv_works: list[Any]
 
 
 _MAX_OUTSTANDING_LAYERS = _read_max_outstanding_layers()
@@ -88,10 +96,10 @@ def post_layer_transfer(payload: Sequence[torch.Tensor]) -> None:
     _pending_sends.append((layer_seq, send_works, retained_tensors))
 
 
-def recv_layer_payload_into(
+def post_layer_receive_into(
     recv_buffers: Sequence[torch.Tensor],
-) -> tuple[torch.Tensor, ...]:
-    """Receive one full-layer payload directly into caller-owned buffers."""
+) -> PendingLayerReceive:
+    """Post one full-layer receive into caller-owned buffers without waiting."""
     global _recv_layer_seq
     pcp_group = get_pcp_group()
     if pcp_group.world_size != 2 or pcp_group.rank_in_group != 1:
@@ -109,12 +117,26 @@ def recv_layer_payload_into(
             for tensor in recv_tensors
         ]
         recv_works = dist.batch_isend_irecv(recv_ops)
-    with _nvtx_range(f"pcp_wavefront.layer.recv_wait.seq_{layer_seq}"):
-        for work in recv_works:
+    return PendingLayerReceive(layer_seq, recv_tensors, recv_works)
+
+
+def wait_layer_receive(
+    pending: PendingLayerReceive,
+) -> tuple[torch.Tensor, ...]:
+    """Wait for a previously posted full-layer receive to become usable."""
+    with _nvtx_range(f"pcp_wavefront.layer.recv_wait.seq_{pending.layer_seq}"):
+        for work in pending.recv_works:
             work.wait()
 
-    _nvtx_mark(f"pcp_wavefront.rank1.layer_seq_{layer_seq}.recv_ready")
-    return recv_tensors
+    _nvtx_mark(f"pcp_wavefront.rank1.layer_seq_{pending.layer_seq}.recv_ready")
+    return pending.recv_tensors
+
+
+def recv_layer_payload_into(
+    recv_buffers: Sequence[torch.Tensor],
+) -> tuple[torch.Tensor, ...]:
+    """Receive one full-layer payload directly into caller-owned buffers."""
+    return wait_layer_receive(post_layer_receive_into(recv_buffers))
 
 
 def recv_layer_payload(
