@@ -1,0 +1,215 @@
+name: PCP optimization one-shot patch
+
+on:
+  push:
+    branches:
+      - wavefront-opt-cleanup
+    paths:
+      - .github/workflows/pcp-opt-one-shot.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: wavefront-opt-cleanup
+          fetch-depth: 0
+
+      - name: Preserve prompt-logprobs fallback for compact PCP sampling restore
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('vllm/v1/worker/gpu/pcp_manager.py')
+          s = p.read_text()
+          old = '''    def restore_for_sampling(
+              self,
+              hidden_states: torch.Tensor,
+          ) -> tuple[torch.Tensor, InputBatch]:
+              assert self._global_batch is not None
+              global_batch = self._global_batch
+              selected_hidden_states = self.restore_selected_hidden_states(
+                  hidden_states,
+                  global_batch.logits_indices,
+              )
+          '''
+          new = '''    def global_batch_uses_prompt_logprobs(
+              self,
+              uses_prompt_logprobs: np.ndarray,
+          ) -> bool:
+              assert self._global_batch is not None
+              return bool(
+                  np.any(uses_prompt_logprobs[self._global_batch.idx_mapping_np])
+              )
+
+          def restore_for_sampling(
+              self,
+              hidden_states: torch.Tensor,
+              force_full: bool = False,
+          ) -> tuple[torch.Tensor, InputBatch]:
+              assert self._global_batch is not None
+              global_batch = self._global_batch
+              if force_full:
+                  return self.restore_hidden_states(hidden_states), global_batch
+              selected_hidden_states = self.restore_selected_hidden_states(
+                  hidden_states,
+                  global_batch.logits_indices,
+              )
+          '''
+          if old not in s:
+              raise SystemExit('pcp_manager restore_for_sampling anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '''def maybe_restore_pcp_for_sampling(
+              manager: PCPManager | None,
+              hidden_states: torch.Tensor | None,
+              input_batch: InputBatch,
+          ) -> tuple[torch.Tensor, InputBatch]:
+              assert hidden_states is not None
+              if manager is None:
+                  return hidden_states, input_batch
+              return manager.restore_for_sampling(hidden_states)
+          '''
+          new = '''def maybe_restore_pcp_for_sampling(
+              manager: PCPManager | None,
+              hidden_states: torch.Tensor | None,
+              input_batch: InputBatch,
+              force_full: bool = False,
+          ) -> tuple[torch.Tensor, InputBatch]:
+              assert hidden_states is not None
+              if manager is None:
+                  return hidden_states, input_batch
+              return manager.restore_for_sampling(hidden_states, force_full=force_full)
+          '''
+          if old not in s:
+              raise SystemExit('pcp_manager helper anchor not found')
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('vllm/v1/worker/gpu/model_runner.py')
+          s = p.read_text()
+          old = '''        # Last rank: sample tokens
+          hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
+              self.pcp_manager, hidden_states, input_batch
+          )
+          '''
+          new = '''        # Last rank: sample tokens. Prompt-logprobs consumes the full
+          # global hidden-state layout, so keep the full restore only for batches
+          # that actually request it. The common sampling-only path communicates
+          # just the rows selected by logits_indices.
+          force_full_pcp_hidden = False
+          if self.pcp_manager is not None:
+              assert self.prompt_logprobs_worker is not None
+              force_full_pcp_hidden = (
+                  self.pcp_manager.global_batch_uses_prompt_logprobs(
+                      self.prompt_logprobs_worker.uses_prompt_logprobs
+                  )
+              )
+          hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
+              self.pcp_manager,
+              hidden_states,
+              input_batch,
+              force_full=force_full_pcp_hidden,
+          )
+          '''
+          if old not in s:
+              raise SystemExit('model_runner sampling restore anchor not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+          git config user.name "OpenAI PCP patch"
+          git config user.email "pcp-patch@users.noreply.github.com"
+          git add vllm/v1/worker/gpu/pcp_manager.py vllm/v1/worker/gpu/model_runner.py
+          if ! git diff --cached --quiet; then
+            git commit -m "[PCP] Preserve full hidden restore for prompt logprobs"
+          fi
+
+      - name: Shorten MLA temporary tensor lifetimes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('vllm/model_executor/layers/attention/mla_attention.py')
+          s = p.read_text()
+
+          old = '''            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                  kv_for_cache,
+                  kpe_for_cache,
+                  self_kv_cache,
+                  layer_slot_mapping,
+                  self.kv_cache_dtype,
+                  self._k_scale,
+              )
+              output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+          '''
+          new = '''            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                  kv_for_cache,
+                  kpe_for_cache,
+                  self_kv_cache,
+                  layer_slot_mapping,
+                  self.kv_cache_dtype,
+                  self._k_scale,
+              )
+              # The cache update is the last consumer in this scope. Rank0's
+              # asynchronous send retains its own source references until the
+              # P2P work completes, so dropping these aliases is safe.
+              del kv_for_cache, kpe_for_cache
+              output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+          '''
+          if old not in s:
+              raise SystemExit('MLA cache-update lifetime anchor not found')
+          s = s.replace(old, new, 1)
+
+          old = '''        output_prefill = prefill_metadata.prefill_backend.run_prefill_new_tokens(
+              q=q,
+              k=k,
+              v=v,
+              return_softmax_lse=has_context,
+              out=(
+                  output.view(-1, self.num_heads, self.v_head_dim)
+                  if output_scale is not None
+                  else None
+              ),
+              output_scale=output_scale,
+          )
+
+          if has_context:
+          '''
+          new = '''        output_prefill = prefill_metadata.prefill_backend.run_prefill_new_tokens(
+              q=q,
+              k=k,
+              v=v,
+              return_softmax_lse=has_context,
+              out=(
+                  output.view(-1, self.num_heads, self.v_head_dim)
+                  if output_scale is not None
+                  else None
+              ),
+              output_scale=output_scale,
+          )
+          # Do not keep the expanded local K/V alive while chunked context K/V
+          # is projected. Their kernels are already enqueued on the CUDA stream;
+          # allocator reuse remains stream ordered.
+          del k, v, k_nope, kv_nope
+
+          if has_context:
+          '''
+          if old not in s:
+              raise SystemExit('MLA local-KV lifetime anchor not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+          git add vllm/model_executor/layers/attention/mla_attention.py
+          if ! git diff --cached --quiet; then
+            git commit -m "[PCP] Shorten MLA prefill temporary lifetimes"
+          fi
+
+      - name: Push patch commits
+        shell: bash
+        run: |
+          git pull --rebase origin wavefront-opt-cleanup
+          git push origin HEAD:wavefront-opt-cleanup
