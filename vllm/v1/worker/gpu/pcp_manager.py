@@ -647,12 +647,24 @@ class PCPManager:
         )
         return gathered_candidates[selected_rows]
 
+    def global_batch_uses_prompt_logprobs(
+        self,
+        uses_prompt_logprobs: np.ndarray,
+    ) -> bool:
+        assert self._global_batch is not None
+        return bool(
+            np.any(uses_prompt_logprobs[self._global_batch.idx_mapping_np])
+        )
+
     def restore_for_sampling(
         self,
         hidden_states: torch.Tensor,
+        force_full: bool = False,
     ) -> tuple[torch.Tensor, InputBatch]:
         assert self._global_batch is not None
         global_batch = self._global_batch
+        if force_full:
+            return self.restore_hidden_states(hidden_states), global_batch
         selected_hidden_states = self.restore_selected_hidden_states(
             hidden_states,
             global_batch.logits_indices,
@@ -692,11 +704,12 @@ def maybe_restore_pcp_for_sampling(
     manager: PCPManager | None,
     hidden_states: torch.Tensor | None,
     input_batch: InputBatch,
+    force_full: bool = False,
 ) -> tuple[torch.Tensor, InputBatch]:
     assert hidden_states is not None
     if manager is None:
         return hidden_states, input_batch
-    return manager.restore_for_sampling(hidden_states)
+    return manager.restore_for_sampling(hidden_states, force_full=force_full)
 
 
 def maybe_build_pcp_manager(
