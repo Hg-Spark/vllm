@@ -228,7 +228,7 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 )
 from vllm.model_executor.layers.attention.pcp import (
     finalize_mla_pcp_decode,
-    maybe_gather_mla_latent_cache_inputs,
+    maybe_transfer_mla_cache_inputs,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
@@ -634,7 +634,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             layer_slot_mapping = slot_mapping.get(self.layer_name)
             kv_for_cache, kpe_for_cache, layer_slot_mapping = (
-                maybe_gather_mla_latent_cache_inputs(
+                maybe_transfer_mla_cache_inputs(
                     kv_c_normed,
                     k_pe,
                     layer_slot_mapping,
@@ -1192,7 +1192,7 @@ def unified_mla_kv_cache_update(
         layer_name
     )
     if layer_slot_mapping is not None:
-        kv_c_normed, k_pe, layer_slot_mapping = maybe_gather_mla_latent_cache_inputs(
+        kv_c_normed, k_pe, layer_slot_mapping = maybe_transfer_mla_cache_inputs(
             kv_c_normed,
             k_pe,
             layer_slot_mapping,
