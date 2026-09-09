@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Production full-layer PCP Wavefront transport runtime."""
 
 import os
 from collections import deque
@@ -11,7 +12,6 @@ import torch
 import torch.distributed as dist
 
 from vllm.distributed.parallel_state import get_pcp_group
-
 
 _MAX_OUTSTANDING_LAYERS_ENV = "VLLM_PCP_WAVEFRONT_MAX_OUTSTANDING_LAYERS"
 
@@ -31,8 +31,6 @@ def _read_max_outstanding_layers() -> int:
     return value
 
 
-# Controls how many layer transfers rank0 may keep in flight before the next
-# handoff waits for send credit. The default preserves the original depth of 1.
 _MAX_OUTSTANDING_LAYERS = _read_max_outstanding_layers()
 _pending_sends: deque[tuple[int, list[Any], tuple[torch.Tensor, ...]]] = deque()
 _send_layer_seq = 0
@@ -42,7 +40,6 @@ _NVTX_ENABLED = os.getenv("VLLM_PCP_WAVEFRONT_NVTX", "0") == "1"
 
 @contextmanager
 def _nvtx_range(name: str) -> Iterator[None]:
-    """Mark wavefront runtime activity without changing synchronization."""
     enabled = _NVTX_ENABLED and torch.cuda.is_available()
     if enabled:
         torch.cuda.nvtx.range_push(name)
@@ -54,32 +51,26 @@ def _nvtx_range(name: str) -> Iterator[None]:
 
 
 def _nvtx_mark(name: str) -> None:
-    """Emit a point marker for aligning producer and consumer layer progress."""
     if _NVTX_ENABLED and torch.cuda.is_available():
         torch.cuda.nvtx.mark(name)
 
 
 def _wait_oldest_send() -> None:
-    _layer_seq, send_works, retained_tensors = _pending_sends.popleft()
+    _seq, send_works, retained_tensors = _pending_sends.popleft()
     for work in send_works:
         work.wait()
-    # Keep source storage alive through work.wait().
     del retained_tensors
 
 
 def post_layer_transfer(payload: Sequence[torch.Tensor]) -> None:
-    """Post one full-layer rank0->rank1 transfer and return immediately."""
     global _send_layer_seq
-
     pcp_group = get_pcp_group()
     if pcp_group.world_size != 2 or pcp_group.rank_in_group != 0:
-        raise RuntimeError("post_layer_transfer must run on PCP=2 rank0")
+        raise RuntimeError("PCP layer transfer must run on PCP=2 rank0")
 
     while len(_pending_sends) >= _MAX_OUTSTANDING_LAYERS:
-        pending_layer_seq = _pending_sends[0][0]
-        with _nvtx_range(
-            f"pcp_wavefront.send_credit_wait.layer_seq_{pending_layer_seq}"
-        ):
+        pending_seq = _pending_sends[0][0]
+        with _nvtx_range(f"pcp_wavefront.layer.send_credit_wait.seq_{pending_seq}"):
             _wait_oldest_send()
 
     layer_seq = _send_layer_seq
@@ -88,56 +79,52 @@ def post_layer_transfer(payload: Sequence[torch.Tensor]) -> None:
 
     retained_tensors = tuple(payload)
     dst = pcp_group.ranks[1]
-    with _nvtx_range(f"pcp_wavefront.send_post.layer_seq_{layer_seq}"):
+    with _nvtx_range(f"pcp_wavefront.layer.send_post.seq_{layer_seq}"):
         send_ops = [
-            dist.P2POp(
-                dist.isend,
-                tensor,
-                dst,
-                group=pcp_group.device_group,
-            )
+            dist.P2POp(dist.isend, tensor, dst, group=pcp_group.device_group)
             for tensor in retained_tensors
         ]
         send_works = dist.batch_isend_irecv(send_ops)
     _pending_sends.append((layer_seq, send_works, retained_tensors))
 
 
-def recv_layer_payload(
-    recv_templates: Sequence[torch.Tensor],
+def recv_layer_payload_into(
+    recv_buffers: Sequence[torch.Tensor],
 ) -> tuple[torch.Tensor, ...]:
-    """Receive one full-layer rank0 payload into buffers shaped like templates."""
+    """Receive one full-layer payload directly into caller-owned buffers."""
     global _recv_layer_seq
-
     pcp_group = get_pcp_group()
     if pcp_group.world_size != 2 or pcp_group.rank_in_group != 1:
-        raise RuntimeError("recv_layer_payload must run on PCP=2 rank1")
+        raise RuntimeError("PCP layer receive must run on PCP=2 rank1")
 
     layer_seq = _recv_layer_seq
     _recv_layer_seq += 1
     _nvtx_mark(f"pcp_wavefront.rank1.layer_seq_{layer_seq}.recv_begin")
 
-    recv_tensors = tuple(torch.empty_like(template) for template in recv_templates)
+    recv_tensors = tuple(recv_buffers)
     src = pcp_group.ranks[0]
-    with _nvtx_range(f"pcp_wavefront.recv_post.layer_seq_{layer_seq}"):
+    with _nvtx_range(f"pcp_wavefront.layer.recv_post.seq_{layer_seq}"):
         recv_ops = [
-            dist.P2POp(
-                dist.irecv,
-                tensor,
-                src,
-                group=pcp_group.device_group,
-            )
+            dist.P2POp(dist.irecv, tensor, src, group=pcp_group.device_group)
             for tensor in recv_tensors
         ]
         recv_works = dist.batch_isend_irecv(recv_ops)
-    with _nvtx_range(f"pcp_wavefront.recv_wait.layer_seq_{layer_seq}"):
+    with _nvtx_range(f"pcp_wavefront.layer.recv_wait.seq_{layer_seq}"):
         for work in recv_works:
             work.wait()
+
     _nvtx_mark(f"pcp_wavefront.rank1.layer_seq_{layer_seq}.recv_ready")
     return recv_tensors
 
 
+def recv_layer_payload(
+    recv_templates: Sequence[torch.Tensor],
+) -> tuple[torch.Tensor, ...]:
+    recv_tensors = tuple(torch.empty_like(template) for template in recv_templates)
+    return recv_layer_payload_into(recv_tensors)
+
+
 def flush_pending_sends() -> None:
-    """Complete retained producer sends, primarily for step/test cleanup."""
     with _nvtx_range("pcp_wavefront.final_flush"):
         while _pending_sends:
             layer_seq = _pending_sends[0][0]
