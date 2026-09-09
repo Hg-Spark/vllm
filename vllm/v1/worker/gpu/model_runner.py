@@ -1487,9 +1487,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
-        # Last rank: sample tokens
+        # Last rank: sample tokens. Prompt-logprobs consumes the full
+        # global hidden-state layout, so retain the full restore only
+        # for batches that actually request prompt logprobs.
+        force_full_pcp_hidden = False
+        if self.pcp_manager is not None:
+            assert self.prompt_logprobs_worker is not None
+            force_full_pcp_hidden = (
+                self.pcp_manager.global_batch_uses_prompt_logprobs(
+                    self.prompt_logprobs_worker.uses_prompt_logprobs
+                )
+            )
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
-            self.pcp_manager, hidden_states, input_batch
+            self.pcp_manager,
+            hidden_states,
+            input_batch,
+            force_full=force_full_pcp_hidden,
         )
 
         sampler_output, num_sampled, num_rejected = self.sample(

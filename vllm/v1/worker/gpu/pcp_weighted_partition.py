@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.pcp_execution import PCPExecutionPlanner
 from vllm.v1.worker.gpu.pcp_manager import RankSegment
@@ -161,6 +162,73 @@ class WeightedPCPManager(PCPExecutionPlanner):
             if block_tables is not None and block_tables.kernel_block_sizes
             else 1
         )
+        self._selected_candidate_buffer: torch.Tensor | None = None
+
+    def restore_selected_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        global_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Restore only selected global rows from the weighted slab layout."""
+        plan = self.batch_plan
+        if plan is None:
+            return hidden_states[global_indices]
+        if global_indices.numel() == 0 or plan.rank_slab_width == 0:
+            return hidden_states[:0]
+        if hidden_states.shape[0] < plan.owned_num_tokens:
+            raise RuntimeError(
+                "PCP hidden-state rows are smaller than owned token count: "
+                f"{hidden_states.shape[0]} < {plan.owned_num_tokens}"
+            )
+
+        selected_gather_idx = plan.hidden_restore_idx[global_indices]
+        owner_rank = torch.div(
+            selected_gather_idx,
+            plan.rank_slab_width,
+            rounding_mode="floor",
+        )
+        local_idx = torch.remainder(selected_gather_idx, plan.rank_slab_width)
+        num_selected = global_indices.numel()
+        required_shape = (num_selected, *hidden_states.shape[1:])
+
+        buffer = self._selected_candidate_buffer
+        if (
+            buffer is None
+            or buffer.device != hidden_states.device
+            or buffer.dtype != hidden_states.dtype
+            or buffer.shape[1:] != hidden_states.shape[1:]
+            or buffer.shape[0] < num_selected
+        ):
+            buffer = hidden_states.new_empty(required_shape)
+            self._selected_candidate_buffer = buffer
+        local_candidates = buffer[:num_selected]
+        local_candidates.zero_()
+
+        owner_mask = owner_rank == self.pcp_rank
+        local_candidates[owner_mask] = hidden_states[local_idx[owner_mask]]
+
+        gathered_candidates = get_pcp_group().all_gather(local_candidates, dim=0)
+        selected_rows = owner_rank * num_selected + torch.arange(
+            num_selected,
+            dtype=owner_rank.dtype,
+            device=owner_rank.device,
+        )
+        return gathered_candidates[selected_rows]
+
+    def restore_for_sampling(
+        self,
+        hidden_states: torch.Tensor,
+        force_full: bool = False,
+    ):
+        if self.pcp_rank == 0:
+            from vllm.model_executor.layers.attention.pcp_wavefront_runtime import (
+                flush_pending_sends,
+            )
+
+            flush_pending_sends()
+        if self.batch_plan is None:
+            force_full = True
+        return super().restore_for_sampling(hidden_states, force_full=force_full)
 
     def _partition_lengths(
         self,
