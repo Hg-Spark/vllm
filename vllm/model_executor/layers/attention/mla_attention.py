@@ -191,7 +191,7 @@ import functools
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import ClassVar, Generic, TypeVar, cast
+from typing import Callable, ClassVar, Generic, TypeVar, cast
 
 import torch
 import torch.nn as nn
@@ -227,7 +227,9 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
 from vllm.model_executor.layers.attention.pcp import (
+    begin_mla_cache_input_transfer,
     finalize_mla_pcp_decode,
+    finish_mla_cache_input_transfer,
     maybe_transfer_mla_cache_inputs,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -633,28 +635,63 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
             )
             layer_slot_mapping = slot_mapping.get(self.layer_name)
-            kv_for_cache, kpe_for_cache, layer_slot_mapping = (
-                maybe_transfer_mla_cache_inputs(
-                    kv_c_normed,
-                    k_pe,
+            after_local_attention: Callable[[], None] | None = None
+            use_pcp_prefill_overlap = (
+                self.use_pcp
+                and attn_metadata is not None
+                and attn_metadata.num_decode_tokens == 0
+                and layer_slot_mapping is not None
+                and not self.impl.is_sparse
+            )
+            if use_pcp_prefill_overlap:
+                pending_cache_transfer = begin_mla_cache_input_transfer(
+                    (kv_c_normed, k_pe.flatten(1)),
                     layer_slot_mapping,
-                    attn_metadata.num_decode_tokens
-                    if attn_metadata is not None
-                    else None,
-                    self.use_pcp,
                 )
-            )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_for_cache,
-                kpe_for_cache,
-                self_kv_cache,
-                layer_slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
-            # The cache update is the last consumer in this scope. Rank0's
-            # async send retains source tensors until its P2P work completes.
-            del kv_for_cache, kpe_for_cache
+
+                def _finish_pcp_cache_update() -> None:
+                    (cache_inputs, cache_slot_mapping) = (
+                        finish_mla_cache_input_transfer(
+                            pending_cache_transfer
+                        )
+                    )
+                    cache_kv_c, cache_k_pe_flat = cache_inputs
+                    cache_k_pe = cache_k_pe_flat.view(
+                        -1, *k_pe.shape[1:]
+                    )
+                    self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                        cache_kv_c,
+                        cache_k_pe,
+                        self_kv_cache,
+                        cache_slot_mapping,
+                        self.kv_cache_dtype,
+                        self._k_scale,
+                    )
+
+                after_local_attention = _finish_pcp_cache_update
+            else:
+                kv_for_cache, kpe_for_cache, layer_slot_mapping = (
+                    maybe_transfer_mla_cache_inputs(
+                        kv_c_normed,
+                        k_pe,
+                        layer_slot_mapping,
+                        attn_metadata.num_decode_tokens
+                        if attn_metadata is not None
+                        else None,
+                        self.use_pcp,
+                    )
+                )
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_for_cache,
+                    kpe_for_cache,
+                    self_kv_cache,
+                    layer_slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
+                # The cache update is the last consumer in this scope.
+                # Rank0 async send retains its source until completion.
+                del kv_for_cache, kpe_for_cache
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -664,6 +701,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 attn_metadata,
                 output=output,
                 q_dcp_replicated=q_dcp_replicated,
+                after_local_attention=after_local_attention,
             )
             return output
         else:
@@ -702,6 +740,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         quant_col_major: bool | None = None,
         quant_tma_aligned: bool | None = None,
         q_dcp_replicated: torch.Tensor | None = None,
+        after_local_attention: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
@@ -829,6 +868,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self._k_scale,
                 output=mha_output[num_mqa_tokens:num_actual_toks],
                 output_scale=mha_output_scale,
+                after_local_attention=after_local_attention,
             )
 
         if num_mqa_tokens > 0:
@@ -2591,6 +2631,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         k_scale: torch.Tensor,
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
+        after_local_attention: Callable[[], None] | None = None,
     ) -> None:
         assert attn_metadata.prefill is not None
         assert self.dcp_world_size != -1
@@ -2633,6 +2674,12 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         # Release expanded local K/V before chunked context K/V is
         # projected. CUDA allocator reuse remains stream ordered.
         del k, v, k_nope, kv_nope
+
+        # For PCP pure prefill, the receive was posted before local
+        # attention. Complete the transfer/cache write only now so
+        # NCCL can overlap the local attention kernels.
+        if after_local_attention is not None:
+            after_local_attention()
 
         if has_context:
             assert prefill_metadata.chunked_context is not None
