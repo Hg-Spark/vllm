@@ -135,6 +135,10 @@ def maybe_apply_startup_plan(worker: "Worker") -> None:
     """If enabled and ``--kv-cache-memory`` was not set explicitly, apply a
     persisted plan by setting ``worker.cache_config.kv_cache_memory_bytes``.
     No-op unless ``VLLM_ENABLE_STARTUP_PLAN=1``."""
+    from vllm.v1.worker.gpu.pcp_profile import maybe_prepare_pcp_profile_run
+
+    maybe_prepare_pcp_profile_run(worker)
+
     if (
         not envs.VLLM_ENABLE_STARTUP_PLAN
         or worker.cache_config.kv_cache_memory_bytes is not None
