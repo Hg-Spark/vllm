@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Execution layout and batch materialization for rank-local PCP policies."""
+"""Execution layout, batch materialization, and slab mapping for rank-local PCP."""
 
 from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
 
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -23,7 +24,7 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class PCPBatchPlan:
-    """One-step semantic and communication widths for rank-local PCP."""
+    """One-step execution and communication-slab layout for rank-local PCP."""
 
     segments_by_rank: tuple[tuple[RankSegment, ...], ...]
     per_rank_num_tokens: tuple[int, ...]
@@ -31,6 +32,9 @@ class PCPBatchPlan:
     owned_num_tokens: int
     model_num_rows: int
     rank_slab_width: int
+    slab_global_idx: torch.Tensor
+    kv_write_mask: torch.Tensor
+    hidden_restore_idx: torch.Tensor
 
     @property
     def uses_dummy_execution_row(self) -> bool:
@@ -50,6 +54,7 @@ class PCPExecutionPlanner(PCPManager):
         self._batch_plan: PCPBatchPlan | None = None
         self._scratch_max_reqs = 0
         self._scratch_max_tokens = 0
+        self._layout_token_capacity = 0
 
     @property
     def batch_plan(self) -> PCPBatchPlan | None:
@@ -73,6 +78,32 @@ class PCPExecutionPlanner(PCPManager):
                 )
             )
             for rank in range(self.pcp_world_size)
+        )
+
+    def _ensure_layout_scratch(self, global_num_tokens: int) -> None:
+        input_buffers = getattr(self, "_input_buffers", None)
+        configured_tokens = (
+            input_buffers.max_num_tokens if input_buffers is not None else 0
+        )
+        token_capacity = max(global_num_tokens, configured_tokens)
+        if token_capacity <= self._layout_token_capacity:
+            return
+
+        self._layout_token_capacity = token_capacity
+        slab_capacity = token_capacity * self.pcp_world_size
+        self._slab_global_idx_np = np.empty(slab_capacity, dtype=np.int64)
+        self._kv_write_mask_np = np.empty(slab_capacity, dtype=np.bool_)
+        self._hidden_restore_idx_np = np.empty(token_capacity, dtype=np.int64)
+
+        device = getattr(self, "device", torch.device("cpu"))
+        self._slab_global_idx_gpu = torch.empty(
+            slab_capacity, dtype=torch.int64, device=device
+        )
+        self._kv_write_mask_gpu = torch.empty(
+            slab_capacity, dtype=torch.bool, device=device
+        )
+        self._hidden_restore_idx_gpu = torch.empty(
+            token_capacity, dtype=torch.int64, device=device
         )
 
     def _build_batch_plan(
@@ -100,6 +131,38 @@ class PCPExecutionPlanner(PCPManager):
             else (1 if rank_slab_width > 0 else 0)
         )
 
+        global_num_tokens = int(query_start_loc_np[-1])
+        self._ensure_layout_scratch(global_num_tokens)
+        num_slab_rows = rank_slab_width * self.pcp_world_size
+        slab_global_idx_np = self._slab_global_idx_np[:num_slab_rows]
+        kv_write_mask_np = self._kv_write_mask_np[:num_slab_rows]
+        hidden_restore_idx_np = self._hidden_restore_idx_np[:global_num_tokens]
+        slab_global_idx_np.fill(0)
+        kv_write_mask_np.fill(False)
+
+        for rank, segments in enumerate(segments_by_rank):
+            rank_offset = rank * rank_slab_width
+            for segment in segments:
+                slab_slice = slice(
+                    rank_offset + segment.rank_local_batch_slice.start,
+                    rank_offset + segment.rank_local_batch_slice.stop,
+                )
+                global_slice = segment.global_batch_slice
+                slab_global_idx_np[slab_slice] = np.arange(
+                    global_slice.start, global_slice.stop, dtype=np.int64
+                )
+                kv_write_mask_np[slab_slice] = True
+                hidden_restore_idx_np[global_slice] = np.arange(
+                    slab_slice.start, slab_slice.stop, dtype=np.int64
+                )
+
+        slab_global_idx = self._slab_global_idx_gpu[:num_slab_rows]
+        kv_write_mask = self._kv_write_mask_gpu[:num_slab_rows]
+        hidden_restore_idx = self._hidden_restore_idx_gpu[:global_num_tokens]
+        async_copy_to_gpu(slab_global_idx_np, out=slab_global_idx)
+        async_copy_to_gpu(kv_write_mask_np, out=kv_write_mask)
+        async_copy_to_gpu(hidden_restore_idx_np, out=hidden_restore_idx)
+
         plan = PCPBatchPlan(
             segments_by_rank=segments_by_rank,
             per_rank_num_tokens=per_rank_num_tokens,
@@ -107,6 +170,9 @@ class PCPExecutionPlanner(PCPManager):
             owned_num_tokens=owned_num_tokens,
             model_num_rows=model_num_rows,
             rank_slab_width=rank_slab_width,
+            slab_global_idx=slab_global_idx,
+            kv_write_mask=kv_write_mask,
+            hidden_restore_idx=hidden_restore_idx,
         )
         self._batch_plan = plan
         return plan
@@ -129,6 +195,7 @@ class PCPExecutionPlanner(PCPManager):
         self._local_is_prefilling_np = np.empty(max_reqs, dtype=np.bool_)
         self._seq_lens_cpu_upper_bound_np = np.empty(max_reqs, dtype=np.int32)
         self._local_input_idx_np = np.empty(max_tokens, dtype=np.int64)
+        self._local_to_global_req_idx_np = np.empty(max_reqs, dtype=np.int32)
         self._req_range_np = np.arange(max_reqs + 1, dtype=np.int32)
         self._zero_req_range_np = np.zeros(max_reqs + 1, dtype=np.int32)
 
@@ -213,27 +280,22 @@ class PCPExecutionPlanner(PCPManager):
             )
             local_num_scheduled_tokens[local_req_idx] = segment.num_tokens
 
-        local_to_global_req_idx_np = global_batch.idx_mapping_np[
-            local_to_global_batch_req_idx_np
-        ]
+        local_to_global_req_idx_np = self._local_to_global_req_idx_np[:num_local_reqs]
+        np.take(
+            global_batch.idx_mapping_np,
+            local_to_global_batch_req_idx_np,
+            out=local_to_global_req_idx_np,
+        )
         local_req_ids = [
             global_batch.req_ids[global_batch_req_idx]
             for global_batch_req_idx in local_to_global_batch_req_idx_np
         ]
 
         if plan.owned_num_tokens > 0:
-            local_input_idx_np = self._local_input_idx_np[: plan.owned_num_tokens]
-            cursor = 0
-            for segment in plan.local_segments:
-                width = segment.num_tokens
-                local_input_idx_np[cursor : cursor + width] = np.arange(
-                    segment.global_batch_slice.start,
-                    segment.global_batch_slice.stop,
-                    dtype=np.int64,
-                )
-                cursor += width
-            local_input_idx = self._local_input_idx_gpu[: plan.owned_num_tokens]
-            async_copy_to_gpu(local_input_idx_np, out=local_input_idx)
+            rank_start = self.pcp_rank * plan.rank_slab_width
+            local_input_idx = plan.slab_global_idx[
+                rank_start : rank_start + plan.owned_num_tokens
+            ]
             torch.index_select(
                 global_batch.input_ids,
                 0,
@@ -383,3 +445,61 @@ class PCPExecutionPlanner(PCPManager):
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
         )
+
+    def _convert_to_gathered_slot_mappings(
+        self,
+        global_batch_slot_mappings: torch.Tensor,
+    ) -> torch.Tensor:
+        plan = self._batch_plan
+        if plan is None:
+            raise RuntimeError("PCP slot mapping requested without a batch plan")
+        num_slab_rows = plan.slab_global_idx.shape[0]
+        if self._gathered_kv_slot_mappings is None:
+            self._gathered_kv_slot_mappings = global_batch_slot_mappings.new_empty(
+                global_batch_slot_mappings.shape[0], num_slab_rows
+            )
+        gathered_kv_slot_mappings = self._gathered_kv_slot_mappings[:, :num_slab_rows]
+        if num_slab_rows == 0:
+            return gathered_kv_slot_mappings
+        torch.index_select(
+            global_batch_slot_mappings,
+            1,
+            plan.slab_global_idx,
+            out=gathered_kv_slot_mappings,
+        )
+        torch.where(
+            plan.kv_write_mask.unsqueeze(0),
+            gathered_kv_slot_mappings,
+            self._pad_slot_id,
+            out=gathered_kv_slot_mappings,
+        )
+        return gathered_kv_slot_mappings
+
+    def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        plan = self._batch_plan
+        if plan is None:
+            return hidden_states
+        if plan.rank_slab_width == 0:
+            return hidden_states[:0]
+        if hidden_states.shape[0] < plan.owned_num_tokens:
+            raise RuntimeError(
+                "PCP hidden-state rows are smaller than owned token count: "
+                f"{hidden_states.shape[0]} < {plan.owned_num_tokens}"
+            )
+
+        if (
+            plan.owned_num_tokens == plan.rank_slab_width
+            and hidden_states.shape[0] == plan.rank_slab_width
+        ):
+            slab_hidden_states = hidden_states
+        else:
+            slab_hidden_states = hidden_states.new_zeros(
+                (plan.rank_slab_width, *hidden_states.shape[1:])
+            )
+            if plan.owned_num_tokens > 0:
+                slab_hidden_states[: plan.owned_num_tokens].copy_(
+                    hidden_states[: plan.owned_num_tokens]
+                )
+
+        gathered = get_pcp_group().all_gather(slab_hidden_states, dim=0)
+        return gathered[plan.hidden_restore_idx]
