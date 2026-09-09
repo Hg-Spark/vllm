@@ -15,29 +15,77 @@ from vllm.v1.worker.gpu.states import RequestState
 def weighted_partition_lengths(
     num_tokens: int,
     pcp_partition_weights: tuple[float, ...],
+    *,
+    start_pos: int = 0,
+    alignment: int = 1,
 ) -> tuple[int, ...]:
-    """Split tokens by positive weights with deterministic largest remainders."""
+    """Partition tokens with cumulative weighted, optionally aligned cuts."""
     if num_tokens < 0:
         raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
     if not pcp_partition_weights:
         raise ValueError("weighted PCP partition requires at least one weight")
+    if alignment <= 0:
+        raise ValueError(f"alignment must be positive, got {alignment}")
 
     total_weight = sum(pcp_partition_weights)
     if not math.isfinite(total_weight) or total_weight <= 0.0:
         raise ValueError(f"invalid PCP load weights: {pcp_partition_weights}")
+    num_segments = len(pcp_partition_weights)
     if num_tokens == 0:
-        return (0,) * len(pcp_partition_weights)
+        return (0,) * num_segments
 
-    ideal = [num_tokens * weight / total_weight for weight in pcp_partition_weights]
-    lengths = [math.floor(value) for value in ideal]
-    remainder = num_tokens - sum(lengths)
-    order = sorted(
-        range(len(lengths)),
-        key=lambda index: (-(ideal[index] - lengths[index]), index),
+    if alignment == 1:
+        ideal = [num_tokens * weight / total_weight for weight in pcp_partition_weights]
+        lengths = [math.floor(value) for value in ideal]
+        remainder = num_tokens - sum(lengths)
+        order = sorted(
+            range(num_segments),
+            key=lambda index: (-(ideal[index] - lengths[index]), index),
+        )
+        for index in order[:remainder]:
+            lengths[index] += 1
+        return tuple(lengths)
+
+    require_positive = (
+        start_pos % alignment == 0
+        and num_tokens >= (num_segments - 1) * alignment + 1
     )
-    for index in order[:remainder]:
-        lengths[index] += 1
-    return tuple(lengths)
+    boundaries = [0]
+    cumulative_weight = 0.0
+    for segment in range(num_segments - 1):
+        cumulative_weight += pcp_partition_weights[segment]
+        ideal_rel = num_tokens * cumulative_weight / total_weight
+        ideal_abs = start_pos + ideal_rel
+
+        if require_positive:
+            min_cut = (segment + 1) * alignment
+            remaining_segments = num_segments - segment - 1
+            max_cut = num_tokens - ((remaining_segments - 1) * alignment + 1)
+            candidates: set[int] = set()
+        else:
+            min_cut = boundaries[-1]
+            max_cut = num_tokens
+            candidates = {boundaries[-1], num_tokens}
+
+        lower_abs = math.floor(ideal_abs / alignment) * alignment
+        upper_abs = math.ceil(ideal_abs / alignment) * alignment
+        min_abs = math.ceil((start_pos + min_cut) / alignment) * alignment
+        max_abs = math.floor((start_pos + max_cut) / alignment) * alignment
+        for candidate_abs in (lower_abs, upper_abs, min_abs, max_abs):
+            candidate_rel = int(candidate_abs - start_pos)
+            if min_cut <= candidate_rel <= max_cut:
+                candidates.add(candidate_rel)
+
+        if not candidates:
+            raise AssertionError("PCP page-aligned partition has no legal boundary")
+        boundary = min(candidates, key=lambda cut: (abs(cut - ideal_rel), cut))
+        boundaries.append(boundary)
+
+    boundaries.append(num_tokens)
+    return tuple(
+        boundaries[index + 1] - boundaries[index]
+        for index in range(num_segments)
+    )
 
 
 def parse_pcp_partition_weights(
@@ -108,9 +156,26 @@ class WeightedPCPManager(PCPExecutionPlanner):
                 "PCP partition weights must match PCP world size: "
                 f"weights={self._pcp_partition_weights}, world_size={pcp_world_size}"
             )
+        self._page_alignment = (
+            math.lcm(*(int(size) for size in block_tables.kernel_block_sizes))
+            if block_tables is not None and block_tables.kernel_block_sizes
+            else 1
+        )
 
-    def _partition_lengths(self, query_len: int) -> tuple[int, ...]:
-        return weighted_partition_lengths(query_len, self._pcp_partition_weights)
+    def _partition_lengths(
+        self,
+        query_len: int,
+        num_computed_tokens: int,
+    ) -> tuple[int, ...]:
+        alignment = self._page_alignment
+        if query_len < self.pcp_world_size * alignment:
+            alignment = 1
+        return weighted_partition_lengths(
+            query_len,
+            self._pcp_partition_weights,
+            start_pos=num_computed_tokens,
+            alignment=alignment,
+        )
 
     def _get_segments_by_rank(
         self,
@@ -131,7 +196,9 @@ class WeightedPCPManager(PCPExecutionPlanner):
             global_start = int(query_start_loc_np[global_req_idx])
 
             if bool(is_prefilling[global_req_idx]):
-                lengths = self._partition_lengths(query_len)
+                lengths = self._partition_lengths(
+                    query_len, int(num_computed_tokens[global_req_idx])
+                )
                 query_offset = 0
                 for rank, length in enumerate(lengths):
                     if length > 0:
