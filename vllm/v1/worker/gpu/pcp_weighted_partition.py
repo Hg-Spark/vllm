@@ -89,6 +89,17 @@ def weighted_partition_lengths(
     )
 
 
+def effective_partition_alignment(
+    query_len: int,
+    pcp_world_size: int,
+    page_alignment: int,
+) -> int:
+    """Return the existing weighted-PCP alignment for one scheduled query."""
+    if query_len < pcp_world_size * page_alignment:
+        return 1
+    return page_alignment
+
+
 def parse_pcp_partition_weights(
     additional_config: object,
     pcp_world_size: int,
@@ -235,9 +246,11 @@ class WeightedPCPManager(PCPExecutionPlanner):
         query_len: int,
         num_computed_tokens: int,
     ) -> tuple[int, ...]:
-        alignment = self._page_alignment
-        if query_len < self.pcp_world_size * alignment:
-            alignment = 1
+        alignment = effective_partition_alignment(
+            query_len,
+            self.pcp_world_size,
+            self._page_alignment,
+        )
         return weighted_partition_lengths(
             query_len,
             self._pcp_partition_weights,

@@ -22,6 +22,29 @@ from vllm.v1.worker.gpu.pcp_manager import PCPManager, RankSegment
 logger = init_logger(__name__)
 
 
+def _model_num_rows(owned_num_tokens: int, rank_slab_width: int) -> int:
+    """Return the existing rank-local execution width, including dummy-row use."""
+    return (
+        owned_num_tokens
+        if owned_num_tokens > 0
+        else (1 if rank_slab_width > 0 else 0)
+    )
+
+
+def _segment_start_pos(
+    segment: RankSegment,
+    num_computed_tokens: np.ndarray,
+    query_start_loc_np: np.ndarray,
+):
+    """Derive a segment's request-local start position from the global batch."""
+    req_idx = segment.global_batch_req_idx
+    return (
+        num_computed_tokens[req_idx]
+        + segment.global_batch_slice.start
+        - query_start_loc_np[req_idx]
+    )
+
+
 @dataclass(frozen=True)
 class PCPBatchPlan:
     """One-step execution and communication-slab layout for rank-local PCP."""
@@ -125,11 +148,7 @@ class PCPExecutionPlanner(PCPManager):
         )
         rank_slab_width = max(per_rank_num_tokens, default=0)
         owned_num_tokens = per_rank_num_tokens[self.pcp_rank]
-        model_num_rows = (
-            owned_num_tokens
-            if owned_num_tokens > 0
-            else (1 if rank_slab_width > 0 else 0)
-        )
+        model_num_rows = _model_num_rows(owned_num_tokens, rank_slab_width)
 
         global_num_tokens = int(query_start_loc_np[-1])
         self._ensure_layout_scratch(global_num_tokens)
@@ -194,7 +213,6 @@ class PCPExecutionPlanner(PCPManager):
         self._local_num_computed_prefill_tokens_np = np.empty(max_reqs, dtype=np.int32)
         self._local_is_prefilling_np = np.empty(max_reqs, dtype=np.bool_)
         self._seq_lens_cpu_upper_bound_np = np.empty(max_reqs, dtype=np.int32)
-        self._local_input_idx_np = np.empty(max_tokens, dtype=np.int64)
         self._local_to_global_req_idx_np = np.empty(max_reqs, dtype=np.int32)
         self._req_range_np = np.arange(max_reqs + 1, dtype=np.int32)
         self._zero_req_range_np = np.zeros(max_reqs + 1, dtype=np.int32)
@@ -204,9 +222,6 @@ class PCPExecutionPlanner(PCPManager):
         )
         self._local_start_pos_gpu = torch.empty(
             max_reqs, dtype=torch.int32, device=self.device
-        )
-        self._local_input_idx_gpu = torch.empty(
-            max_tokens, dtype=torch.int64, device=self.device
         )
         self._expanded_local_pos_gpu = torch.zeros(
             max_reqs, dtype=torch.int32, device=self.device
@@ -273,10 +288,10 @@ class PCPExecutionPlanner(PCPManager):
         for local_req_idx, segment in enumerate(local_segments):
             global_batch_req_idx = segment.global_batch_req_idx
             local_to_global_batch_req_idx_np[local_req_idx] = global_batch_req_idx
-            local_start_pos_np[local_req_idx] = (
-                num_computed_tokens[global_batch_req_idx]
-                + segment.global_batch_slice.start
-                - global_batch.query_start_loc_np[global_batch_req_idx]
+            local_start_pos_np[local_req_idx] = _segment_start_pos(
+                segment,
+                num_computed_tokens,
+                global_batch.query_start_loc_np,
             )
             local_num_scheduled_tokens[local_req_idx] = segment.num_tokens
 
