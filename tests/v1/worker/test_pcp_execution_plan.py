@@ -9,6 +9,7 @@ import torch
 import vllm.model_executor.layers.attention.pcp_wavefront_runtime as wavefront
 import vllm.v1.worker.gpu.pcp_execution as pcp_execution
 from vllm.v1.worker.gpu.pcp_execution import PCPExecutionPlanner
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.pcp_weighted_partition import WeightedPCPManager
 
 
@@ -53,6 +54,7 @@ def test_weighted_manager_uses_pcp_execution_planner() -> None:
         block_tables=_block_tables(),
     )
     assert isinstance(manager, PCPExecutionPlanner)
+    assert PCPExecutionPlanner.partition_batch is PCPManager.partition_batch
 
 
 def test_batch_plan_separates_owned_rows_and_rank_slab_width(monkeypatch) -> None:
@@ -65,14 +67,24 @@ def test_batch_plan_separates_owned_rows_and_rank_slab_width(monkeypatch) -> Non
         pcp_partition_weights=(2.0, 1.0),
     )
 
-    plan = manager._build_batch_plan(*_layout_inputs(4096))
+    segments_by_rank, per_rank_num_tokens = manager._build_batch_layout(
+        *_layout_inputs(4096)
+    )
+    plan = manager.batch_plan
+    assert plan is not None
 
-    assert plan.per_rank_num_tokens == (2688, 1408)
+    assert tuple(per_rank_num_tokens) == (2688, 1408)
+    assert tuple(tuple(segments) for segments in segments_by_rank) == plan.segments_by_rank
     assert plan.owned_num_tokens == 1408
+    assert manager._get_model_num_rows(per_rank_num_tokens) == 1408
     assert plan.model_num_rows == 1408
     assert plan.rank_slab_width == 2688
     assert not plan.uses_dummy_execution_row
     assert plan.slab_global_idx.numel() == 2 * 2688
+
+    local_input_idx = manager._get_local_input_idx(plan.model_num_rows)
+    expected = plan.slab_global_idx[2688 : 2688 + 1408]
+    assert torch.equal(local_input_idx, expected)
 
 
 def test_empty_owner_gets_exactly_one_dummy_model_row(monkeypatch) -> None:
@@ -84,14 +96,21 @@ def test_empty_owner_gets_exactly_one_dummy_model_row(monkeypatch) -> None:
         block_tables=_block_tables(),
     )
 
-    plan = manager._build_batch_plan(*_layout_inputs(1))
+    segments_by_rank, per_rank_num_tokens = manager._build_batch_layout(
+        *_layout_inputs(1)
+    )
+    plan = manager.batch_plan
+    assert plan is not None
 
-    assert plan.per_rank_num_tokens == (1, 0, 0, 0)
+    assert tuple(per_rank_num_tokens) == (1, 0, 0, 0)
     assert plan.owned_num_tokens == 0
+    assert manager._get_model_num_rows(per_rank_num_tokens) == 1
     assert plan.model_num_rows == 1
     assert plan.rank_slab_width == 1
     assert plan.uses_dummy_execution_row
     assert not bool(plan.kv_write_mask[3].item())
+    assert manager._get_local_input_idx(1).tolist() == [0]
+    assert len(segments_by_rank[3]) == 0
 
 
 def test_decode_plan_is_owned_by_last_rank(monkeypatch) -> None:

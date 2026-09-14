@@ -316,6 +316,23 @@ class PCPManager:
         )
         return segments_by_rank, per_rank_num_tokens
 
+    def _get_model_num_rows(self, per_rank_num_tokens: list[int]) -> int:
+        """Return rows executed by the model for the current rank.
+
+        Canonical PCP executes the common padded rank width. Specialized PCP
+        planners may keep a different execution width while retaining a wider
+        communication slab.
+        """
+        return max(per_rank_num_tokens, default=0)
+
+    def _get_local_input_idx(self, model_num_rows: int) -> torch.Tensor:
+        """Return global input indices materialized into this rank's model rows."""
+        assert self._padded_gather_idx is not None
+        rank_token_start = self.pcp_rank * model_num_rows
+        return self._padded_gather_idx[
+            rank_token_start : rank_token_start + model_num_rows
+        ]
+
     def partition_batch(self, input_batch: InputBatch) -> InputBatch:
         assert self._req_states is not None
         assert self._input_buffers is not None
@@ -384,7 +401,7 @@ class PCPManager:
         ]
 
         num_local_tokens = int(local_num_scheduled_tokens.sum())
-        num_local_tokens_padded = max(per_rank_num_tokens)
+        num_local_tokens_padded = self._get_model_num_rows(per_rank_num_tokens)
         fresh_prefills = int(
             np.count_nonzero(is_prefilling & (num_computed_tokens == 0))
         )
@@ -394,7 +411,7 @@ class PCPManager:
         logger.debug(
             "PCP batch: rank=%d global_batch_reqs=%d fresh_prefills=%d "
             "continued_prefills=%d decodes=%d local_reqs=%d "
-            "local_tokens=%d per_rank_tokens=%s",
+            "local_tokens=%d model_rows=%d per_rank_tokens=%s",
             self.pcp_rank,
             global_batch.num_reqs,
             fresh_prefills,
@@ -402,6 +419,7 @@ class PCPManager:
             global_batch.num_reqs - fresh_prefills - continued_prefills,
             num_local_reqs,
             num_local_tokens,
+            num_local_tokens_padded,
             per_rank_num_tokens,
         )
         if num_local_tokens_padded > input_buffers.max_num_tokens:
@@ -409,11 +427,7 @@ class PCPManager:
                 "PCP local token count exceeds the MRV2 input buffer size: "
                 f"{num_local_tokens_padded} > {input_buffers.max_num_tokens}."
             )
-        rank_token_start = self.pcp_rank * num_local_tokens_padded
-        assert self._padded_gather_idx is not None
-        local_gather_idx = self._padded_gather_idx[
-            rank_token_start : rank_token_start + num_local_tokens_padded
-        ]
+        local_gather_idx = self._get_local_input_idx(num_local_tokens_padded)
         torch.index_select(
             global_batch.input_ids,
             0,

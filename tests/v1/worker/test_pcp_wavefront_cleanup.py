@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import numpy as np
+import torch
 
-from vllm.v1.worker.gpu.pcp_execution import _model_num_rows, _segment_start_pos
-from vllm.v1.worker.gpu.pcp_manager import RankSegment
+from vllm.v1.worker.gpu.pcp_execution import _model_num_rows
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.pcp_weighted_partition import effective_partition_alignment
 
 
@@ -14,21 +14,14 @@ def test_model_num_rows_preserves_existing_dummy_row_rule() -> None:
     assert _model_num_rows(0, 0) == 0
 
 
-def test_segment_start_pos_matches_existing_formula() -> None:
-    segment = RankSegment(
-        global_batch_req_idx=1,
-        global_batch_slice=slice(8, 12),
-        rank_local_batch_slice=slice(0, 4),
+def test_base_pcp_model_rows_preserve_padded_rank_width() -> None:
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
     )
-    num_computed_tokens = np.asarray([3, 20], dtype=np.int32)
-    query_start_loc = np.asarray([0, 5, 13], dtype=np.int32)
-
-    expected = (
-        num_computed_tokens[1]
-        + segment.global_batch_slice.start
-        - query_start_loc[1]
-    )
-    assert _segment_start_pos(segment, num_computed_tokens, query_start_loc) == expected
+    assert manager._get_model_num_rows([3, 5]) == 5
+    assert manager._get_model_num_rows([0, 0]) == 0
 
 
 def test_effective_partition_alignment_preserves_threshold_rule() -> None:
