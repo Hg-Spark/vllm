@@ -5,6 +5,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any, cast
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
@@ -14,6 +15,9 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
+)
+from vllm.v1.attention.ops.pcp_shared_context_mla import (
+    maybe_build_pcp_mla_shared_metadata,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -265,12 +269,15 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    request_state_indices_cpu: np.ndarray | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
     if seq_lens_cpu_upper_bound is not None:
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
+    if request_state_indices_cpu is not None:
+        request_state_indices_cpu = request_state_indices_cpu[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
@@ -327,11 +334,19 @@ def build_attn_metadata(
                     if model_specific_attn_metadata is not None
                     else {}
                 )
-                metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
-                    **attn_metadata_extra_kwargs,
-                )
+                metadata = None
+                if not attn_metadata_extra_kwargs:
+                    metadata = maybe_build_pcp_mla_shared_metadata(
+                        attn_metadata_builder,
+                        common_attn_metadata,
+                        request_state_indices_cpu,
+                    )
+                if metadata is None:
+                    metadata = attn_metadata_builder.build(
+                        common_prefix_len=0,
+                        common_attn_metadata=common_attn_metadata,
+                        **attn_metadata_extra_kwargs,
+                    )
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata
