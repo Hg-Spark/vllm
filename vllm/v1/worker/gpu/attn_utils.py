@@ -5,6 +5,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any, cast
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
@@ -258,6 +259,7 @@ def build_attn_metadata(
     kv_cache_config: KVCacheConfig,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     dcp_local_seq_lens: torch.Tensor | None = None,
+    req_idx: np.ndarray | None = None,
     positions: torch.Tensor | None = None,
     is_prefilling: torch.Tensor | None = None,
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None,
@@ -305,6 +307,7 @@ def build_attn_metadata(
             slot_mapping=slot_mapping,
             causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
+            req_idx=req_idx,
             positions=positions,
             is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,

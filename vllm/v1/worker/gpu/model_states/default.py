@@ -219,6 +219,7 @@ class DefaultModelState(ModelState):
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            req_idx=input_batch.idx_mapping_np,
             positions=input_batch.positions,
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
             mm_req_doc_ranges=req_doc_ranges,

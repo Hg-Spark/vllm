@@ -425,6 +425,10 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    req_idx: np.ndarray | None = None
+    """(batch_size,) request-table index for each row. Equal adjacent values
+    identify PCP virtual rows that share one logical request."""
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges
@@ -555,6 +559,7 @@ class CommonAttentionMetadata:
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
+            req_idx=maybe_slice_reqs(self.req_idx),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
