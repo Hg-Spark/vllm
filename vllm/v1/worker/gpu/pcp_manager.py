@@ -166,20 +166,12 @@ class PCPManager:
         segments: list[RankSegment],
         num_computed_tokens: np.ndarray,
         is_prefilling: np.ndarray,
-        query_start_loc_np: np.ndarray,
     ) -> list[RankSegment]:
-        """Move pure prefills last to match the batch ordering expected by
-        attention backends like MLA and sparse MLA.
-        """
+        """Move pure-prefill requests last without splitting their PCP rows."""
 
         def is_pure_prefill(segment: RankSegment) -> bool:
             req_idx = segment.global_batch_req_idx
-            start_pos = (
-                num_computed_tokens[req_idx]
-                + segment.global_batch_slice.start
-                - query_start_loc_np[req_idx]
-            )
-            return is_prefilling[req_idx] and start_pos == 0
+            return bool(is_prefilling[req_idx]) and num_computed_tokens[req_idx] == 0
 
         segments.sort(key=is_pure_prefill)
         rank_offset = 0
@@ -253,10 +245,7 @@ class PCPManager:
             )
             rank_offset += chunk_len
         return self._reorder_segments(
-            rank_segments,
-            num_computed_tokens,
-            is_prefilling,
-            query_start_loc_np,
+            rank_segments, num_computed_tokens, is_prefilling
         )
 
     def _build_batch_layout(
