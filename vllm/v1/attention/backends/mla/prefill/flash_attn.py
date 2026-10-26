@@ -383,17 +383,12 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         # still clone V on equal-dimension MLA models.
         # FA3 on Hopper (SM90) and FA4 natively handle diff headdims.
         device_capability = current_platform.get_device_capability()
-        self.requires_v_padding = qk_head_dim != v_head_dim and (
-            self.vllm_flash_attn_version is None
-            or not (
-                (
-                    self.vllm_flash_attn_version == 3
-                    and device_capability is not None
-                    and device_capability[0] == 9
-                )
-                or self.vllm_flash_attn_version == 4
-            )
+        supports_diff_dims = self.vllm_flash_attn_version == 4 or (
+            self.vllm_flash_attn_version == 3
+            and device_capability is not None
+            and device_capability[0] == 9
         )
+        self.requires_v_padding = qk_head_dim != v_head_dim and not supports_diff_dims
 
         # Track whether we're using vllm's FA or upstream (for ROCm)
         self._is_vllm_fa = current_platform.is_cuda() or current_platform.is_xpu()
