@@ -378,20 +378,17 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         ):
             _FA4_MLA_PREFILL_KERNEL.register_warmup()
 
-        # Determine if we need to pad V
-        # For MLA the v head dim is smaller than qk head dim so we pad out
-        # v with 0s to match the qk head dim for attention backends that do
-        # not support different headdims.
+        # Pad V only when head dimensions differ and the selected backend
+        # cannot handle different QK/V dimensions. A zero-width pad would
+        # still clone V on equal-dimension MLA models.
         # FA3 on Hopper (SM90) and FA4 natively handle diff headdims.
         device_capability = current_platform.get_device_capability()
-        self.requires_v_padding = self.vllm_flash_attn_version is None or not (
-            (
-                self.vllm_flash_attn_version == 3
-                and device_capability is not None
-                and device_capability[0] == 9
-            )
-            or self.vllm_flash_attn_version == 4
+        supports_diff_dims = self.vllm_flash_attn_version == 4 or (
+            self.vllm_flash_attn_version == 3
+            and device_capability is not None
+            and device_capability[0] == 9
         )
+        self.requires_v_padding = qk_head_dim != v_head_dim and not supports_diff_dims
 
         # Track whether we're using vllm's FA or upstream (for ROCm)
         self._is_vllm_fa = current_platform.is_cuda() or current_platform.is_xpu()
@@ -458,7 +455,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
     def supports_out(self) -> bool:
         # A padded V produces a qk_head_dim output that cannot be written into
         # a v_head_dim `out`; only the unpadded path honors `out`.
-        return not self.requires_v_padding
+        return self._is_vllm_fa and not self.requires_v_padding
 
     def run_prefill_new_tokens(
         self,

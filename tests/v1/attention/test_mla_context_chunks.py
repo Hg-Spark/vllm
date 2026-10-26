@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import vllm.utils.gpu_sync_debug as gsd
+from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.mla_attention import (
     build_mla_chunked_context_metadata,
     init_mla_context_partial,
@@ -122,7 +123,14 @@ def test_chunks_gather_every_context_row_exactly_once(context_lens, workspace_si
         assert chunk.all_rows_active
         assert chunk.num_context_tokens <= workspace_size
         assert chunk.num_context_tokens == int(chunk.cu_seq_lens[-1])
-        assert chunk.token_to_seq.shape[0] == chunk.num_context_tokens
+        if mla_attention.current_platform.is_cuda():
+            assert chunk.token_to_seq.numel() == 0
+        else:
+            expected_mapping = torch.repeat_interleave(
+                torch.arange(chunk.num_requests, dtype=torch.int32),
+                chunk.seq_lens.cpu(),
+            )
+            torch.testing.assert_close(chunk.token_to_seq.cpu(), expected_mapping)
         # Chunks are emitted in request order, which is what lets the partial
         # treat only a chunk's first request as a continuation.
         assert chunk.request_slice.start >= previous_request_start
@@ -145,6 +153,7 @@ def test_chunks_gather_every_context_row_exactly_once(context_lens, workspace_si
             assert start == cursor
             cursor += length
         assert cursor == expected[request]
+
 
 
 def test_continuation_is_confined_to_a_chunks_first_request():
