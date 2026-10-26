@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU PCP job planning and real native chunk/restore contracts."""
 
+import pytest
 import torch
 
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -93,33 +94,28 @@ def test_pcp_mixed_singleton_and_pair_keep_explicit_query_indices() -> None:
     )
 
 
-def test_pcp_two_pairs_pack_into_one_native_chunk() -> None:
+@pytest.mark.parametrize(
+    "workspace, expected_lengths, expected_starts",
+    [(4096, [192], [[0, 0, 80, 80]]), (128, [128, 64], [[0, 0], [80, 80]])],
+)
+def test_pcp_two_pairs_packed_chunks(
+    workspace: int, expected_lengths: list[int], expected_starts: list[list[int]]
+) -> None:
     _, context = _build_context(
-        workspace=4096,
+        workspace=workspace,
         request_ids=(0, 0, 1, 1),
         context_lens=(64, 112, 64, 112),
         query_starts=(0, 16, 32, 48, 64),
     )
     assert context.pcp_mapping is not None
-    assert len(context.chunks) == 1
-    assert context.chunks[0].num_context_tokens == 192
+    assert [c.num_context_tokens for c in context.chunks] == expected_lengths
+    assert [c.starts.tolist() for c in context.chunks] == expected_starts
     mapping = context.pcp_mapping
     assert mapping.block_table.flatten().tolist() == [0, 2, 0, 2]
     assert mapping.num_base_tokens == 64
     assert isinstance(mapping.query_selector, torch.Tensor)
     assert mapping.query_selector.numel() == 96
     assert mapping.query_selector[64:80].tolist() == list(range(16, 32))
-
-
-def test_pcp_workspace_splits_preserve_absolute_tail_offsets() -> None:
-    _, context = _build_context(
-        request_ids=(0, 0, 1, 1),
-        context_lens=(64, 112, 64, 112),
-        query_starts=(0, 16, 32, 48, 64),
-    )
-    assert context.pcp_mapping is not None
-    assert [c.num_context_tokens for c in context.chunks] == [128, 64]
-    assert context.chunks[-1].starts.tolist() == [80, 80]
 
 
 def test_pcp_no_shared_context_packs_tail_into_base() -> None:
