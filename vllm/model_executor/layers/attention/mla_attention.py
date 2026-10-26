@@ -2352,9 +2352,9 @@ def _build_pcp_packed_context_metadata(
         selector = slice(jobs[0][3].start, jobs[-1][3].stop)
     else:
         indices = [token for job in jobs for token in range(job[3].start, job[3].stop)]
-        selector = torch.tensor(indices, dtype=torch.long, device=builder.device)
-    source_rows = torch.tensor(
-        [job[0] for job in jobs], dtype=torch.long, device=block_table.device
+        selector = async_tensor_h2d(indices, device=builder.device, dtype=torch.long)
+    source_rows = async_tensor_h2d(
+        [job[0] for job in jobs], device=block_table.device, dtype=torch.long
     )
     return replace(
         native,
@@ -2485,7 +2485,9 @@ def _build_pcp_context_reuse(
     merged_query_start_loc_cpu = torch.tensor(merged_starts, dtype=torch.int32)
     merged_query_lens_cpu = torch.tensor(merged_query_lens, dtype=torch.int32)
     return (
-        merged_query_start_loc_cpu.to(builder.device, non_blocking=True),
+        async_tensor_h2d(
+            merged_query_start_loc_cpu, device=builder.device, dtype=torch.int32
+        ),
         merged_query_lens_cpu,
         max(merged_query_lens, default=0),
         chunked_context,
@@ -3171,7 +3173,7 @@ def restore_pcp_context_partial(
         tail_lse = lse[:, base_end:]
         # Match the native merge kernel's required head stride.
         prefix_output = torch.empty_like(tail_output)
-        prefix_output.copy_(output.index_select(0, tail_indices))
+        torch.index_select(output, 0, tail_indices, out=prefix_output)
         prefix_lse = output_lse.index_select(1, tail_indices)
         merge_attn_states(
             output=prefix_output,
