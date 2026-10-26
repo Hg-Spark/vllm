@@ -270,9 +270,17 @@ def test_cuda_non_dcp_context_omits_unused_token_to_seq(monkeypatch) -> None:
     assert all(chunk.token_to_seq.numel() == 0 for chunk in context.chunks)
 
 
-def test_pcp_context_out_matches_copy_for_chunks_and_empty_rows(monkeypatch) -> None:
+def test_pcp_context_out_matches_copy_for_continuation_and_empty_rows(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(mla_attention, "merge_attn_states", _merge_attn_states_torch)
+    monkeypatch.setattr(mla_attention.current_platform, "is_cpu", lambda: True)
+
+    def fake_gather(src_cache, dst, block_table, starts, cu_seq_lens):
+        dst[: int(cu_seq_lens[-1])] = 1
+
     monkeypatch.setattr(
-        mla_attention, "merge_attn_states", _merge_attn_states_torch
+        mla_attention.ops, "gather_mla_context_cache_cpu", fake_gather
     )
 
     class FakeBackend:
@@ -285,29 +293,28 @@ def test_pcp_context_out_matches_copy_for_chunks_and_empty_rows(monkeypatch) -> 
 
         def run_prefill_context_chunk(self, chunk, q, k, v, out=None):
             self.calls.append((chunk.is_continuation, out is not None))
-            value = float(chunk.index + 1)
-            if out is None:
-                attn_output = torch.full((q.shape[0], 1, 1), value)
-            else:
-                attn_output = out.fill_(value)
-            return attn_output, torch.zeros((1, q.shape[0]))
+            result = out if out is not None else torch.empty((q.shape[0], 1, 1))
+            result.fill_(float(chunk.index + 1))
+            return result, torch.zeros((1, q.shape[0]))
 
-    def fake_gather(src_cache, dst, block_table, starts, cu_seq_lens):
-        dst[: int(cu_seq_lens[-1])] = 1
-
-    monkeypatch.setattr(mla_attention.current_platform, "is_cpu", lambda: True)
-    monkeypatch.setattr(
-        mla_attention.ops, "gather_mla_context_cache_cpu", fake_gather
+    layer = SimpleNamespace(
+        kv_cache_dtype="auto",
+        kv_lora_rank=1,
+        num_heads=1,
+        qk_nope_head_dim=1,
+        qk_rope_head_dim=1,
+        v_head_dim=1,
+        kv_b_proj=lambda x: (torch.cat((x, x), dim=-1), None),
+        _concat_k_nope_k_pe=lambda k_nope, k_pe: torch.cat(
+            (k_nope, k_pe), dim=-1
+        ),
     )
 
-    for context_lens, query_starts, req_idx in (
-        (
-            (64, 112) * 4,
-            tuple(range(0, 144, 16)),
-            tuple(i for i in range(4) for _ in range(2)),
-        ),
-        ((64, 112, 0), (0, 16, 32, 48), (7, 7, 8)),
-    ):
+    cases = (
+        ((256, 272), (0, 16, 32), (7, 7)),  # Split context: continuation.
+        ((64, 112, 0), (0, 16, 32, 48), (7, 7, 8)),  # Empty context row.
+    )
+    for context_lens, query_starts, req_idx in cases:
         builder = _builder()
         builder.chunked_prefill_workspace = torch.empty((128, 2))
         plan = _plan(
@@ -329,18 +336,6 @@ def test_pcp_context_out_matches_copy_for_chunks_and_empty_rows(monkeypatch) -> 
                 q_data_type=torch.float32,
                 output_dtype=torch.float32,
             )
-            layer = SimpleNamespace(
-                kv_cache_dtype="auto",
-                kv_lora_rank=1,
-                num_heads=1,
-                qk_nope_head_dim=1,
-                qk_rope_head_dim=1,
-                v_head_dim=1,
-                kv_b_proj=lambda x: (torch.cat((x, x), dim=-1), None),
-                _concat_k_nope_k_pe=lambda k_nope, k_pe: torch.cat(
-                    (k_nope, k_pe), dim=-1
-                ),
-            )
             outputs.append(
                 mla_attention.MLACommonBaseImpl._compute_prefill_context(
                     layer,
@@ -350,14 +345,11 @@ def test_pcp_context_out_matches_copy_for_chunks_and_empty_rows(monkeypatch) -> 
                     torch.tensor(1.0),
                 )
             )
-            if direct:
-                assert any(wrote for continuation, wrote in backend.calls)
-                assert all(
-                    not wrote for continuation, wrote in backend.calls
-                    if continuation
-                )
-            else:
-                assert all(not wrote for _, wrote in backend.calls)
+            assert any(cont for cont, _ in backend.calls) == (
+                context_lens[0] == 256
+            )
+            assert all(not wrote for cont, wrote in backend.calls if cont)
+            assert any(wrote for _, wrote in backend.calls) == direct
 
-        for before, after in zip(outputs[0], outputs[1]):
+        for before, after in zip(*outputs):
             torch.testing.assert_close(after, before)
