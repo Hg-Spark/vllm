@@ -2144,6 +2144,9 @@ def build_mla_chunked_context_metadata(
     seq_lens_flat: list[int] = []
     cu_seq_lens_flat: list[int] = []
     cu_seqlens_q_flat: list[int] = []
+    # The CUDA non-DCP gather only uses cu_seq_lens; preserve the metadata ABI
+    # with an empty token_to_seq tensor instead of uploading an O(tokens) map.
+    needs_token_to_seq = not (current_platform.is_cuda() and not use_dcp)
     token_to_seq_parts: list[np.ndarray] = []
     padded_local_cu_seq_lens_flat: list[int] = []
     padded_local_token_to_seq_parts: list[np.ndarray] = []
@@ -2173,9 +2176,10 @@ def build_mla_chunked_context_metadata(
             query_start_loc[request] - query_base
             for request in range(plan.request_start, plan.request_end + 1)
         )
-        token_to_seq_parts.append(
-            np.repeat(np.arange(num_requests, dtype=np.int32), plan.seq_lens)
-        )
+        if needs_token_to_seq:
+            token_to_seq_parts.append(
+                np.repeat(np.arange(num_requests, dtype=np.int32), plan.seq_lens)
+            )
 
         if use_dcp:
             # A request's local rows are its context rows sharded across ranks
@@ -2232,8 +2236,12 @@ def build_mla_chunked_context_metadata(
     context_lens_gpu = starts_and_context_lens[len(starts_flat) :]
     cu_seq_lens = async_tensor_h2d(cu_seq_lens_flat, device=device, dtype=torch.int32)
     cu_seqlens_q = async_tensor_h2d(cu_seqlens_q_flat, device=device, dtype=torch.int32)
-    token_to_seq = async_tensor_h2d(
-        np.concatenate(token_to_seq_parts), device=device, dtype=torch.int32
+    token_to_seq = (
+        async_tensor_h2d(
+            np.concatenate(token_to_seq_parts), device=device, dtype=torch.int32
+        )
+        if needs_token_to_seq
+        else torch.empty(0, device=device, dtype=torch.int32)
     )
     if use_dcp:
         padded_local_cu_seq_lens = async_tensor_h2d(
@@ -3277,7 +3285,21 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         if use_fp8_prefill:
             q = q.to(prefill_metadata.q_data_type)
 
-        output = None
+        # Direct out= avoids a separate chunk-output allocation/copy.
+        # The single complete chunk keeps its existing zero-copy return.
+        direct_output = prefill_metadata.prefill_backend.supports_out() and (
+            len(chunked_context.chunks) > 1
+            or bool(chunked_context.empty_token_slices)
+        )
+        if direct_output:
+            assert prefill_metadata.output_dtype is not None
+            output = torch.empty(
+                (q.shape[0], self.num_heads, self.v_head_dim),
+                dtype=prefill_metadata.output_dtype,
+                device=q.device,
+            )
+        else:
+            output = None
         output_lse = None
         for chunk in chunked_context.chunks:
             toks = chunk.num_context_tokens
@@ -3344,16 +3366,24 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
 
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
+            chunk_out = (
+                output[chunk.token_slice]
+                if output is not None and not chunk.is_continuation
+                else None
+            )
             attn_output, attn_softmax_lse = (
                 prefill_metadata.prefill_backend.run_prefill_context_chunk(
                     chunk=chunk,
                     q=q[chunk.token_slice],
                     k=k,
                     v=v,
+                    out=chunk_out,
                 )
             )
+            # Release projected K/V references before allocating the next chunk.
+            del kv_c_normed, k_pe, kv_nope, k_nope, v, k
 
-            if output is None:
+            if output_lse is None:
                 if (
                     len(chunked_context.chunks) == 1
                     and not chunked_context.empty_token_slices
@@ -3364,15 +3394,27 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                         pcp_mapping, attn_output, attn_softmax_lse,
                         original_num_tokens,
                     )
-                output, output_lse = init_mla_context_partial(
-                    chunked_context,
-                    attn_output,
-                    attn_softmax_lse,
-                    num_tokens=q.shape[0],
-                )
+                if output is None:
+                    output, output_lse = init_mla_context_partial(
+                        chunked_context,
+                        attn_output,
+                        attn_softmax_lse,
+                        num_tokens=q.shape[0],
+                    )
+                else:
+                    output_lse = torch.empty(
+                        (attn_softmax_lse.shape[0], q.shape[0]),
+                        dtype=attn_softmax_lse.dtype,
+                        device=attn_softmax_lse.device,
+                    )
+                    neutralize_empty_context_partials(
+                        chunked_context, output, output_lse
+                    )
             accumulate_mla_context_chunk(
-                chunk, attn_output, attn_softmax_lse, output, output_lse
+                chunk, attn_output, attn_softmax_lse, output, output_lse,
+                output_written=chunk_out is not None,
             )
+            del attn_output, attn_softmax_lse
 
         if pcp_mapping is not None:
             return restore_pcp_context_partial(
@@ -3572,6 +3614,9 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             ),
             output_scale=output_scale,
         )
+
+        # Drop suffix K/V references before expanding the cached context.
+        del kv_nope, k_nope, v, k
 
         if has_context:
             assert prefill_metadata.chunked_context is not None
