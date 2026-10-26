@@ -218,6 +218,8 @@ def test_pcp_restore_merges_tail_and_neutralizes_absent_context(monkeypatch) -> 
     assert hot_out_lse.data_ptr() == hot_lse.data_ptr()
     torch.testing.assert_close(hot_output[16:], torch.full((16, 1, 8), 4.0))
     torch.testing.assert_close(hot_out_lse[0, 16:], torch.full((16,), float(np.log(2))))
+
+
 def test_fa2_equal_mla_head_dims_skip_padding_and_allow_out(monkeypatch) -> None:
     from vllm.v1.attention.backends.mla.prefill import flash_attn
 
@@ -299,7 +301,11 @@ def test_pcp_context_out_matches_copy_for_chunks_and_empty_rows(monkeypatch) -> 
     )
 
     for context_lens, query_starts, req_idx in (
-        ((64, 112) * 4, tuple(range(0, 144, 16)), tuple(i for i in range(4) for _ in range(2))),
+        (
+            (64, 112) * 4,
+            tuple(range(0, 144, 16)),
+            tuple(i for i in range(4) for _ in range(2)),
+        ),
         ((64, 112, 0), (0, 16, 32, 48), (7, 7, 8)),
     ):
         builder = _builder()
