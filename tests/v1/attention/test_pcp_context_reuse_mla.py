@@ -218,3 +218,140 @@ def test_pcp_restore_merges_tail_and_neutralizes_absent_context(monkeypatch) -> 
     assert hot_out_lse.data_ptr() == hot_lse.data_ptr()
     torch.testing.assert_close(hot_output[16:], torch.full((16, 1, 8), 4.0))
     torch.testing.assert_close(hot_out_lse[0, 16:], torch.full((16,), float(np.log(2))))
+def test_fa2_equal_mla_head_dims_skip_padding_and_allow_out(monkeypatch) -> None:
+    from vllm.v1.attention.backends.mla.prefill import flash_attn
+
+    monkeypatch.setattr(flash_attn, "flash_attn_varlen_func", lambda **kwargs: None)
+    monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 2)
+    monkeypatch.setattr(flash_attn.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        flash_attn.current_platform, "get_device_capability", lambda: None
+    )
+    config = SimpleNamespace(
+        kernel_config=SimpleNamespace(enable_jit_warmup=False)
+    )
+
+    def make_backend(v_head_dim):
+        return flash_attn.FlashAttnPrefillBackend(
+            num_heads=20,
+            scale=1.0,
+            kv_lora_rank=512,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+            v_head_dim=v_head_dim,
+            vllm_config=config,
+        )
+
+    equal = make_backend(256)
+    assert not equal.requires_v_padding
+    assert equal.supports_out()
+
+    unequal = make_backend(128)
+    assert unequal.requires_v_padding
+    assert not unequal.supports_out()
+
+    # Upstream FlashAttention's ROCm wrapper does not accept out=.
+    monkeypatch.setattr(flash_attn.current_platform, "is_cuda", lambda: False)
+    equal_upstream = make_backend(256)
+    assert not equal_upstream.supports_out()
+
+
+def test_cuda_non_dcp_context_omits_unused_token_to_seq(monkeypatch) -> None:
+    # Exercise the CUDA metadata branch with CPU tensors; the CUDA gather
+    # ignores token_to_seq and uses cu_seq_lens for token ownership.
+    monkeypatch.setattr(mla_attention.current_platform, "is_cuda", lambda: True)
+    plan = _plan()
+    assert plan is not None
+    context = plan[3]
+    assert context is not None
+    assert context.chunks
+    assert all(chunk.token_to_seq.numel() == 0 for chunk in context.chunks)
+
+
+def test_pcp_context_out_matches_copy_for_chunks_and_empty_rows(monkeypatch) -> None:
+    monkeypatch.setattr(
+        mla_attention, "merge_attn_states", _merge_attn_states_torch
+    )
+
+    class FakeBackend:
+        def __init__(self, direct):
+            self.direct = direct
+            self.calls = []
+
+        def supports_out(self):
+            return self.direct
+
+        def run_prefill_context_chunk(self, chunk, q, k, v, out=None):
+            self.calls.append((chunk.is_continuation, out is not None))
+            value = float(chunk.index + 1)
+            if out is None:
+                attn_output = torch.full((q.shape[0], 1, 1), value)
+            else:
+                attn_output = out.fill_(value)
+            return attn_output, torch.zeros((1, q.shape[0]))
+
+    def fake_gather(src_cache, dst, block_table, starts, cu_seq_lens):
+        dst[: int(cu_seq_lens[-1])] = 1
+
+    monkeypatch.setattr(mla_attention.current_platform, "is_cpu", lambda: True)
+    monkeypatch.setattr(
+        mla_attention.ops, "gather_mla_context_cache_cpu", fake_gather
+    )
+
+    for context_lens, query_starts, req_idx in (
+        ((64, 112) * 4, tuple(range(0, 144, 16)), tuple(i for i in range(4) for _ in range(2))),
+        ((64, 112, 0), (0, 16, 32, 48), (7, 7, 8)),
+    ):
+        builder = _builder()
+        builder.chunked_prefill_workspace = torch.empty((128, 2))
+        plan = _plan(
+            builder=builder,
+            metadata=_metadata(req_idx),
+            context_lens=context_lens,
+            query_starts=query_starts,
+        )
+        assert plan is not None
+        context = plan[3]
+        assert context is not None
+        outputs = []
+        for direct in (False, True):
+            backend = FakeBackend(direct)
+            prefill = SimpleNamespace(
+                prefill_backend=backend,
+                block_table=torch.arange(len(context_lens)).unsqueeze(-1),
+                chunked_context=context,
+                q_data_type=torch.float32,
+                output_dtype=torch.float32,
+            )
+            layer = SimpleNamespace(
+                kv_cache_dtype="auto",
+                kv_lora_rank=1,
+                num_heads=1,
+                qk_nope_head_dim=1,
+                qk_rope_head_dim=1,
+                v_head_dim=1,
+                kv_b_proj=lambda x: (torch.cat((x, x), dim=-1), None),
+                _concat_k_nope_k_pe=lambda k_nope, k_pe: torch.cat(
+                    (k_nope, k_pe), dim=-1
+                ),
+            )
+            outputs.append(
+                mla_attention.MLACommonBaseImpl._compute_prefill_context(
+                    layer,
+                    torch.zeros((query_starts[-1], 1, 2)),
+                    torch.empty((1, 1, 2)),
+                    SimpleNamespace(prefill=prefill),
+                    torch.tensor(1.0),
+                )
+            )
+            if direct:
+                assert any(wrote for continuation, wrote in backend.calls)
+                assert all(
+                    not wrote for continuation, wrote in backend.calls
+                    if continuation
+                )
+            else:
+                assert all(not wrote for _, wrote in backend.calls)
+
+        for before, after in zip(outputs[0], outputs[1]):
+            torch.testing.assert_close(after, before)
