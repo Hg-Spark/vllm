@@ -1675,7 +1675,7 @@ class MLACommonPrefillMetadata:
 
     @dataclass
     class PCPContextMapping:
-        """Map packed context jobs to original PCP queries."""
+        """Map packed context rows to original PCP queries."""
 
         block_table: torch.Tensor
         query_selector: slice | torch.Tensor
@@ -2071,7 +2071,7 @@ def build_mla_chunked_context_metadata(
         dcp_manager: Shared MLA DCP collective manager.
         align_indptr: Align packed int32 indptr slices to 16 bytes for CuTe DSL.
         context_starts_cpu: Optional absolute cache offsets for the per-request
-            context jobs. Native chunk planning uses relative offsets; the
+            context rows. Native chunk planning uses relative offsets; the
             absolute offsets are applied to gather metadata before H2D.
 
     Returns:
@@ -2305,46 +2305,43 @@ def build_mla_chunked_context_metadata(
     )
 
 
-@dataclass(frozen=True)
-class _PCPContextJob:
-    """One logical context gather; start is an absolute KV-cache offset."""
-
-    source_row: int
-    context_start: int
-    context_len: int
-    query_slice: slice
-
-
 @dataclass
-class _PCPContextPlan:
-    """CPU-only shared/tail planning, prior to chunk packing and H2D."""
+class _PCPPackedContextLayout:
+    """Native context-row inputs and their original PCP query mapping."""
 
-    base_jobs: list[_PCPContextJob]
-    tail_jobs: list[_PCPContextJob]
+    source_rows: list[int]
+    context_starts: list[int]
+    context_lens: list[int]
+    query_slices: list[slice]
     merged_starts: list[int]
+    num_base_tokens: int
+    has_tail: bool
 
 
 def _plan_pcp_context_reuse(
     request_ids: list[int],
     context_lens: list[int],
     query_starts: list[int],
-) -> _PCPContextPlan | None:
-    """Plan adjacent PCP pairs without needing model, backend, or GPU objects.
-
-    Base query ranges are ordered and disjoint; tail ranges repeat part of an
-    existing base range only when shared context exists. Without shared
-    context, the extra context is a base job rather than a tail to merge.
-    Each context_start is absolute in the source request's KV cache; the
-    native chunk planner produces offsets relative to that job.
-    """
+) -> _PCPPackedContextLayout | None:
+    """Express eligible PCP pairs as packed native context rows."""
     num_prefills = len(context_lens)
     if len(request_ids) != num_prefills or len(query_starts) != num_prefills + 1:
         return None
 
-    base_jobs: list[_PCPContextJob] = []
-    tail_jobs: list[_PCPContextJob] = []
+    source_rows: list[int] = []
+    context_starts: list[int] = []
+    packed_lens: list[int] = []
+    query_slices: list[slice] = []
+
+    def add_row(row: int, start: int, length: int, query: slice) -> None:
+        source_rows.append(row)
+        context_starts.append(start)
+        packed_lens.append(length)
+        query_slices.append(query)
+
     merged_starts = [query_starts[0]]
     seen_req_idx: set[int] = set()
+    tail_pairs: list[int] = []
     has_pair = False
     start = 0
     while start < num_prefills:
@@ -2364,52 +2361,63 @@ def _plan_pcp_context_reuse(
             if query.stop <= query.start or context_len < 0:
                 return None
             if context_len > 0:
-                base_jobs.append(_PCPContextJob(start, 0, context_len, query))
-            merged_starts.append(query.stop)
-            start = end
-            continue
+                add_row(start, 0, context_len, query)
+        else:
+            has_pair = True
+            first_query = slice(query_starts[start], query_starts[start + 1])
+            second_query = slice(query_starts[start + 1], query_starts[end])
+            if (
+                first_query.stop <= first_query.start
+                or second_query.stop <= second_query.start
+            ):
+                return None
 
-        has_pair = True
-        first_query = slice(query_starts[start], query_starts[start + 1])
-        second_query = slice(query_starts[start + 1], query_starts[end])
-        if (
-            first_query.stop <= first_query.start
-            or second_query.stop <= second_query.start
-        ):
-            return None
-
-        first_len, second_len = context_lens[start:end]
-        current_end = first_len + first_query.stop - first_query.start
-        if first_len < 0 or second_len < current_end:
-            return None
-        if first_len > 0:
-            base_jobs.append(
-                _PCPContextJob(
+            first_len, second_len = context_lens[start:end]
+            tail_start = first_len + first_query.stop - first_query.start
+            if first_len < 0 or second_len < tail_start:
+                return None
+            if first_len > 0:
+                add_row(
                     start,
                     0,
                     first_len,
                     slice(first_query.start, second_query.stop),
                 )
-            )
-        if second_len > current_end:
-            job = _PCPContextJob(
-                start,
-                current_end,
-                second_len - current_end,
-                second_query,
-            )
-            (tail_jobs if first_len > 0 else base_jobs).append(job)
+            if second_len > tail_start:
+                if first_len > 0:
+                    tail_pairs.append(start)
+                else:
+                    add_row(start, tail_start, second_len - tail_start, second_query)
 
-        merged_starts.append(second_query.stop)
+        merged_starts.append(query_starts[end])
         start = end
 
     if not has_pair:
         return None
-    return _PCPContextPlan(base_jobs, tail_jobs, merged_starts)
+
+    num_base_tokens = sum(q.stop - q.start for q in query_slices)
+    for row in tail_pairs:
+        tail_start = context_lens[row] + query_starts[row + 1] - query_starts[row]
+        add_row(
+            row,
+            tail_start,
+            context_lens[row + 1] - tail_start,
+            slice(query_starts[row + 1], query_starts[row + 2]),
+        )
+
+    return _PCPPackedContextLayout(
+        source_rows,
+        context_starts,
+        packed_lens,
+        query_slices,
+        merged_starts,
+        num_base_tokens,
+        bool(tail_pairs),
+    )
 
 
 def _build_pcp_packed_context_metadata(
-    plan: _PCPContextPlan,
+    plan: _PCPPackedContextLayout,
     *,
     chunked_prefill_workspace: torch.Tensor,
     chunked_prefill_workspace_size: int,
@@ -2420,19 +2428,15 @@ def _build_pcp_packed_context_metadata(
     align_indptr: bool,
     block_table: torch.Tensor,
 ) -> "MLACommonPrefillMetadata.ChunkedContextMetadata | None":
-    """Materialize the CPU jobs with native chunk packing and PCP mappings."""
-    jobs = plan.base_jobs + plan.tail_jobs
-    if not jobs:
+    """Build the native packed context directly from PCP context-row arrays."""
+    if not plan.source_rows:
         return None
 
     query_starts = [0]
-    for job in jobs:
-        query = job.query_slice
+    for query in plan.query_slices:
         query_starts.append(query_starts[-1] + query.stop - query.start)
     native = build_mla_chunked_context_metadata(
-        context_lens_cpu=torch.tensor(
-            [job.context_len for job in jobs], dtype=torch.int32
-        ),
+        context_lens_cpu=torch.tensor(plan.context_lens, dtype=torch.int32),
         prefill_query_start_loc_cpu=torch.tensor(query_starts, dtype=torch.int32),
         chunked_prefill_workspace=chunked_prefill_workspace,
         chunked_prefill_workspace_size=chunked_prefill_workspace_size,
@@ -2444,42 +2448,34 @@ def _build_pcp_packed_context_metadata(
         dcp_virtual_block_size=dcp_virtual_block_size,
         dcp_manager=None,
         align_indptr=align_indptr,
-        context_starts_cpu=torch.tensor(
-            [job.context_start for job in jobs], dtype=torch.int32
-        ),
+        context_starts_cpu=torch.tensor(plan.context_starts, dtype=torch.int32),
     )
     assert native is not None
 
-    # Length equality is not enough to imply a slice: omitted queries and
-    # repeated tail queries can cancel out.
-    contiguous = not plan.tail_jobs and all(
-        previous.query_slice.stop == following.query_slice.start
-        for previous, following in zip(jobs, jobs[1:])
+    # Skipped zero-context queries cannot be represented by one query slice.
+    contiguous = not plan.has_tail and all(
+        previous.stop == following.start
+        for previous, following in zip(plan.query_slices, plan.query_slices[1:])
     )
     selector: slice | torch.Tensor
     if contiguous:
-        selector = slice(jobs[0].query_slice.start, jobs[-1].query_slice.stop)
+        selector = slice(plan.query_slices[0].start, plan.query_slices[-1].stop)
     else:
         indices = [
             token
-            for job in jobs
-            for token in range(job.query_slice.start, job.query_slice.stop)
+            for query in plan.query_slices
+            for token in range(query.start, query.stop)
         ]
         selector = async_tensor_h2d(indices, device=device, dtype=torch.long)
     source_rows = async_tensor_h2d(
-        [job.source_row for job in jobs],
-        device=block_table.device,
-        dtype=torch.long,
+        plan.source_rows, device=block_table.device, dtype=torch.long
     )
     return replace(
         native,
         pcp_mapping=MLACommonPrefillMetadata.PCPContextMapping(
             block_table=block_table.index_select(0, source_rows),
             query_selector=selector,
-            num_base_tokens=sum(
-                job.query_slice.stop - job.query_slice.start
-                for job in plan.base_jobs
-            ),
+            num_base_tokens=plan.num_base_tokens,
         ),
     )
 
@@ -2517,7 +2513,7 @@ def _build_pcp_context_reuse(
     int,
     MLACommonPrefillMetadata.ChunkedContextMetadata | None,
 ] | None:
-    """Gate PCP reuse, then materialize the purely CPU-planned jobs."""
+    """Gate PCP reuse, then build packed context metadata."""
     if not _pcp_context_reuse_applicable(
         builder.dcp_world_size,
         builder.use_sparse,
