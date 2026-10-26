@@ -3548,6 +3548,10 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     v=v,
                 )
             )
+            # Release this chunk's projected buffers before the next gather.
+            del kv_c_normed, k_pe, kv_nope, k, v
+            if fused_mla_kv_concat_fn is None:
+                del k_nope
 
             if output is None:
                 if (
@@ -3564,6 +3568,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             accumulate_mla_context_chunk(
                 chunk, attn_output, attn_softmax_lse, output, output_lse
             )
+            del attn_output, attn_softmax_lse
 
         return output, output_lse
 
