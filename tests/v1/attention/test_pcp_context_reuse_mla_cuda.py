@@ -31,7 +31,7 @@ def test_pcp_cuda_context_matches_independent_reference(default_vllm_config) -> 
     partial; the tail begins at the absolute cache offset 80.
     """
     device = torch.device("cuda")
-    heads, rank, nope, rope, value_dim = 4, 128, 64, 64, 128
+    heads, rank, nope, rope, value_dim = 4, 512, 64, 64, 128
     qk_dim = nope + rope
     scale = qk_dim**-0.5
     generator = torch.Generator(device=device).manual_seed(2026)
