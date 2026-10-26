@@ -1671,6 +1671,15 @@ class MLACommonPrefillMetadata:
         context_lens_list: list[int]
         empty_token_slices: list[slice]
         dcp_manager: MLADCPManager | None = None
+        pcp_mapping: "MLACommonPrefillMetadata.PCPContextMapping | None" = None
+
+    @dataclass
+    class PCPContextMapping:
+        """Map packed context jobs to original PCP queries."""
+
+        block_table: torch.Tensor
+        query_selector: slice | torch.Tensor
+        num_base_tokens: int
 
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -2040,6 +2049,7 @@ def build_mla_chunked_context_metadata(
     dcp_virtual_block_size: int,
     dcp_manager: MLADCPManager | None = None,
     align_indptr: bool = False,
+    context_starts_cpu: torch.Tensor | None = None,
 ) -> "MLACommonPrefillMetadata.ChunkedContextMetadata | None":
     """Build chunked-context metadata for an MLA prefill.
 
@@ -2060,6 +2070,9 @@ def build_mla_chunked_context_metadata(
         dcp_virtual_block_size: ``dcp_local_block_size * dcp_world_size``.
         dcp_manager: Shared MLA DCP collective manager.
         align_indptr: Align packed int32 indptr slices to 16 bytes for CuTe DSL.
+        context_starts_cpu: Optional absolute cache offsets for the per-request
+            context jobs. Native chunk planning uses relative offsets; the
+            absolute offsets are applied to gather metadata before H2D.
 
     Returns:
         The chunked-context metadata, or None when no prefill has any context.
@@ -2070,10 +2083,16 @@ def build_mla_chunked_context_metadata(
     context_lens = context_lens_cpu.tolist()
     if max(context_lens, default=0) <= 0:
         return None
+    context_starts = (
+        context_starts_cpu.tolist() if context_starts_cpu is not None else None
+    )
+    if context_starts is not None:
+        assert dcp_world_size == 1
+        assert len(context_starts) == len(context_lens)
+        assert all(start >= 0 for start in context_starts)
 
-    # The `gather_and_maybe_dequant_cache` kernel cannot handle chunk starts
-    # that are not aligned to block_size, so a split request advances in
-    # block-aligned steps.
+    # Align split steps to cache pages when requested. The gather kernels also
+    # handle partial boundary pages through non-negative seq_starts.
     chunk_alignment = block_size if align_chunk_to_block else 1
     if dcp_world_size > 1:
         # Each rank gathers only its own shard, so a chunk's workspace cost is
@@ -2183,7 +2202,13 @@ def build_mla_chunked_context_metadata(
             # The gather takes per-rank local offsets under DCP.
             starts_flat.extend(local_starts)
         else:
-            starts_flat.extend(plan.starts)
+            if context_starts is None:
+                starts_flat.extend(plan.starts)
+            else:
+                starts_flat.extend(
+                    start + context_starts[plan.request_start + index]
+                    for index, start in enumerate(plan.starts)
+                )
         assert num_local_tokens <= row_budget
 
         layouts.append(
@@ -2269,6 +2294,266 @@ def build_mla_chunked_context_metadata(
         context_lens_list=context_lens,
         empty_token_slices=empty_token_slices,
         dcp_manager=dcp_manager,
+    )
+
+
+@dataclass(frozen=True)
+class _PCPContextJob:
+    """One logical context gather; start is an absolute KV-cache offset."""
+
+    source_row: int
+    context_start: int
+    context_len: int
+    query_slice: slice
+
+
+@dataclass
+class _PCPContextPlan:
+    """CPU-only shared/tail planning, prior to chunk packing and H2D."""
+
+    base_jobs: list[_PCPContextJob]
+    tail_jobs: list[_PCPContextJob]
+    merged_starts: list[int]
+
+
+def _plan_pcp_context_reuse(
+    request_ids: list[int],
+    context_lens: list[int],
+    query_starts: list[int],
+) -> _PCPContextPlan | None:
+    """Plan adjacent PCP pairs without needing model, backend, or GPU objects.
+
+    Base query ranges are ordered and disjoint; tail ranges repeat part of an
+    existing base range only when shared context exists. Without shared
+    context, the extra context is a base job rather than a tail to merge.
+    Each context_start is absolute in the source request's KV cache; the
+    native chunk planner produces offsets relative to that job.
+    """
+    num_prefills = len(context_lens)
+    if len(request_ids) != num_prefills or len(query_starts) != num_prefills + 1:
+        return None
+
+    base_jobs: list[_PCPContextJob] = []
+    tail_jobs: list[_PCPContextJob] = []
+    merged_starts = [query_starts[0]]
+    seen_req_idx: set[int] = set()
+    has_pair = False
+    start = 0
+    while start < num_prefills:
+        end = start + 1
+        while end < num_prefills and request_ids[end] == request_ids[start]:
+            end += 1
+
+        request_idx = int(request_ids[start])
+        run_size = end - start
+        if request_idx in seen_req_idx or run_size > 2:
+            return None
+        seen_req_idx.add(request_idx)
+
+        if run_size == 1:
+            query = slice(query_starts[start], query_starts[end])
+            context_len = context_lens[start]
+            if query.stop <= query.start or context_len < 0:
+                return None
+            if context_len > 0:
+                base_jobs.append(_PCPContextJob(start, 0, context_len, query))
+            merged_starts.append(query.stop)
+            start = end
+            continue
+
+        has_pair = True
+        first_query = slice(query_starts[start], query_starts[start + 1])
+        second_query = slice(query_starts[start + 1], query_starts[end])
+        if (
+            first_query.stop <= first_query.start
+            or second_query.stop <= second_query.start
+        ):
+            return None
+
+        first_len, second_len = context_lens[start:end]
+        current_end = first_len + first_query.stop - first_query.start
+        if first_len < 0 or second_len < current_end:
+            return None
+        if first_len > 0:
+            base_jobs.append(
+                _PCPContextJob(
+                    start,
+                    0,
+                    first_len,
+                    slice(first_query.start, second_query.stop),
+                )
+            )
+        if second_len > current_end:
+            job = _PCPContextJob(
+                start,
+                current_end,
+                second_len - current_end,
+                second_query,
+            )
+            (tail_jobs if first_len > 0 else base_jobs).append(job)
+
+        merged_starts.append(second_query.stop)
+        start = end
+
+    if not has_pair:
+        return None
+    return _PCPContextPlan(base_jobs, tail_jobs, merged_starts)
+
+
+def _build_pcp_packed_context_metadata(
+    plan: _PCPContextPlan,
+    *,
+    chunked_prefill_workspace: torch.Tensor,
+    chunked_prefill_workspace_size: int,
+    page_size: int,
+    device: torch.device,
+    dcp_local_block_size: int,
+    dcp_virtual_block_size: int,
+    align_indptr: bool,
+    block_table: torch.Tensor,
+) -> "MLACommonPrefillMetadata.ChunkedContextMetadata | None":
+    """Materialize the CPU jobs with native chunk packing and PCP mappings."""
+    jobs = plan.base_jobs + plan.tail_jobs
+    if not jobs:
+        return None
+
+    query_starts = [0]
+    for job in jobs:
+        query = job.query_slice
+        query_starts.append(query_starts[-1] + query.stop - query.start)
+    native = build_mla_chunked_context_metadata(
+        context_lens_cpu=torch.tensor(
+            [job.context_len for job in jobs], dtype=torch.int32
+        ),
+        prefill_query_start_loc_cpu=torch.tensor(query_starts, dtype=torch.int32),
+        chunked_prefill_workspace=chunked_prefill_workspace,
+        chunked_prefill_workspace_size=chunked_prefill_workspace_size,
+        block_size=page_size,
+        align_chunk_to_block=True,
+        device=device,
+        dcp_world_size=1,
+        dcp_local_block_size=dcp_local_block_size,
+        dcp_virtual_block_size=dcp_virtual_block_size,
+        dcp_manager=None,
+        align_indptr=align_indptr,
+        context_starts_cpu=torch.tensor(
+            [job.context_start for job in jobs], dtype=torch.int32
+        ),
+    )
+    assert native is not None
+
+    # Length equality is not enough to imply a slice: omitted queries and
+    # repeated tail queries can cancel out.
+    contiguous = not plan.tail_jobs and all(
+        previous.query_slice.stop == following.query_slice.start
+        for previous, following in zip(jobs, jobs[1:])
+    )
+    selector: slice | torch.Tensor
+    if contiguous:
+        selector = slice(jobs[0].query_slice.start, jobs[-1].query_slice.stop)
+    else:
+        indices = [
+            token
+            for job in jobs
+            for token in range(job.query_slice.start, job.query_slice.stop)
+        ]
+        selector = async_tensor_h2d(indices, device=device, dtype=torch.long)
+    source_rows = async_tensor_h2d(
+        [job.source_row for job in jobs],
+        device=block_table.device,
+        dtype=torch.long,
+    )
+    return replace(
+        native,
+        pcp_mapping=MLACommonPrefillMetadata.PCPContextMapping(
+            block_table=block_table.index_select(0, source_rows),
+            query_selector=selector,
+            num_base_tokens=sum(
+                job.query_slice.stop - job.query_slice.start
+                for job in plan.base_jobs
+            ),
+        ),
+    )
+
+
+def _pcp_context_reuse_applicable(
+    dcp_world_size: int,
+    use_sparse: bool,
+    has_sliding_window: bool,
+    causal: bool | None,
+    has_request_ids: bool,
+) -> bool:
+    """Only causal, non-DCP, dense attention with request IDs can reuse PCP."""
+    return (
+        dcp_world_size == 1
+        and not use_sparse
+        and not has_sliding_window
+        and causal is True
+        and has_request_ids
+    )
+
+
+def _build_pcp_context_reuse(
+    builder: "MLACommonMetadataBuilder",
+    metadata: CommonAttentionMetadata,
+    *,
+    num_decodes: int,
+    num_prefills: int,
+    context_lens_cpu: torch.Tensor,
+    prefill_query_start_loc_cpu: torch.Tensor,
+    block_table: torch.Tensor,
+    align_indptr: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    MLACommonPrefillMetadata.ChunkedContextMetadata | None,
+] | None:
+    """Gate PCP reuse, then materialize the purely CPU-planned jobs."""
+    if not _pcp_context_reuse_applicable(
+        builder.dcp_world_size,
+        builder.use_sparse,
+        builder.model_config.get_sliding_window() is not None,
+        metadata.causal,
+        metadata.req_idx is not None,
+    ):
+        return None
+
+    request_ids = metadata.req_idx[num_decodes : num_decodes + num_prefills]
+    plan = _plan_pcp_context_reuse(
+        request_ids.tolist(),
+        context_lens_cpu.tolist(),
+        prefill_query_start_loc_cpu.tolist(),
+    )
+    if plan is None:
+        return None
+
+    chunked_context = _build_pcp_packed_context_metadata(
+        plan,
+        chunked_prefill_workspace=builder.chunked_prefill_workspace,
+        chunked_prefill_workspace_size=builder.chunked_prefill_workspace_size,
+        page_size=builder.page_size,
+        device=builder.device,
+        dcp_local_block_size=builder.dcp_local_block_size,
+        dcp_virtual_block_size=builder.dcp_virtual_block_size,
+        align_indptr=align_indptr,
+        block_table=block_table,
+    )
+
+    merged_starts = plan.merged_starts
+    merged_query_start_loc_cpu = torch.tensor(merged_starts, dtype=torch.int32)
+    merged_query_lens = [
+        merged_starts[i + 1] - merged_starts[i]
+        for i in range(len(merged_starts) - 1)
+    ]
+    merged_query_lens_cpu = torch.tensor(merged_query_lens, dtype=torch.int32)
+    return (
+        async_tensor_h2d(
+            merged_query_start_loc_cpu, device=builder.device, dtype=torch.int32
+        ),
+        merged_query_lens_cpu,
+        max(merged_query_lens, default=0),
+        chunked_context,
     )
 
 
@@ -2443,6 +2728,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             vllm_config, self.model_config.dtype
         )
         attention_layer = self.compilation_config.static_forward_context[layer_names[0]]
+        self.use_sparse = attention_layer.impl.is_sparse
 
         try:
             self.dcp_world_size = get_dcp_group().world_size
@@ -2650,20 +2936,43 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             ):
                 align_indptr = True
 
-            chunked_context_metadata = build_mla_chunked_context_metadata(
-                context_lens_cpu=context_lens_cpu,
-                prefill_query_start_loc_cpu=prefill_query_start_loc_cpu,
-                chunked_prefill_workspace=self.chunked_prefill_workspace,
-                chunked_prefill_workspace_size=self.chunked_prefill_workspace_size,
-                block_size=self.page_size,
-                align_chunk_to_block=True,
-                device=device,
-                dcp_world_size=self.dcp_world_size,
-                dcp_local_block_size=self.dcp_local_block_size,
-                dcp_virtual_block_size=self.dcp_virtual_block_size,
-                dcp_manager=self.dcp_manager,
-                align_indptr=align_indptr,
+            pcp_context_reuse = (
+                _build_pcp_context_reuse(
+                    self,
+                    common_attn_metadata,
+                    num_decodes=num_decodes,
+                    num_prefills=num_prefills,
+                    context_lens_cpu=context_lens_cpu,
+                    prefill_query_start_loc_cpu=prefill_query_start_loc_cpu,
+                    block_table=block_table_tensor[reqs_start:, ...],
+                    align_indptr=align_indptr,
+                )
+                if self.use_pcp
+                else None
             )
+            if pcp_context_reuse is None:
+                chunked_context_metadata = build_mla_chunked_context_metadata(
+                    context_lens_cpu=context_lens_cpu,
+                    prefill_query_start_loc_cpu=prefill_query_start_loc_cpu,
+                    chunked_prefill_workspace=self.chunked_prefill_workspace,
+                    chunked_prefill_workspace_size=self.chunked_prefill_workspace_size,
+                    block_size=self.page_size,
+                    align_chunk_to_block=True,
+                    device=device,
+                    dcp_world_size=self.dcp_world_size,
+                    dcp_local_block_size=self.dcp_local_block_size,
+                    dcp_virtual_block_size=self.dcp_virtual_block_size,
+                    dcp_manager=self.dcp_manager,
+                    align_indptr=align_indptr,
+                )
+            else:
+                (
+                    prefill_query_start_loc,
+                    prefill_query_lens_cpu,
+                    pcp_max_query_len,
+                    chunked_context_metadata,
+                ) = pcp_context_reuse
+                max_query_len = max(max_query_len, pcp_max_query_len)
 
             prefill_metadata = MLACommonPrefillMetadata(
                 block_table=block_table_tensor[reqs_start:, ...],
@@ -2710,7 +3019,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         attn_metadata = self.metadata_cls(
             num_reqs=common_attn_metadata.num_reqs,
-            max_query_len=common_attn_metadata.max_query_len,
+            max_query_len=max_query_len,
             max_seq_len=max_seq_len,
             num_actual_tokens=num_tokens,
             query_start_loc=query_start_loc,
@@ -2894,6 +3203,58 @@ def accumulate_mla_context_chunk(
         output_lse[:, init_start:token_end].copy_(attn_softmax_lse[:, written:])
 
 
+def restore_pcp_context_partial(
+    mapping: "MLACommonPrefillMetadata.PCPContextMapping",
+    partial: torch.Tensor,
+    lse: torch.Tensor,
+    num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Restore packed Shared/Tail partials to the original PCP token order."""
+    selector = mapping.query_selector
+    base_end = mapping.num_base_tokens
+    if base_end == num_tokens:
+        # Ordered, nonoverlapping base jobs covering Q tokens are the
+        # identity mapping. Keep views of packed partials, even with a tail.
+        output = partial[:num_tokens]
+        output_lse = lse[:, :num_tokens]
+    else:
+        # Uncovered queries have no cached context and must remain neutral.
+        output = partial.new_zeros((num_tokens, *partial.shape[1:]))
+        output_lse = lse.new_full((lse.shape[0], num_tokens), float("-inf"))
+        if isinstance(selector, slice):
+            assert base_end == partial.shape[0]
+            output[selector].copy_(partial)
+            output_lse[:, selector].copy_(lse)
+        elif base_end:
+            base_indices = selector[:base_end]
+            output.index_copy_(0, base_indices, partial[:base_end])
+            output_lse.index_copy_(1, base_indices, lse[:, :base_end])
+
+    if isinstance(selector, slice):
+        assert base_end == partial.shape[0]
+        return output, output_lse
+
+    tail_indices = selector[base_end:]
+    if tail_indices.numel():
+        tail_output = partial[base_end:]
+        tail_lse = lse[:, base_end:]
+        # Match the native merge kernel's required head stride.
+        prefix_output = torch.empty_like(tail_output)
+        torch.index_select(output, 0, tail_indices, out=prefix_output)
+        prefix_lse = output_lse.index_select(1, tail_indices)
+        merge_attn_states(
+            output=prefix_output,
+            output_lse=prefix_lse,
+            prefix_output=prefix_output,
+            prefix_lse=prefix_lse,
+            suffix_output=tail_output,
+            suffix_lse=tail_lse,
+        )
+        output.index_copy_(0, tail_indices, prefix_output)
+        output_lse.index_copy_(1, tail_indices, prefix_lse)
+    return output, output_lse
+
+
 class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
     """Shared MLA base providing dense-MHA prefill (via the selected
     MLAPrefillBackend) for both dense and sparse impls; subclasses add decode
@@ -2975,6 +3336,12 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         assert prefill_metadata.prefill_backend is not None
         chunked_context = prefill_metadata.chunked_context
         assert chunked_context is not None
+        pcp_mapping = chunked_context.pcp_mapping
+        original_num_tokens = q.shape[0]
+        block_table = prefill_metadata.block_table
+        if pcp_mapping is not None:
+            q = q[pcp_mapping.query_selector]
+            block_table = pcp_mapping.block_table
 
         use_fp8_prefill = prefill_metadata.q_data_type == current_platform.fp8_dtype()
         kv_b_proj_input_dtype = _get_kv_b_proj_input_dtype(
@@ -2989,7 +3356,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         output_lse = None
         for chunk in chunked_context.chunks:
             toks = chunk.num_context_tokens
-            chunk_block_table = prefill_metadata.block_table[chunk.request_slice]
+            chunk_block_table = block_table[chunk.request_slice]
             if self.kv_cache_dtype == "fp8_ds_mla":
                 ops.cp_gather_and_upconvert_fp8_kv_cache(
                     src_cache=kv_c_and_k_pe_cache,
@@ -3066,7 +3433,12 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     len(chunked_context.chunks) == 1
                     and not chunked_context.empty_token_slices
                 ):
-                    return attn_output, attn_softmax_lse
+                    if pcp_mapping is None:
+                        return attn_output, attn_softmax_lse
+                    return restore_pcp_context_partial(
+                        pcp_mapping, attn_output, attn_softmax_lse,
+                        original_num_tokens,
+                    )
                 output, output_lse = init_mla_context_partial(
                     chunked_context,
                     attn_output,
@@ -3077,6 +3449,10 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 chunk, attn_output, attn_softmax_lse, output, output_lse
             )
 
+        if pcp_mapping is not None:
+            return restore_pcp_context_partial(
+                pcp_mapping, output, output_lse, original_num_tokens
+            )
         return output, output_lse
 
     def _context_parallel_compute_prefill_context(
