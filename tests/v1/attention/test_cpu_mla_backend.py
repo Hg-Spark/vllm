@@ -15,6 +15,8 @@ Two levels of coverage are provided:
   asserted. Marked `cpu_model` so it is skipped on non-CPU CI.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -26,9 +28,9 @@ from vllm.model_executor.layers.attention.mla_attention import (
     build_mla_chunked_context_metadata,
 )
 from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.cpu_mla import CPUMLAImpl
-from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.prefill.cpu_sdpa import (
     CPUSDPAMLAPrefillBackend,
 )
@@ -258,8 +260,13 @@ def test_cpu_mla_prefill_context_chunk(default_vllm_config) -> None:
     v = torch.randn((7, 4, 16), generator=generator, dtype=torch.bfloat16)
     result, lse = backend.run_prefill_context_chunk(chunk, q, k, v)
     ref_out, ref_lse = _reference_ragged_attention(
-        q, k, v, chunk.query_start_loc, chunk.cu_seq_lens,
-        scale=0.25, causal=False,
+        q,
+        k,
+        v,
+        chunk.query_start_loc,
+        chunk.cu_seq_lens,
+        scale=0.25,
+        causal=False,
     )
     torch.testing.assert_close(result.float(), ref_out.float(), rtol=0, atol=2e-2)
     torch.testing.assert_close(lse.float(), ref_lse.float(), rtol=0, atol=2e-2)
@@ -272,6 +279,7 @@ def test_cpu_mla_prefill_context_chunk(default_vllm_config) -> None:
     assert output.data_ptr() == dest.data_ptr()
     torch.testing.assert_close(output, result, rtol=0, atol=0)
     torch.testing.assert_close(output_lse, lse, rtol=0, atol=0)
+
 
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="CPU only")
 @pytest.mark.skipif(
@@ -333,6 +341,7 @@ def test_zen_cpu_mla_prefill_new_tokens() -> None:
     gen_out, gen_lse = generic.run_prefill_new_tokens(q, k, v, return_softmax_lse=True)
     assert torch.equal(zen_out, gen_out)
     assert torch.equal(zen_lse, gen_lse)
+
 
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="CPU MLA implementation")
 def test_pcp_context_executes_real_cpu_mla(default_vllm_config) -> None:
@@ -443,16 +452,22 @@ def test_pcp_context_executes_real_cpu_mla(default_vllm_config) -> None:
             atol=1e-4,
         )
         torch.testing.assert_close(
-            output[:, :, 1:], torch.zeros_like(output[:, :, 1:]),
-            rtol=0, atol=1e-6,
+            output[:, :, 1:],
+            torch.zeros_like(output[:, :, 1:]),
+            rtol=0,
+            atol=1e-6,
         )
         torch.testing.assert_close(
-            lse[:, :16], torch.full((num_heads, 16), float(torch.tensor(64.0).log())),
-            rtol=0, atol=1e-5,
+            lse[:, :16],
+            torch.full((num_heads, 16), math.log(64.0)),
+            rtol=0,
+            atol=1e-5,
         )
         torch.testing.assert_close(
-            lse[:, 16:], torch.full((num_heads, 16), float(torch.tensor(96.0).log())),
-            rtol=0, atol=1e-5,
+            lse[:, 16:],
+            torch.full((num_heads, 16), math.log(96.0)),
+            rtol=0,
+            atol=1e-5,
         )
         outputs.append((output, lse))
 

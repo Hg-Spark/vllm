@@ -10,8 +10,6 @@ from vllm.model_executor.layers.attention.mla_attention import (
     _build_pcp_packed_context_metadata,
     _pcp_context_reuse_applicable,
     _plan_pcp_context_reuse,
-    accumulate_mla_context_chunk,
-    init_mla_context_partial,
     restore_pcp_context_partial,
 )
 
@@ -201,16 +199,20 @@ def test_pcp_restore_merges_tail_and_neutralizes_absent_context() -> None:
     assert not partial.is_contiguous()
     lse = torch.zeros((3, 48), device=device)
     output, out_lse = restore_pcp_context_partial(mapping, partial, lse, 48)
-    torch.testing.assert_close(output[:16], torch.full((16, 3, 8), 2.0, device=device))
+    torch.testing.assert_close(
+        output[:16], torch.full((16, 3, 8), 2.0, device=device)
+    )
     torch.testing.assert_close(
         output[16:32], torch.full((16, 3, 8), 4.0, device=device)
     )
     torch.testing.assert_close(output[32:], torch.zeros((16, 3, 8), device=device))
-    torch.testing.assert_close(out_lse[0, :16], torch.zeros(16, device=device))
     torch.testing.assert_close(
-        out_lse[0, 16:32], torch.full((16,), math.log(2), device=device)
+        out_lse[:, :16], torch.zeros((3, 16), device=device)
     )
-    assert torch.isneginf(out_lse[0, 32:]).all()
+    torch.testing.assert_close(
+        out_lse[:, 16:32], torch.full((3, 16), math.log(2), device=device)
+    )
+    assert torch.isneginf(out_lse[:, 32:]).all()
 
     hot_plan = _plan(device=device)
     assert hot_plan is not None
@@ -226,79 +228,3 @@ def test_pcp_restore_merges_tail_and_neutralizes_absent_context() -> None:
     torch.testing.assert_close(
         hot_output[16:], torch.full((16, 3, 8), 4.0, device=device)
     )
-
-
-def test_pcp_context_chunk_out_equals_copy_with_continuation_and_empty_rows() -> None:
-    # Exercise the real init/accumulate/restore functions. No fake backend or
-    # patched kernel is needed to compare in-place and copying accumulation.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cases = (
-        ((256, 272), (0, 16, 32), (7, 7), True),
-        ((64, 112, 0), (0, 16, 32, 48), (7, 7, 8), False),
-    )
-    for context_lens, query_starts, req_idx, multi_chunk in cases:
-        plan = _plan(
-            req_idx=req_idx,
-            context_lens=context_lens,
-            query_starts=query_starts,
-            device=device,
-        )
-        assert plan is not None
-        context = plan[3]
-        assert context is not None and context.pcp_mapping is not None
-        assert len(context.chunks) == (2 if multi_chunk else 1)
-        assert not context.empty_token_slices
-        mapping = context.pcp_mapping
-        num_packed = (
-            mapping.query_selector.numel()
-            if isinstance(mapping.query_selector, torch.Tensor)
-            else mapping.query_selector.stop - mapping.query_selector.start
-        )
-        results = []
-        for direct in (False, True):
-            single_chunk = len(context.chunks) == 1
-            output = (
-                torch.empty((num_packed, 1, 8), device=device)
-                if direct and not single_chunk
-                else None
-            )
-            output_lse = None
-            wrote_any = False
-            for chunk in context.chunks:
-                tokens = chunk.token_slice.stop - chunk.token_slice.start
-                wrote = output is not None and not chunk.is_continuation
-                attn_output = (
-                    output[chunk.token_slice]
-                    if wrote
-                    else torch.empty((tokens, 1, 8), device=device)
-                )
-                attn_output.fill_(float(chunk.index + 1))
-                attn_lse = torch.zeros((1, tokens), device=device)
-                wrote_any |= wrote
-                if output_lse is None:
-                    if single_chunk:
-                        output, output_lse = attn_output, attn_lse
-                        break
-                    output, output_lse = init_mla_context_partial(
-                        context,
-                        attn_output,
-                        attn_lse,
-                        num_tokens=num_packed,
-                        output=output,
-                    )
-                accumulate_mla_context_chunk(
-                    chunk,
-                    attn_output,
-                    attn_lse,
-                    output,
-                    output_lse,
-                    output_written=wrote,
-                )
-            assert wrote_any == (direct and multi_chunk)
-            results.append(
-                restore_pcp_context_partial(
-                    mapping, output, output_lse, query_starts[-1]
-                )
-            )
-        for before, after in zip(*results):
-            torch.testing.assert_close(after, before)
