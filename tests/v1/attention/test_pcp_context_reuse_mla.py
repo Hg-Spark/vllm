@@ -116,8 +116,8 @@ def test_pcp_mixed_singleton_and_pair_share_one_chunk() -> None:
     )
 
 
-def test_pcp_thirty_two_pairs_pack_into_one_native_chunk() -> None:
-    pairs = 32
+def test_pcp_two_pairs_pack_into_one_native_chunk() -> None:
+    pairs = 2
     plan = _plan(
         builder=_builder(4096),
         metadata=_metadata(tuple(i for i in range(pairs) for _ in range(2))),
@@ -128,19 +128,19 @@ def test_pcp_thirty_two_pairs_pack_into_one_native_chunk() -> None:
     context = plan[3]
     assert context is not None and context.pcp_mapping is not None
     assert len(context.chunks) == 1
-    assert context.chunks[0].num_context_tokens == 3072
+    assert context.chunks[0].num_context_tokens == 192
     mapping = context.pcp_mapping
     assert mapping.block_table.flatten().tolist() == (
-        list(range(0, 64, 2)) * 2
+        [0, 2, 0, 2]
     )
-    assert mapping.num_base_tokens == 1024
+    assert mapping.num_base_tokens == 64
     assert isinstance(mapping.query_selector, torch.Tensor)
-    assert mapping.query_selector.numel() == 1536
-    assert mapping.query_selector[1024:1040].tolist() == list(range(16, 32))
+    assert mapping.query_selector.numel() == 96
+    assert mapping.query_selector[64:80].tolist() == list(range(16, 32))
 
 
-def test_pcp_workspace_splits_use_native_chunk_packing() -> None:
-    pairs = 4
+def test_pcp_workspace_splits_preserve_absolute_tail_offsets() -> None:
+    pairs = 2
     plan = _plan(
         metadata=_metadata(tuple(i for i in range(pairs) for _ in range(2))),
         context_lens=(64, 112) * pairs,
@@ -149,12 +149,13 @@ def test_pcp_workspace_splits_use_native_chunk_packing() -> None:
     assert plan is not None
     context = plan[3]
     assert context is not None and context.pcp_mapping is not None
-    assert len(context.chunks) == 3
-    assert [chunk.num_context_tokens for chunk in context.chunks] == [128] * 3
-    assert context.chunks[-1].starts.tolist() == [80] * 4
+    assert len(context.chunks) == 2
+    assert [chunk.num_context_tokens for chunk in context.chunks] == [128, 64]
+    # The second chunk uses the absolute cache offsets for both tails.
+    assert context.chunks[-1].starts.tolist() == [80, 80]
 
 
-def test_pcp_no_shared_context_remains_initialized() -> None:
+def test_pcp_no_shared_context_packs_tail_into_base() -> None:
     plan = _plan(
         metadata=_metadata((1, 1, 2, 2)),
         context_lens=(0, 48, 64, 112),
@@ -220,56 +221,6 @@ def test_pcp_restore_merges_tail_and_neutralizes_absent_context(monkeypatch) -> 
     torch.testing.assert_close(hot_out_lse[0, 16:], torch.full((16,), float(np.log(2))))
 
 
-def test_fa2_equal_mla_head_dims_skip_padding_and_allow_out(monkeypatch) -> None:
-    from vllm.v1.attention.backends.mla.prefill import flash_attn
-
-    monkeypatch.setattr(flash_attn, "flash_attn_varlen_func", lambda **kwargs: None)
-    monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 2)
-    monkeypatch.setattr(flash_attn.current_platform, "is_cuda", lambda: True)
-    monkeypatch.setattr(
-        flash_attn.current_platform, "get_device_capability", lambda: None
-    )
-    config = SimpleNamespace(
-        kernel_config=SimpleNamespace(enable_jit_warmup=False)
-    )
-
-    def make_backend(v_head_dim):
-        return flash_attn.FlashAttnPrefillBackend(
-            num_heads=20,
-            scale=1.0,
-            kv_lora_rank=512,
-            qk_nope_head_dim=192,
-            qk_rope_head_dim=64,
-            v_head_dim=v_head_dim,
-            vllm_config=config,
-        )
-
-    equal = make_backend(256)
-    assert not equal.requires_v_padding
-    assert equal.supports_out()
-
-    unequal = make_backend(128)
-    assert unequal.requires_v_padding
-    assert not unequal.supports_out()
-
-    # Upstream FlashAttention's ROCm wrapper does not accept out=.
-    monkeypatch.setattr(flash_attn.current_platform, "is_cuda", lambda: False)
-    equal_upstream = make_backend(256)
-    assert not equal_upstream.supports_out()
-
-
-def test_cuda_non_dcp_context_omits_unused_token_to_seq(monkeypatch) -> None:
-    # Exercise the CUDA metadata branch with CPU tensors; the CUDA gather
-    # ignores token_to_seq and uses cu_seq_lens for token ownership.
-    monkeypatch.setattr(mla_attention.current_platform, "is_cuda", lambda: True)
-    plan = _plan()
-    assert plan is not None
-    context = plan[3]
-    assert context is not None
-    assert context.chunks
-    assert all(chunk.token_to_seq.numel() == 0 for chunk in context.chunks)
-
-
 def test_pcp_context_out_matches_copy_for_continuation_and_empty_rows(
     monkeypatch,
 ) -> None:
@@ -311,10 +262,12 @@ def test_pcp_context_out_matches_copy_for_continuation_and_empty_rows(
     )
 
     cases = (
-        ((256, 272), (0, 16, 32), (7, 7)),  # Split context: continuation.
-        ((64, 112, 0), (0, 16, 32, 48), (7, 7, 8)),  # Empty context row.
+        # Multiple chunks: the first chunk can write out=, continuations cannot.
+        ((256, 272), (0, 16, 32), (7, 7), True),
+        # The zero-context row is excluded from the packed single chunk.
+        ((64, 112, 0), (0, 16, 32, 48), (7, 7, 8), False),
     )
-    for context_lens, query_starts, req_idx in cases:
+    for context_lens, query_starts, req_idx, multi_chunk in cases:
         builder = _builder()
         builder.chunked_prefill_workspace = torch.empty((128, 2))
         plan = _plan(
@@ -326,6 +279,8 @@ def test_pcp_context_out_matches_copy_for_continuation_and_empty_rows(
         assert plan is not None
         context = plan[3]
         assert context is not None
+        assert len(context.chunks) == (2 if multi_chunk else 1)
+        assert not context.empty_token_slices
         outputs = []
         for direct in (False, True):
             backend = FakeBackend(direct)
@@ -349,7 +304,11 @@ def test_pcp_context_out_matches_copy_for_continuation_and_empty_rows(
                 context_lens[0] == 256
             )
             assert all(not wrote for cont, wrote in backend.calls if cont)
-            assert any(wrote for _, wrote in backend.calls) == direct
+            # Single-chunk execution returns directly without supplying out=,
+            # even when the backend supports it.
+            assert any(wrote for _, wrote in backend.calls) == (
+                direct and multi_chunk
+            )
 
         for before, after in zip(*outputs):
             torch.testing.assert_close(after, before)

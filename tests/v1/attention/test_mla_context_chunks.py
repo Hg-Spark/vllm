@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import vllm.utils.gpu_sync_debug as gsd
+from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.mla_attention import (
     build_mla_chunked_context_metadata,
     init_mla_context_partial,
@@ -122,7 +123,10 @@ def test_chunks_gather_every_context_row_exactly_once(context_lens, workspace_si
         assert chunk.all_rows_active
         assert chunk.num_context_tokens <= workspace_size
         assert chunk.num_context_tokens == int(chunk.cu_seq_lens[-1])
-        assert chunk.token_to_seq.shape[0] == chunk.num_context_tokens
+        if mla_attention.current_platform.is_cuda():
+            assert chunk.token_to_seq.numel() == 0
+        else:
+            assert chunk.token_to_seq.numel() == chunk.num_context_tokens
         # Chunks are emitted in request order, which is what lets the partial
         # treat only a chunk's first request as a continuation.
         assert chunk.request_slice.start >= previous_request_start
@@ -145,6 +149,22 @@ def test_chunks_gather_every_context_row_exactly_once(context_lens, workspace_si
             assert start == cursor
             cursor += length
         assert cursor == expected[request]
+
+
+@pytest.mark.parametrize("is_cuda", [False, True])
+def test_non_dcp_token_to_seq_follows_platform_contract(monkeypatch, is_cuda):
+    # These tensors are on CPU, but the optimization is selected by platform.
+    monkeypatch.setattr(mla_attention.current_platform, "is_cuda", lambda: is_cuda)
+    metadata = build_chunked_context([64, 32], [4, 4], 128)
+    assert metadata is not None
+    assert len(metadata.chunks) == 1
+    chunk = metadata.chunks[0]
+    assert chunk.num_context_tokens == 96
+    assert chunk.cu_seq_lens.tolist() == [0, 64, 96]
+    if is_cuda:
+        assert chunk.token_to_seq.numel() == 0
+    else:
+        assert chunk.token_to_seq.tolist() == [0] * 64 + [1] * 32
 
 
 def test_continuation_is_confined_to_a_chunks_first_request():
