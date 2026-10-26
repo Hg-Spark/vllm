@@ -2305,63 +2305,181 @@ def build_mla_chunked_context_metadata(
     )
 
 
+@dataclass(frozen=True)
+class _PCPContextJob:
+    """One logical context gather; start is an absolute KV-cache offset."""
+
+    source_row: int
+    context_start: int
+    context_len: int
+    query_slice: slice
+
+
+@dataclass
+class _PCPContextPlan:
+    """CPU-only shared/tail planning, prior to chunk packing and H2D."""
+
+    base_jobs: list[_PCPContextJob]
+    tail_jobs: list[_PCPContextJob]
+    merged_starts: list[int]
+
+
+def _plan_pcp_context_reuse(
+    request_ids: list[int],
+    context_lens: list[int],
+    query_starts: list[int],
+) -> _PCPContextPlan | None:
+    """Plan adjacent PCP pairs without needing model, backend, or GPU objects.
+
+    Base query ranges are ordered and disjoint; tail ranges repeat part of an
+    existing base range only when shared context exists. Without shared
+    context, the extra context is a base job rather than a tail to merge.
+    Each context_start is absolute in the source request's KV cache; the
+    native chunk planner produces offsets relative to that job.
+    """
+    num_prefills = len(context_lens)
+    if len(request_ids) != num_prefills or len(query_starts) != num_prefills + 1:
+        return None
+
+    base_jobs: list[_PCPContextJob] = []
+    tail_jobs: list[_PCPContextJob] = []
+    merged_starts = [query_starts[0]]
+    seen_req_idx: set[int] = set()
+    has_pair = False
+    start = 0
+    while start < num_prefills:
+        end = start + 1
+        while end < num_prefills and request_ids[end] == request_ids[start]:
+            end += 1
+
+        request_idx = int(request_ids[start])
+        run_size = end - start
+        if request_idx in seen_req_idx or run_size > 2:
+            return None
+        seen_req_idx.add(request_idx)
+
+        if run_size == 1:
+            query = slice(query_starts[start], query_starts[end])
+            context_len = context_lens[start]
+            if query.stop <= query.start or context_len < 0:
+                return None
+            if context_len > 0:
+                base_jobs.append(_PCPContextJob(start, 0, context_len, query))
+            merged_starts.append(query.stop)
+            start = end
+            continue
+
+        has_pair = True
+        first_query = slice(query_starts[start], query_starts[start + 1])
+        second_query = slice(query_starts[start + 1], query_starts[end])
+        if (
+            first_query.stop <= first_query.start
+            or second_query.stop <= second_query.start
+        ):
+            return None
+
+        first_len, second_len = context_lens[start:end]
+        current_end = first_len + first_query.stop - first_query.start
+        if first_len < 0 or second_len < current_end:
+            return None
+        if first_len > 0:
+            base_jobs.append(
+                _PCPContextJob(
+                    start,
+                    0,
+                    first_len,
+                    slice(first_query.start, second_query.stop),
+                )
+            )
+        if second_len > current_end:
+            job = _PCPContextJob(
+                start,
+                current_end,
+                second_len - current_end,
+                second_query,
+            )
+            (tail_jobs if first_len > 0 else base_jobs).append(job)
+
+        merged_starts.append(second_query.stop)
+        start = end
+
+    if not has_pair:
+        return None
+    return _PCPContextPlan(base_jobs, tail_jobs, merged_starts)
+
+
 def _build_pcp_packed_context_metadata(
-    builder: "MLACommonMetadataBuilder",
-    base_jobs: list[tuple[int, int, int, slice]],
-    tail_jobs: list[tuple[int, int, int, slice]],
+    plan: _PCPContextPlan,
+    *,
+    chunked_prefill_workspace: torch.Tensor,
+    chunked_prefill_workspace_size: int,
+    page_size: int,
+    device: torch.device,
+    dcp_local_block_size: int,
+    dcp_virtual_block_size: int,
     align_indptr: bool,
     block_table: torch.Tensor,
 ) -> "MLACommonPrefillMetadata.ChunkedContextMetadata | None":
-    """Plan Shared and Tail jobs together with the native workspace packer."""
-    jobs = base_jobs + tail_jobs
+    """Materialize the CPU jobs with native chunk packing and PCP mappings."""
+    jobs = plan.base_jobs + plan.tail_jobs
     if not jobs:
         return None
 
     query_starts = [0]
-    for _, _, _, query in jobs:
+    for job in jobs:
+        query = job.query_slice
         query_starts.append(query_starts[-1] + query.stop - query.start)
     native = build_mla_chunked_context_metadata(
-        context_lens_cpu=torch.tensor([job[2] for job in jobs], dtype=torch.int32),
+        context_lens_cpu=torch.tensor(
+            [job.context_len for job in jobs], dtype=torch.int32
+        ),
         prefill_query_start_loc_cpu=torch.tensor(query_starts, dtype=torch.int32),
-        chunked_prefill_workspace=builder.chunked_prefill_workspace,
-        chunked_prefill_workspace_size=builder.chunked_prefill_workspace_size,
-        block_size=builder.page_size,
+        chunked_prefill_workspace=chunked_prefill_workspace,
+        chunked_prefill_workspace_size=chunked_prefill_workspace_size,
+        block_size=page_size,
         align_chunk_to_block=True,
-        device=builder.device,
+        device=device,
         dcp_world_size=1,
-        dcp_local_block_size=builder.dcp_local_block_size,
-        dcp_virtual_block_size=builder.dcp_virtual_block_size,
+        dcp_local_block_size=dcp_local_block_size,
+        dcp_virtual_block_size=dcp_virtual_block_size,
         dcp_manager=None,
         align_indptr=align_indptr,
         context_starts_cpu=torch.tensor(
-            [job[1] for job in jobs], dtype=torch.int32
+            [job.context_start for job in jobs], dtype=torch.int32
         ),
     )
     assert native is not None
 
-    # The native executor uses logical job order; restore Shared/Tail outputs
-    # to their original PCP query indices only after chunk accumulation.
-    # Base jobs are ordered and disjoint. Tail jobs duplicate some base
-    # queries, so a span/length check alone cannot prove contiguity.
-    contiguous = not tail_jobs and all(
-        previous[3].stop == following[3].start
+    # Length equality is not enough to imply a slice: omitted queries and
+    # repeated tail queries can cancel out.
+    contiguous = not plan.tail_jobs and all(
+        previous.query_slice.stop == following.query_slice.start
         for previous, following in zip(jobs, jobs[1:])
     )
     selector: slice | torch.Tensor
     if contiguous:
-        selector = slice(jobs[0][3].start, jobs[-1][3].stop)
+        selector = slice(jobs[0].query_slice.start, jobs[-1].query_slice.stop)
     else:
-        indices = [token for job in jobs for token in range(job[3].start, job[3].stop)]
-        selector = async_tensor_h2d(indices, device=builder.device, dtype=torch.long)
+        indices = [
+            token
+            for job in jobs
+            for token in range(job.query_slice.start, job.query_slice.stop)
+        ]
+        selector = async_tensor_h2d(indices, device=device, dtype=torch.long)
     source_rows = async_tensor_h2d(
-        [job[0] for job in jobs], device=block_table.device, dtype=torch.long
+        [job.source_row for job in jobs],
+        device=block_table.device,
+        dtype=torch.long,
     )
     return replace(
         native,
         pcp_mapping=MLACommonPrefillMetadata.PCPContextMapping(
             block_table=block_table.index_select(0, source_rows),
             query_selector=selector,
-            num_base_tokens=sum(job[3].stop - job[3].start for job in base_jobs),
+            num_base_tokens=sum(
+                job.query_slice.stop - job.query_slice.start
+                for job in plan.base_jobs
+            ),
         ),
     )
 
@@ -2382,7 +2500,7 @@ def _build_pcp_context_reuse(
     int,
     MLACommonPrefillMetadata.ChunkedContextMetadata | None,
 ] | None:
-    """Reuse cached context when two adjacent PCP rows form one causal query."""
+    """Gate PCP reuse, then materialize the purely CPU-planned jobs."""
     if (
         builder.dcp_world_size != 1
         or builder.use_sparse
@@ -2392,97 +2510,33 @@ def _build_pcp_context_reuse(
     ):
         return None
 
-    context_lens = [int(value) for value in context_lens_cpu.tolist()]
-    query_starts = [int(value) for value in prefill_query_start_loc_cpu.tolist()]
-    req_idx = metadata.req_idx[num_decodes : num_decodes + num_prefills]
-    if (
-        len(context_lens) != num_prefills
-        or len(query_starts) != num_prefills + 1
-        or req_idx.size != num_prefills
-    ):
-        return None
-
-    # source row, context start, context length, query slice
-    base_jobs: list[tuple[int, int, int, slice]] = []
-    tail_jobs: list[tuple[int, int, int, slice]] = []
-    merged_starts = [query_starts[0]]
-    seen_req_idx: set[int] = set()
-    has_pair = False
-    start = 0
-    while start < num_prefills:
-        end = start + 1
-        while end < num_prefills and req_idx[end] == req_idx[start]:
-            end += 1
-
-        request_idx = int(req_idx[start])
-        run_size = end - start
-        if request_idx in seen_req_idx or run_size > 2:
-            return None
-        seen_req_idx.add(request_idx)
-
-        if run_size == 1:
-            query = slice(query_starts[start], query_starts[end])
-            context_len = context_lens[start]
-            if query.stop <= query.start or context_len < 0:
-                return None
-            if context_len > 0:
-                base_jobs.append((start, 0, context_len, query))
-            merged_starts.append(query.stop)
-            start = end
-            continue
-
-        has_pair = True
-        first_query = slice(query_starts[start], query_starts[start + 1])
-        second_query = slice(query_starts[start + 1], query_starts[end])
-        if (
-            first_query.stop <= first_query.start
-            or second_query.stop <= second_query.start
-        ):
-            return None
-
-        first_len, second_len = context_lens[start:end]
-        current_end = first_len + first_query.stop - first_query.start
-        if first_len < 0 or second_len < current_end:
-            return None
-        if first_len > 0:
-            base_jobs.append(
-                (
-                    start,
-                    0,
-                    first_len,
-                    slice(first_query.start, second_query.stop),
-                )
-            )
-        if second_len > current_end:
-            # Without a shared partial this row is initialized, not merged.
-            (tail_jobs if first_len > 0 else base_jobs).append(
-                (
-                    start,
-                    current_end,
-                    second_len - current_end,
-                    second_query,
-                )
-            )
-
-        merged_starts.append(second_query.stop)
-        start = end
-
-    if not has_pair:
+    request_ids = metadata.req_idx[num_decodes : num_decodes + num_prefills]
+    plan = _plan_pcp_context_reuse(
+        request_ids.tolist(),
+        context_lens_cpu.tolist(),
+        prefill_query_start_loc_cpu.tolist(),
+    )
+    if plan is None:
         return None
 
     chunked_context = _build_pcp_packed_context_metadata(
-        builder,
-        base_jobs,
-        tail_jobs,
-        align_indptr,
-        block_table,
+        plan,
+        chunked_prefill_workspace=builder.chunked_prefill_workspace,
+        chunked_prefill_workspace_size=builder.chunked_prefill_workspace_size,
+        page_size=builder.page_size,
+        device=builder.device,
+        dcp_local_block_size=builder.dcp_local_block_size,
+        dcp_virtual_block_size=builder.dcp_virtual_block_size,
+        align_indptr=align_indptr,
+        block_table=block_table,
     )
 
+    merged_starts = plan.merged_starts
+    merged_query_start_loc_cpu = torch.tensor(merged_starts, dtype=torch.int32)
     merged_query_lens = [
         merged_starts[i + 1] - merged_starts[i]
         for i in range(len(merged_starts) - 1)
     ]
-    merged_query_start_loc_cpu = torch.tensor(merged_starts, dtype=torch.int32)
     merged_query_lens_cpu = torch.tensor(merged_query_lens, dtype=torch.int32)
     return (
         async_tensor_h2d(
