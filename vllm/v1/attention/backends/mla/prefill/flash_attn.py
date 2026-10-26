@@ -378,10 +378,9 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         ):
             _FA4_MLA_PREFILL_KERNEL.register_warmup()
 
-        # Determine if we need to pad V
-        # For MLA the v head dim is smaller than qk head dim so we pad out
-        # v with 0s to match the qk head dim for attention backends that do
-        # not support different headdims.
+        # Pad V only when head dimensions differ and the selected backend
+        # cannot handle different QK/V dimensions. A zero-width pad would
+        # still clone V on equal-dimension MLA models.
         # FA3 on Hopper (SM90) and FA4 natively handle diff headdims.
         device_capability = current_platform.get_device_capability()
         self.requires_v_padding = qk_head_dim != v_head_dim and (
