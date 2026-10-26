@@ -122,7 +122,6 @@ class CPUSDPAMLAPrefillBackend(MLAPrefillBackend):
         v: torch.Tensor,
         out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert out is None, "CPU MLA context prefill does not support in-place output"
         result = self._ragged_sdpa(
             q,
             k,
@@ -133,5 +132,8 @@ class CPUSDPAMLAPrefillBackend(MLAPrefillBackend):
             return_softmax_lse=True,
         )
         assert isinstance(result, tuple)
-        out, lse = result
-        return out, lse
+        result_out, lse = result
+        if out is not None:
+            out.copy_(result_out)
+            return out, lse
+        return result_out, lse

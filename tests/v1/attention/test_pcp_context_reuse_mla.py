@@ -189,19 +189,23 @@ def test_pcp_restore_merges_tail_and_neutralizes_absent_context() -> None:
     context = plan[3]
     assert context is not None and context.pcp_mapping is not None
     mapping = context.pcp_mapping
-    partial = torch.cat(
+    # Three heads and a non-contiguous token stride exercise restore's
+    # index_select(out=) and the merge kernel's head-stride requirement.
+    packed = torch.cat(
         (
-            torch.full((32, 1, 8), 2.0, device=device),
-            torch.full((16, 1, 8), 6.0, device=device),
+            torch.full((32, 3, 8), 2.0, device=device),
+            torch.full((16, 3, 8), 6.0, device=device),
         )
     )
-    lse = torch.zeros((1, 48), device=device)
+    partial = torch.stack((packed, packed), dim=1)[:, 0]
+    assert not partial.is_contiguous()
+    lse = torch.zeros((3, 48), device=device)
     output, out_lse = restore_pcp_context_partial(mapping, partial, lse, 48)
-    torch.testing.assert_close(output[:16], torch.full((16, 1, 8), 2.0, device=device))
+    torch.testing.assert_close(output[:16], torch.full((16, 3, 8), 2.0, device=device))
     torch.testing.assert_close(
-        output[16:32], torch.full((16, 1, 8), 4.0, device=device)
+        output[16:32], torch.full((16, 3, 8), 4.0, device=device)
     )
-    torch.testing.assert_close(output[32:], torch.zeros((16, 1, 8), device=device))
+    torch.testing.assert_close(output[32:], torch.zeros((16, 3, 8), device=device))
     torch.testing.assert_close(out_lse[0, :16], torch.zeros(16, device=device))
     torch.testing.assert_close(
         out_lse[0, 16:32], torch.full((16,), math.log(2), device=device)
@@ -220,7 +224,7 @@ def test_pcp_restore_merges_tail_and_neutralizes_absent_context() -> None:
     assert hot_output.data_ptr() == hot_partial.data_ptr()
     assert hot_out_lse.data_ptr() == hot_lse.data_ptr()
     torch.testing.assert_close(
-        hot_output[16:], torch.full((16, 1, 8), 4.0, device=device)
+        hot_output[16:], torch.full((16, 3, 8), 4.0, device=device)
     )
 
 
