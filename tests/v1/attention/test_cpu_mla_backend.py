@@ -18,7 +18,17 @@ Two levels of coverage are provided:
 import pytest
 import torch
 
+from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonMetadata,
+    MLACommonPrefillMetadata,
+    _build_pcp_packed_context_metadata,
+    _plan_pcp_context_reuse,
+    build_mla_chunked_context_metadata,
+)
+from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.platforms import current_platform
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.mla.cpu_mla import CPUMLAImpl
 from vllm.v1.attention.backends.mla.prefill.cpu_sdpa import (
     CPUSDPAMLAPrefillBackend,
 )
@@ -217,7 +227,7 @@ def test_cpu_mla_prefill_new_tokens() -> None:
 
 
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="CPU only")
-def test_cpu_mla_prefill_context_chunk() -> None:
+def test_cpu_mla_prefill_context_chunk(default_vllm_config) -> None:
     backend = CPUSDPAMLAPrefillBackend(
         num_heads=4,
         scale=0.25,
@@ -225,35 +235,48 @@ def test_cpu_mla_prefill_context_chunk() -> None:
         qk_nope_head_dim=16,
         qk_rope_head_dim=0,
         v_head_dim=16,
-        vllm_config=None,
+        vllm_config=default_vllm_config,
     )
+    context = build_mla_chunked_context_metadata(
+        context_lens_cpu=torch.tensor([3, 4], dtype=torch.int32),
+        prefill_query_start_loc_cpu=torch.tensor([0, 2, 5], dtype=torch.int32),
+        chunked_prefill_workspace=torch.empty((16, 1)),
+        chunked_prefill_workspace_size=16,
+        block_size=16,
+        align_chunk_to_block=True,
+        device=torch.device("cpu"),
+        dcp_world_size=1,
+        dcp_local_block_size=1,
+        dcp_virtual_block_size=1,
+    )
+    assert context is not None and len(context.chunks) == 1
+    chunk = context.chunks[0]
 
-    class _PrefillMeta:
-        query_start_loc = torch.tensor([0, 5], dtype=torch.int32)
-
-    class _Chunk:
-        query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
-        cu_seq_lens = torch.tensor([0, 3, 7], dtype=torch.int32)
-
-    backend.prepare_metadata(_PrefillMeta())
-    q = torch.randn(5, 4, 16, dtype=torch.bfloat16)
-    k = torch.randn(7, 4, 16, dtype=torch.bfloat16)
-    v = torch.randn(7, 4, 16, dtype=torch.bfloat16)
-
-    out, lse = backend.run_prefill_context_chunk(_Chunk(), q, k, v)
+    generator = torch.Generator().manual_seed(0)
+    q = torch.randn((5, 4, 16), generator=generator, dtype=torch.bfloat16)
+    k = torch.randn((7, 4, 16), generator=generator, dtype=torch.bfloat16)
+    v = torch.randn((7, 4, 16), generator=generator, dtype=torch.bfloat16)
+    result, lse = backend.run_prefill_context_chunk(chunk, q, k, v)
     ref_out, ref_lse = _reference_ragged_attention(
         q,
         k,
         v,
-        _Chunk.query_start_loc,
-        _Chunk.cu_seq_lens,
+        chunk.query_start_loc,
+        chunk.cu_seq_lens,
         scale=0.25,
         causal=False,
     )
-    assert out.float().allclose(ref_out.float(), atol=2e-2)
-    assert lse.float().allclose(ref_lse.float(), atol=2e-2)
-    assert out.shape == (5, 4, 16)
-    assert lse.shape == (4, 5)
+    torch.testing.assert_close(result.float(), ref_out.float(), rtol=0, atol=2e-2)
+    torch.testing.assert_close(lse.float(), ref_lse.float(), rtol=0, atol=2e-2)
+
+    assert backend.supports_out()
+    dest = torch.empty_like(result)
+    output, output_lse = backend.run_prefill_context_chunk(
+        chunk, q, k, v, out=dest
+    )
+    assert output.data_ptr() == dest.data_ptr()
+    torch.testing.assert_close(output, result, rtol=0, atol=0)
+    torch.testing.assert_close(output_lse, lse, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="CPU only")
@@ -316,3 +339,132 @@ def test_zen_cpu_mla_prefill_new_tokens() -> None:
     gen_out, gen_lse = generic.run_prefill_new_tokens(q, k, v, return_softmax_lse=True)
     assert torch.equal(zen_out, gen_out)
     assert torch.equal(zen_lse, gen_lse)
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="CPU MLA implementation")
+def test_pcp_context_executes_real_cpu_mla(default_vllm_config) -> None:
+    # Real MLA implementation and backend; distinct queries, keys, and heads
+    # ensure wrong PCP query remapping cannot masquerade as an averaging test.
+    num_heads, rank, dim = 3, 16, 8
+    projection = ColumnParallelLinear(
+        input_size=rank,
+        output_size=num_heads * (dim + dim),
+        bias=False,
+        params_dtype=torch.float32,
+        disable_tp=True,
+    )
+    generator = torch.Generator().manual_seed(2026)
+    with torch.no_grad():
+        projection.weight.copy_(
+            torch.randn(projection.weight.shape, generator=generator) * 0.35
+        )
+
+    impl = CPUMLAImpl(
+        num_heads=num_heads,
+        head_size=rank,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type=AttentionType.DECODER,
+        kv_sharing_target_layer_name=None,
+        q_lora_rank=None,
+        kv_lora_rank=rank,
+        qk_nope_head_dim=dim,
+        qk_rope_head_dim=0,
+        qk_head_dim=dim,
+        v_head_dim=dim,
+        kv_b_proj=projection,
+    )
+    backend = CPUSDPAMLAPrefillBackend(
+        num_heads=num_heads,
+        scale=1.0,
+        kv_lora_rank=rank,
+        qk_nope_head_dim=dim,
+        qk_rope_head_dim=0,
+        v_head_dim=dim,
+        vllm_config=default_vllm_config,
+    )
+    plan = _plan_pcp_context_reuse([7, 7], [64, 112], [0, 16, 32])
+    assert plan is not None
+    block_table = torch.arange(8, dtype=torch.int32).repeat(2, 1)
+    cache = torch.randn((8, 16, rank), generator=generator) * 0.75
+    q = torch.randn((32, num_heads, dim), generator=generator)
+
+    # Reference the *context partial*, not full causal attention: the second
+    # PCP row reuses [0, 64) and its tail [80, 112), but excludes [64, 80).
+    projected = torch.nn.functional.linear(
+        cache.view(-1, rank), projection.weight
+    ).view(-1, num_heads, 2 * dim)
+    keys, values = projected.split(dim, dim=-1)
+    references = []
+    for query_slice, context_positions in (
+        (slice(0, 16), list(range(64))),
+        (slice(16, 32), list(range(64)) + list(range(80, 112))),
+    ):
+        scores = torch.einsum(
+            "qhd,khd->hqk",
+            q[query_slice],
+            keys[context_positions],
+        ) * impl.scale
+        probs = scores.softmax(dim=-1)
+        references.append(
+            (
+                torch.einsum("hqk,khd->qhd", probs, values[context_positions]),
+                torch.logsumexp(scores, dim=-1),
+            )
+        )
+    ref_output = torch.cat([pair[0] for pair in references])
+    ref_lse = torch.cat([pair[1] for pair in references], dim=1)
+    # Every token/head must carry a distinguishable query-dependent score.
+    assert not torch.allclose(ref_output[0], ref_output[1])
+    assert not torch.allclose(ref_output[0, 0], ref_output[0, 1])
+
+    outputs = []
+    for workspace_size, expected_chunks in ((128, 1), (32, 3)):
+        context = _build_pcp_packed_context_metadata(
+            plan,
+            chunked_prefill_workspace=torch.empty((workspace_size, rank)),
+            chunked_prefill_workspace_size=workspace_size,
+            page_size=16,
+            device=torch.device("cpu"),
+            dcp_local_block_size=1,
+            dcp_virtual_block_size=1,
+            align_indptr=False,
+            block_table=block_table,
+        )
+        assert context is not None
+        assert len(context.chunks) == expected_chunks
+        prefill = MLACommonPrefillMetadata(
+            block_table=block_table,
+            query_start_loc=torch.tensor([0, 16, 32], dtype=torch.int32),
+            max_query_len=16,
+            chunked_context=context,
+            q_data_type=torch.float32,
+            output_dtype=torch.float32,
+            prefill_backend=backend,
+        )
+        metadata = MLACommonMetadata(
+            num_reqs=2,
+            max_query_len=16,
+            max_seq_len=144,
+            num_actual_tokens=32,
+            query_start_loc=prefill.query_start_loc,
+            slot_mapping=torch.arange(32, dtype=torch.int64),
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_prefills=2,
+            prefill=prefill,
+        )
+        output, lse = impl._compute_prefill_context(
+            q, cache, metadata, torch.tensor(1.0)
+        )
+        torch.testing.assert_close(output, ref_output, rtol=1e-5, atol=2e-5)
+        torch.testing.assert_close(lse, ref_lse, rtol=1e-5, atol=2e-5)
+        outputs.append((output, lse))
+
+    for single, multi in zip(*outputs):
+        torch.testing.assert_close(single, multi, rtol=0, atol=1e-4)
+
