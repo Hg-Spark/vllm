@@ -2484,6 +2484,23 @@ def _build_pcp_packed_context_metadata(
     )
 
 
+def _pcp_context_reuse_applicable(
+    dcp_world_size: int,
+    use_sparse: bool,
+    has_sliding_window: bool,
+    causal: bool | None,
+    has_request_ids: bool,
+) -> bool:
+    """Only causal, non-DCP, dense attention with request IDs can reuse PCP."""
+    return (
+        dcp_world_size == 1
+        and not use_sparse
+        and not has_sliding_window
+        and causal is True
+        and has_request_ids
+    )
+
+
 def _build_pcp_context_reuse(
     builder: "MLACommonMetadataBuilder",
     metadata: CommonAttentionMetadata,
@@ -2501,12 +2518,12 @@ def _build_pcp_context_reuse(
     MLACommonPrefillMetadata.ChunkedContextMetadata | None,
 ] | None:
     """Gate PCP reuse, then materialize the purely CPU-planned jobs."""
-    if (
-        builder.dcp_world_size != 1
-        or builder.use_sparse
-        or builder.model_config.get_sliding_window() is not None
-        or metadata.causal is not True
-        or metadata.req_idx is None
+    if not _pcp_context_reuse_applicable(
+        builder.dcp_world_size,
+        builder.use_sparse,
+        builder.model_config.get_sliding_window() is not None,
+        metadata.causal,
+        metadata.req_idx is not None,
     ):
         return None
 
