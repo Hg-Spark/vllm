@@ -15,8 +15,6 @@ Two levels of coverage are provided:
   asserted. Marked `cpu_model` so it is skipped on non-CPU CI.
 """
 
-import math
-
 import pytest
 import torch
 
@@ -345,8 +343,8 @@ def test_zen_cpu_mla_prefill_new_tokens() -> None:
 
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="CPU MLA implementation")
 def test_pcp_context_executes_real_cpu_mla(default_vllm_config) -> None:
-    # A real MLA implementation, projection and prefill backend. Uniform
-    # query logits make Shared + Tail outputs independently checkable.
+    # Real MLA implementation and backend; distinct queries, keys, and heads
+    # ensure wrong PCP query remapping cannot masquerade as an averaging test.
     num_heads, rank, dim = 3, 16, 8
     projection = ColumnParallelLinear(
         input_size=rank,
@@ -355,10 +353,11 @@ def test_pcp_context_executes_real_cpu_mla(default_vllm_config) -> None:
         params_dtype=torch.float32,
         disable_tp=True,
     )
+    generator = torch.Generator().manual_seed(2026)
     with torch.no_grad():
-        projection.weight.zero_()
-        for head in range(num_heads):
-            projection.weight[head * (2 * dim) + dim, 0] = 1.0
+        projection.weight.copy_(
+            torch.randn(projection.weight.shape, generator=generator) * 0.35
+        )
 
     impl = CPUMLAImpl(
         num_heads=num_heads,
@@ -391,9 +390,37 @@ def test_pcp_context_executes_real_cpu_mla(default_vllm_config) -> None:
     plan = _plan_pcp_context_reuse([7, 7], [64, 112], [0, 16, 32])
     assert plan is not None
     block_table = torch.arange(8, dtype=torch.int32).repeat(2, 1)
-    cache = torch.zeros((8, 16, rank), dtype=torch.float32)
-    cache.view(-1, rank)[:, 0] = torch.arange(128, dtype=torch.float32)
-    q = torch.zeros((32, num_heads, dim), dtype=torch.float32)
+    cache = torch.randn((8, 16, rank), generator=generator) * 0.75
+    q = torch.randn((32, num_heads, dim), generator=generator)
+
+    # Reference the *context partial*, not full causal attention: the second
+    # PCP row reuses [0, 64) and its tail [80, 112), but excludes [64, 80).
+    projected = torch.nn.functional.linear(
+        cache.view(-1, rank), projection.weight
+    ).view(-1, num_heads, 2 * dim)
+    keys, values = projected.split(dim, dim=-1)
+    references = []
+    for query_slice, context_positions in (
+        (slice(0, 16), list(range(64))),
+        (slice(16, 32), list(range(64)) + list(range(80, 112))),
+    ):
+        scores = torch.einsum(
+            "qhd,khd->hqk",
+            q[query_slice],
+            keys[context_positions],
+        ) * impl.scale
+        probs = scores.softmax(dim=-1)
+        references.append(
+            (
+                torch.einsum("hqk,khd->qhd", probs, values[context_positions]),
+                torch.logsumexp(scores, dim=-1),
+            )
+        )
+    ref_output = torch.cat([pair[0] for pair in references])
+    ref_lse = torch.cat([pair[1] for pair in references], dim=1)
+    # Every token/head must carry a distinguishable query-dependent score.
+    assert not torch.allclose(ref_output[0], ref_output[1])
+    assert not torch.allclose(ref_output[0, 0], ref_output[0, 1])
 
     outputs = []
     for workspace_size, expected_chunks in ((128, 1), (32, 3)):
@@ -434,41 +461,8 @@ def test_pcp_context_executes_real_cpu_mla(default_vllm_config) -> None:
         output, lse = impl._compute_prefill_context(
             q, cache, metadata, torch.tensor(1.0)
         )
-        # Shared [0:64), Tail [80:112): no duplicated intervening queries.
-        expected_first = cache.view(-1, rank)[:64, 0].mean()
-        expected_second = torch.cat(
-            (cache.view(-1, rank)[:64, 0], cache.view(-1, rank)[80:112, 0])
-        ).mean()
-        torch.testing.assert_close(
-            output[:16, :, 0],
-            torch.full((16, num_heads), expected_first.item()),
-            rtol=0,
-            atol=1e-4,
-        )
-        torch.testing.assert_close(
-            output[16:, :, 0],
-            torch.full((16, num_heads), expected_second.item()),
-            rtol=0,
-            atol=1e-4,
-        )
-        torch.testing.assert_close(
-            output[:, :, 1:],
-            torch.zeros_like(output[:, :, 1:]),
-            rtol=0,
-            atol=1e-6,
-        )
-        torch.testing.assert_close(
-            lse[:, :16],
-            torch.full((num_heads, 16), math.log(64.0)),
-            rtol=0,
-            atol=1e-5,
-        )
-        torch.testing.assert_close(
-            lse[:, 16:],
-            torch.full((num_heads, 16), math.log(96.0)),
-            rtol=0,
-            atol=1e-5,
-        )
+        torch.testing.assert_close(output, ref_output, rtol=1e-5, atol=2e-5)
+        torch.testing.assert_close(lse, ref_lse, rtol=1e-5, atol=2e-5)
         outputs.append((output, lse))
 
     for single, multi in zip(*outputs):
