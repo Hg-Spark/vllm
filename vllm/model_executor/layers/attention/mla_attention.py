@@ -2071,9 +2071,8 @@ def build_mla_chunked_context_metadata(
     if max(context_lens, default=0) <= 0:
         return None
 
-    # The `gather_and_maybe_dequant_cache` kernel cannot handle chunk starts
-    # that are not aligned to block_size, so a split request advances in
-    # block-aligned steps.
+    # Align split steps to KV pages. Individual jobs may have unaligned
+    # absolute cache starts, which the gather kernels support.
     chunk_alignment = block_size if align_chunk_to_block else 1
     if dcp_world_size > 1:
         # Each rank gathers only its own shard, so a chunk's workspace cost is
@@ -2272,6 +2271,223 @@ def build_mla_chunked_context_metadata(
     )
 
 
+
+@dataclass(frozen=True)
+class _PCPContextJob:
+    """An original-query slice attending to an absolute cached KV range."""
+
+    source_row: int
+    context_start: int
+    context_len: int
+    query_slice: slice
+    continuation: bool = False
+
+
+@dataclass
+class _PCPContextPlan:
+    jobs: list[_PCPContextJob]
+    merged_starts: list[int]
+    empty_token_slices: list[slice]
+
+
+def _plan_pcp_context_reuse(
+    request_ids: list[int],
+    context_lens: list[int],
+    query_starts: list[int],
+) -> _PCPContextPlan | None:
+    """Plan shared-prefix and cached-tail jobs for adjacent PCP virtual rows."""
+    num_prefills = len(context_lens)
+    if len(request_ids) != num_prefills or len(query_starts) != num_prefills + 1:
+        return None
+
+    jobs: list[_PCPContextJob] = []
+    covered = [False] * num_prefills
+    merged_starts = [query_starts[0]]
+    seen: set[int] = set()
+    has_pair = False
+    start = 0
+    while start < num_prefills:
+        end = start + 1
+        while end < num_prefills and request_ids[end] == request_ids[start]:
+            end += 1
+        request_id = int(request_ids[start])
+        run_size = end - start
+        if request_id in seen or run_size > 2:
+            return None
+        seen.add(request_id)
+
+        if run_size == 1:
+            query = slice(query_starts[start], query_starts[end])
+            context_len = context_lens[start]
+            if query.stop <= query.start or context_len < 0:
+                return None
+            if context_len > 0:
+                jobs.append(_PCPContextJob(start, 0, context_len, query))
+                covered[start] = True
+        else:
+            has_pair = True
+            first_query = slice(query_starts[start], query_starts[start + 1])
+            second_query = slice(query_starts[start + 1], query_starts[end])
+            if (
+                first_query.stop <= first_query.start
+                or second_query.stop <= second_query.start
+            ):
+                return None
+
+            first_len, second_len = context_lens[start:end]
+            tail_start = first_len + first_query.stop - first_query.start
+            if first_len < 0 or second_len < tail_start:
+                return None
+            if first_len > 0:
+                jobs.append(
+                    _PCPContextJob(
+                        start,
+                        0,
+                        first_len,
+                        slice(first_query.start, second_query.stop),
+                    )
+                )
+                covered[start] = covered[start + 1] = True
+            if second_len > tail_start:
+                jobs.append(
+                    _PCPContextJob(
+                        start,
+                        tail_start,
+                        second_len - tail_start,
+                        second_query,
+                        continuation=first_len > 0,
+                    )
+                )
+                covered[start + 1] = True
+
+        merged_starts.append(query_starts[end])
+        start = end
+
+    if not has_pair:
+        return None
+    return _PCPContextPlan(
+        jobs,
+        merged_starts,
+        [
+            slice(query_starts[i], query_starts[i + 1])
+            for i, is_covered in enumerate(covered)
+            if not is_covered
+        ],
+    )
+
+
+def _build_pcp_job_context_metadata(
+    plan: _PCPContextPlan,
+    *,
+    context_lens_cpu: torch.Tensor,
+    chunked_prefill_workspace: torch.Tensor,
+    chunked_prefill_workspace_size: int,
+    page_size: int,
+    device: torch.device,
+    align_indptr: bool = False,
+) -> "MLACommonPrefillMetadata.ChunkedContextMetadata | None":
+    """Use the native chunk planner per job, without packing query rows."""
+    if not plan.jobs:
+        return None
+
+    chunks: list[MLACommonPrefillMetadata.ContextChunk] = []
+    for job in plan.jobs:
+        query = job.query_slice
+        native = build_mla_chunked_context_metadata(
+            context_lens_cpu=torch.tensor([job.context_len], dtype=torch.int32),
+            prefill_query_start_loc_cpu=torch.tensor(
+                [0, query.stop - query.start], dtype=torch.int32
+            ),
+            chunked_prefill_workspace=chunked_prefill_workspace,
+            chunked_prefill_workspace_size=chunked_prefill_workspace_size,
+            block_size=page_size,
+            align_chunk_to_block=True,
+            device=device,
+            dcp_world_size=1,
+            dcp_local_block_size=1,
+            dcp_virtual_block_size=1,
+            align_indptr=align_indptr,
+        )
+        assert native is not None
+        for chunk in native.chunks:
+            chunks.append(
+                replace(
+                    chunk,
+                    index=len(chunks),
+                    request_slice=slice(job.source_row, job.source_row + 1),
+                    token_slice=query,
+                    continuation_token_end=query.stop,
+                    is_continuation=job.continuation or chunk.is_continuation,
+                    starts=chunk.starts + job.context_start,
+                )
+            )
+
+    return MLACommonPrefillMetadata.ChunkedContextMetadata(
+        context_lens=context_lens_cpu.to(device, non_blocking=True),
+        workspace=chunked_prefill_workspace,
+        chunks=chunks,
+        context_lens_list=context_lens_cpu.tolist(),
+        empty_token_slices=plan.empty_token_slices,
+        dcp_manager=None,
+    )
+
+
+def _build_pcp_context_reuse(
+    builder: "MLACommonMetadataBuilder",
+    metadata: CommonAttentionMetadata,
+    *,
+    num_decodes: int,
+    num_prefills: int,
+    context_lens_cpu: torch.Tensor,
+    prefill_query_start_loc_cpu: torch.Tensor,
+    align_indptr: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    MLACommonPrefillMetadata.ChunkedContextMetadata | None,
+] | None:
+    """Check PCP eligibility, then materialize the CPU-planned context jobs."""
+    if (
+        builder.dcp_world_size != 1
+        or builder.use_sparse
+        or builder.model_config.get_sliding_window() is not None
+        or metadata.causal is not True
+        or metadata.req_idx is None
+    ):
+        return None
+
+    request_ids = metadata.req_idx[num_decodes : num_decodes + num_prefills]
+    plan = _plan_pcp_context_reuse(
+        request_ids.tolist(),
+        context_lens_cpu.tolist(),
+        prefill_query_start_loc_cpu.tolist(),
+    )
+    if plan is None:
+        return None
+
+    chunked_context = _build_pcp_job_context_metadata(
+        plan,
+        context_lens_cpu=context_lens_cpu,
+        chunked_prefill_workspace=builder.chunked_prefill_workspace,
+        chunked_prefill_workspace_size=builder.chunked_prefill_workspace_size,
+        page_size=builder.page_size,
+        device=builder.device,
+        align_indptr=align_indptr,
+    )
+    merged_starts = plan.merged_starts
+    merged_query_lens = [
+        merged_starts[i + 1] - merged_starts[i]
+        for i in range(len(merged_starts) - 1)
+    ]
+    return (
+        async_tensor_h2d(merged_starts, device=builder.device, dtype=torch.int32),
+        torch.tensor(merged_query_lens, dtype=torch.int32),
+        max(merged_query_lens, default=0),
+        chunked_context,
+    )
+
+
 class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     """NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -2443,6 +2659,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             vllm_config, self.model_config.dtype
         )
         attention_layer = self.compilation_config.static_forward_context[layer_names[0]]
+        self.use_sparse = attention_layer.impl.is_sparse
 
         try:
             self.dcp_world_size = get_dcp_group().world_size
@@ -2650,20 +2867,42 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             ):
                 align_indptr = True
 
-            chunked_context_metadata = build_mla_chunked_context_metadata(
-                context_lens_cpu=context_lens_cpu,
-                prefill_query_start_loc_cpu=prefill_query_start_loc_cpu,
-                chunked_prefill_workspace=self.chunked_prefill_workspace,
-                chunked_prefill_workspace_size=self.chunked_prefill_workspace_size,
-                block_size=self.page_size,
-                align_chunk_to_block=True,
-                device=device,
-                dcp_world_size=self.dcp_world_size,
-                dcp_local_block_size=self.dcp_local_block_size,
-                dcp_virtual_block_size=self.dcp_virtual_block_size,
-                dcp_manager=self.dcp_manager,
-                align_indptr=align_indptr,
+            pcp_context_reuse = (
+                _build_pcp_context_reuse(
+                    self,
+                    common_attn_metadata,
+                    num_decodes=num_decodes,
+                    num_prefills=num_prefills,
+                    context_lens_cpu=context_lens_cpu,
+                    prefill_query_start_loc_cpu=prefill_query_start_loc_cpu,
+                    align_indptr=align_indptr,
+                )
+                if self.use_pcp
+                else None
             )
+            if pcp_context_reuse is None:
+                chunked_context_metadata = build_mla_chunked_context_metadata(
+                    context_lens_cpu=context_lens_cpu,
+                    prefill_query_start_loc_cpu=prefill_query_start_loc_cpu,
+                    chunked_prefill_workspace=self.chunked_prefill_workspace,
+                    chunked_prefill_workspace_size=self.chunked_prefill_workspace_size,
+                    block_size=self.page_size,
+                    align_chunk_to_block=True,
+                    device=device,
+                    dcp_world_size=self.dcp_world_size,
+                    dcp_local_block_size=self.dcp_local_block_size,
+                    dcp_virtual_block_size=self.dcp_virtual_block_size,
+                    dcp_manager=self.dcp_manager,
+                    align_indptr=align_indptr,
+                )
+            else:
+                (
+                    prefill_query_start_loc,
+                    prefill_query_lens_cpu,
+                    pcp_max_query_len,
+                    chunked_context_metadata,
+                ) = pcp_context_reuse
+                max_query_len = max(max_query_len, pcp_max_query_len)
 
             prefill_metadata = MLACommonPrefillMetadata(
                 block_table=block_table_tensor[reqs_start:, ...],
@@ -2710,7 +2949,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         attn_metadata = self.metadata_cls(
             num_reqs=common_attn_metadata.num_reqs,
-            max_query_len=common_attn_metadata.max_query_len,
+            max_query_len=max_query_len,
             max_seq_len=max_seq_len,
             num_actual_tokens=num_tokens,
             query_start_loc=query_start_loc,
